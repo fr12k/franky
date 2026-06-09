@@ -58,7 +58,7 @@ CHeck if this is a unified standard across other providers like opanai, ollama, 
 
 Do a web research.
 
-# List subagents/preset based on the available API KEYS.
+# List subagents/preset based on the available API KEYS. (Done)
 
 Also if a subagent was started with profile gemini but gemini api key is not there return hint with please use one of the following or change the subagent model without telling the parent agent.
 
@@ -66,7 +66,7 @@ The list_preset tool should return the presets and also all the available profil
 that the model can pick one.
 
 
-# Deepseek multiple tool calls
+# Deepseek multiple tool calls (Done)
 ```
 <｜DSML｜tool_calls>
 <｜DSML｜invoke name="bash">
@@ -133,7 +133,7 @@ How PI and Hermes for example:
 
 Create a design doc on how we can support the LLM standard.
 
-# The session id should be a path parameter
+# The session id should be a path parameter (Done)
 
 This make it possible to jump between session but consider there is only one active session but still how we can support at least jumping between sessions and view them while still keep the active session
 MAke a design doc
@@ -165,7 +165,7 @@ Let me search for the skill file.
 Since I'm not in interactive mode with the /review slash command available, I'll run the code review directly using sub-agents per the configured review profiles. Let me review the changes I just made to proxy.zig.
 ```
 
-# Improve Edit tool Error Handling
+# Improve Edit tool Error Handling (Done)
 
 With some changes we can save some turns and tokens when we handle error cases with better response.
 Auto-read on first edit_no_match
@@ -204,7 +204,7 @@ Implementation:
 - Wired in print, interactive, proxy, and rpc modes
 - Caps at 2 nudges per session
 
-# Fix segafult
+# Fix segafult (Done)
 
 Segmentation fault at address 0x13fc13300
 /opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/compiler_rt/memcpy.zig:170:17: 0x100f9f92c in copyFixedLength (compiler_rt)
@@ -254,4 +254,26 @@ The tool offload results missing the path for the model to read the result again
       "tool_call_id": "call_h9xz6ave",
       "content": "[tool result: call_h9xz6ave — 257B (offloaded)]"
     }
+```
+
+# lets support find tools with multiple patterns as args (Done)
+
+```
+find error
+pattern	["**/FlagManager.zig","**/types.zig","**/enums.zig","**/SerfState.zig","**/FlagState.zig","**/BuildingState.zig"]
+
+{"pattern":["**/FlagManager.zig","**/types.zig","**/enums.zig","**/SerfState.zig","**/FlagState.zig","**/BuildingState.zig"]}
+
+[invalid_args] pattern must be a string
+```
+
+# Lets support multiple query args in the web_search tool
+```
+web_search error
+max_results	10
+query	["öffentlicher Dienst IT Stellenangebote Berlin 2025 Senior DevOps SRE","Bund Berlin IT Stellenausschreibung Platform Engineer 2025","German government IT jobs Berlin 2025 DevOps Platform Engineer Bundesamt"]
+
+{"max_results":10,"query":["öffentlicher Dienst IT Stellenangebote Berlin 2025 Senior DevOps SRE","Bund Berlin IT Stellenausschreibung Platform Engineer 2025","German government IT jobs Berlin 2025 DevOps Platform Engineer Bundesamt"]}
+
+[invalid_args] query must be a string
 ```

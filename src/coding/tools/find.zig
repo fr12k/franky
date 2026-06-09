@@ -10,6 +10,9 @@
 //!   - `[abc]` character class
 //! Results are file paths, one per line.
 //!
+//! `pattern` may also be an array of strings — a file matches if it
+//! matches ANY of the patterns (OR semantics).
+//!
 //! `respectGitignore` (default `true`): uses `coding/gitignore.zig` to
 //! drop any result whose path is ignored by a `.gitignore` inside
 //! `cwd`. Pass `false` to search the full tree.
@@ -27,7 +30,12 @@ pub const parameters_json: []const u8 =
     \\  "type": "object",
     \\  "required": ["pattern"],
     \\  "properties": {
-    \\    "pattern": {"type": "string", "description": "Glob pattern. Supports *, **, ?, [abc]."},
+    \\    "pattern": {
+    \\      "oneOf": [
+    \\        {"type": "string", "description": "Glob pattern. Supports *, **, ?, [abc]."},
+    \\        {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Multiple glob patterns — match ANY (OR)."}
+    \\      ]
+    \\    },
     \\    "cwd": {"type": "string", "description": "Root to search (default '.')."},
     \\    "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of results (default 1000)."},
     \\    "respectGitignore": {"type": "boolean", "description": "Respect .gitignore rules under cwd. Default true."}
@@ -60,6 +68,51 @@ pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
     };
 }
 
+/// Extract the pattern(s) from `root.object`.
+///
+/// Accepts either:
+///   `"pattern": "foo/*.zig"`         → single-element slice
+///   `"pattern": ["a.zig", "b.zig"]`  → all elements (minimum 1)
+///
+/// Returns an empty slice when the field is absent or has the wrong type.
+fn extractPatterns(arena_alloc: std.mem.Allocator, root: std.json.ObjectMap) ![]const []const u8 {
+    const pattern_val = root.get("pattern") orelse return &.{};
+    switch (pattern_val) {
+        .string => {
+            const arr = try arena_alloc.alloc([]const u8, 1);
+            arr[0] = pattern_val.string;
+            return arr;
+        },
+        .array => {
+            const items = pattern_val.array.items;
+            // Count strings, skip non-strings silently.
+            var n: usize = 0;
+            for (items) |item| {
+                if (item == .string) n += 1;
+            }
+            if (n == 0) return &.{};
+            const arr = try arena_alloc.alloc([]const u8, n);
+            var i: usize = 0;
+            for (items) |item| {
+                if (item == .string) {
+                    arr[i] = item.string;
+                    i += 1;
+                }
+            }
+            return arr;
+        },
+        else => return &.{},
+    }
+}
+
+/// Returns true if `name` matches any of the `patterns`.
+fn anyMatch(patterns: []const []const u8, name: []const u8) bool {
+    for (patterns) |p| {
+        if (globMatch(p, name)) return true;
+    }
+    return false;
+}
+
 fn execute(
     self: *const at.AgentTool,
     allocator: std.mem.Allocator,
@@ -79,10 +132,8 @@ fn execute(
     const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json_to_parse, .{});
     const root = parsed.value;
 
-    const pattern_val = root.object.get("pattern") orelse
-        return common.toolError(allocator, "invalid_args", "missing pattern");
-    if (pattern_val != .string) return common.toolError(allocator, "invalid_args", "pattern must be a string");
-    const pattern = pattern_val.string;
+    const patterns = try extractPatterns(arena.allocator(), root.object);
+    if (patterns.len == 0) return common.toolError(allocator, "invalid_args", "pattern must be a non-empty string or array of strings");
 
     const user_cwd: []const u8 = if (root.object.get("cwd")) |v|
         (if (v == .string) v.string else ".")
@@ -111,14 +162,14 @@ fn execute(
         }
     } else user_cwd;
 
-    return try findMatches(allocator, io, cwd, pattern, limit, respect_gitignore, cancel);
+    return try findMatches(allocator, io, cwd, patterns, limit, respect_gitignore, cancel);
 }
 
 pub fn findMatches(
     allocator: std.mem.Allocator,
     io: std.Io,
     cwd: []const u8,
-    pattern: []const u8,
+    patterns: []const []const u8,
     limit: usize,
     respect_gitignore: bool,
     cancel: *ai.stream.Cancel,
@@ -159,7 +210,7 @@ pub fn findMatches(
         // hashes and derails the LLM's context.
         if (std.mem.eql(u8, entry.path, ".git") or std.mem.startsWith(u8, entry.path, ".git/")) continue;
         if (stacks.isIgnored(entry.path, false)) continue;
-        if (globMatch(pattern, entry.path)) {
+        if (anyMatch(patterns, entry.path)) {
             try out.appendSlice(allocator, entry.path);
             try out.append(allocator, '\n');
             found += 1;
@@ -297,6 +348,63 @@ test "find globMatch: literal + wildcard" {
     try testing.expect(!globMatch("[!a-z].txt", "m.txt"));
 }
 
+test "find anyMatch: multiple patterns" {
+    try testing.expect(anyMatch(&.{ "*.zig", "*.md" }, "foo.zig"));
+    try testing.expect(anyMatch(&.{ "*.zig", "*.md" }, "foo.md"));
+    try testing.expect(!anyMatch(&.{ "*.zig", "*.md" }, "foo.c"));
+    try testing.expect(anyMatch(&.{ "**/*.zig", "**/*.md" }, "src/foo.zig"));
+    try testing.expect(anyMatch(&.{ "**/*.zig", "**/*.md" }, "readme.md"));
+    try testing.expect(!anyMatch(&.{ "**/*.zig", "**/*.md" }, "src/foo.c"));
+}
+
+test "find extractPatterns: string" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const json = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"pattern": "*.zig"}
+    , .{});
+    const pats = try extractPatterns(arena.allocator(), json.value.object);
+    try testing.expectEqual(@as(usize, 1), pats.len);
+    try testing.expectEqualStrings("*.zig", pats[0]);
+}
+
+test "find extractPatterns: array" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const json = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"pattern": ["*.zig", "*.md"]}
+    , .{});
+    const pats = try extractPatterns(arena.allocator(), json.value.object);
+    try testing.expectEqual(@as(usize, 2), pats.len);
+    try testing.expectEqualStrings("*.zig", pats[0]);
+    try testing.expectEqualStrings("*.md", pats[1]);
+}
+
+test "find extractPatterns: empty string returns empty" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const json = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{"pattern": ""}
+    , .{});
+    const pats = try extractPatterns(arena.allocator(), json.value.object);
+    try testing.expectEqual(@as(usize, 1), pats.len);
+    try testing.expectEqualStrings("", pats[0]);
+}
+
+test "find extractPatterns: missing key returns empty" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const json = try std.json.parseFromSlice(std.json.Value, arena.allocator(),
+        \\{}
+    , .{});
+    const pats = try extractPatterns(arena.allocator(), json.value.object);
+    try testing.expectEqual(@as(usize, 0), pats.len);
+}
+
 test "find tool: returns matching files" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
@@ -325,7 +433,7 @@ test "find tool: returns matching files" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try findMatches(gpa, io, base, "**/*.zig", 100, false, &cancel);
+    var res = try findMatches(gpa, io, base, &.{"**/*.zig"}, 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "alpha.zig") != null);
@@ -367,7 +475,7 @@ test "find tool: hard-skips .git directory regardless of respectGitignore" {
     // respect_gitignore=false intentionally — proves the .git skip is
     // independent of gitignore handling.
     var cancel: ai.stream.Cancel = .{};
-    var res = try findMatches(gpa, io, base, "**/*", 100, false, &cancel);
+    var res = try findMatches(gpa, io, base, &.{"**/*"}, 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "src.zig") != null);
@@ -408,7 +516,7 @@ test "find tool: respectGitignore drops ignored matches" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try findMatches(gpa, io, base, "**/*", 100, true, &cancel);
+    var res = try findMatches(gpa, io, base, &.{"**/*"}, 100, true, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "src.zig") != null);
@@ -453,10 +561,53 @@ test "find tool: .contextignore is enforced unconditionally (§6.9)" {
     }
 
     var cancel: ai.stream.Cancel = .{};
-    var res = try findMatches(gpa, io, base, "**/*", 100, false, &cancel);
+    var res = try findMatches(gpa, io, base, &.{"**/*"}, 100, false, &cancel);
     defer res.deinit(gpa);
     const text = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "current.md") != null);
     try testing.expect(std.mem.indexOf(u8, text, "frozen.md") == null);
     try testing.expect(std.mem.indexOf(u8, text, "archive/old.md") == null);
+}
+
+test "find tool: multi-pattern with array" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_find_multi_test";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/sub");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/alpha.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/readme.md", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/sub/beta.zig", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "x");
+    }
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/sub/beta.c", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "z");
+    }
+
+    var cancel: ai.stream.Cancel = .{};
+    // Match both .zig and .md files
+    var res = try findMatches(gpa, io, base, &.{ "**/*.zig", "**/*.md" }, 100, false, &cancel);
+    defer res.deinit(gpa);
+    const text = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "alpha.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "readme.md") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "beta.zig") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "beta.c") == null);
 }

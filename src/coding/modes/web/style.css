@@ -1786,6 +1786,43 @@ button#send:hover:not(:disabled) {
 .tool-card-subagent .sa-card-open { opacity: 0.5; }
 .tool-card-subagent:hover .sa-card-open { opacity: 1; color: var(--accent); }
 
+/* vN — abort button on sub-agent card, right of the ↗ button */
+.sa-card-abort {
+    position: absolute;
+    top: 6px; right: 28px;
+    font-size: 11px;
+    color: var(--warn);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1.4;
+    opacity: 0.4;
+    transition: opacity 80ms, border-color 150ms ease, color 150ms ease;
+}
+.tool-card:hover .sa-card-abort { opacity: 0.7; }
+.tool-card-subagent:hover .sa-card-abort { opacity: 1; color: var(--error-border); border-color: var(--error-border); }
+.sa-card-abort:hover { opacity: 1 !important; background: rgba(248,81,73,0.1); }
+
+/* vN — abort button in the sub-agent overlay header */
+.sa-overlay-abort {
+    font-size: 11px;
+    padding: 2px 10px;
+    margin-left: auto;
+    background: transparent;
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 150ms ease, color 150ms ease;
+}
+.sa-overlay-abort:hover {
+    background: rgba(248,81,73,0.15);
+    color: var(--error-border);
+    border-color: var(--error-border);
+}
+
 /* v2.7 — full overlay */
 #sa-overlay {
     position: fixed;

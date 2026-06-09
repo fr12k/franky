@@ -448,6 +448,30 @@ function highlightCodeBlocks(container) {
     }
 
     /**
+     * vN — abort a sub-agent by call_id. POSTs to the server's
+     * /subagent/abort/<callId> endpoint which fires the sub-agent's
+     * Cancel handle. Best-effort: if the sub-agent already finished
+     * the server returns 404 and we ignore it.
+     */
+    async function abortSubagent(callId) {
+        try {
+            const res = await fetch('/subagent/abort/' + encodeURIComponent(callId), { method: 'POST' });
+            const data = await res.json();
+            if (data && data.ok) {
+                // Hide abort buttons immediately for responsive feedback
+                for (const [cid, card] of toolCards) {
+                    if (cid === callId && card._saAbortBtn) {
+                        card._saAbortBtn.style.display = 'none';
+                    }
+                }
+                // Also hide overlay abort button if visible
+                const overlayAbort = document.querySelector('.sa-overlay-abort');
+                if (overlayAbort) overlayAbort.style.display = 'none';
+            }
+        } catch (_) { /* best-effort */ }
+    }
+
+    /**
      * v1.7.1 — smart auto-scroll. Only stick to the bottom if the
      * user is already pinned there (within `pinSlack` px tolerance).
      * If they've scrolled up to read earlier content (thinking
@@ -1661,6 +1685,21 @@ function highlightCodeBlocks(container) {
         });
         el.appendChild(openBtn);
 
+        // vN — abort sub-agent button
+        const abortBtn = document.createElement('button');
+        abortBtn.type = 'button';
+        abortBtn.className = 'sa-card-abort';
+        abortBtn.textContent = '⏹';
+        abortBtn.title = 'Abort this sub-agent';
+        abortBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            abortSubagent(callId);
+        });
+        el.appendChild(abortBtn);
+
+        // Track abort button so we can hide it on completion
+        el._saAbortBtn = abortBtn;
+
         const head = el.querySelector('.tool-head');
 
         const log = document.createElement('div');
@@ -1807,6 +1846,22 @@ function highlightCodeBlocks(container) {
         state._overlayThinkingArrow = null;
         state._overlayToolEls = null;
         renderSubagentOverlayContent(state);
+
+        // vN — show/hide abort button in overlay
+        const existingAbort = saOverlayEl.querySelector('.sa-overlay-abort');
+        if (!state.done) {
+            if (!existingAbort) {
+                const abortBtn = document.createElement('button');
+                abortBtn.className = 'sa-overlay-abort';
+                abortBtn.textContent = '⏹ Abort';
+                abortBtn.title = 'Abort this sub-agent';
+                abortBtn.addEventListener('click', () => abortSubagent(callId));
+                const head = saOverlayEl.querySelector('.sa-overlay-head');
+                if (head) head.appendChild(abortBtn);
+            }
+        } else {
+            if (existingAbort) existingAbort.remove();
+        }
 
         saOverlayEl.removeAttribute('hidden');
         document.body.style.overflow = 'hidden';
@@ -2043,6 +2098,15 @@ function highlightCodeBlocks(container) {
         setBadge(state.badgeEl, label);
         if (currentOverlayCallId === callId)
             setBadge(saOverlayBadge, label, 'sa-overlay-badge');
+
+        // vN — hide abort buttons on completion
+        for (const [cid, card] of toolCards) {
+            if (cid === callId && card._saAbortBtn) {
+                card._saAbortBtn.style.display = 'none';
+            }
+        }
+        const overlayAbort = document.querySelector('.sa-overlay-abort');
+        if (overlayAbort) overlayAbort.style.display = 'none';
 
         // Collapse thinking in overlay if open
         if (currentOverlayCallId === callId && state._overlayThinkingEl) {

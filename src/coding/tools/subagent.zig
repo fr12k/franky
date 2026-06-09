@@ -664,6 +664,21 @@ pub const Ctx = struct {
     /// When true, also forward message_update (text + thinking) deltas.
     /// Default false — structural events only.
     verbose_progress: bool = false,
+
+    // ── §6.7 — sub-agent abort (abort from web-ui) ────────────────
+    //
+    // When set, `runSubagent` registers the sub-agent's `Cancel` with
+    // these callbacks so the UI can abort an in-flight sub-agent by
+    // call_id. The mode driver (proxy.zig) holds a map of
+    // `call_id → *Cancel` and fires it on `POST /subagent/abort/<id>`.
+    /// Register a sub-agent's cancel handle for the given call_id.
+    /// Called from the sub-agent's worker thread.
+    register_cancel_fn: ?*const fn (userdata: ?*anyopaque, call_id: []const u8, cancel: *ai.stream.Cancel) void = null,
+    /// Unregister a sub-agent's cancel handle. Called from the
+    /// sub-agent's worker thread after the sub-agent finishes.
+    unregister_cancel_fn: ?*const fn (userdata: ?*anyopaque, call_id: []const u8) void = null,
+    /// Userdata passed to register/unregister callbacks.
+    register_userdata: ?*anyopaque = null,
 };
 
 /// Unconfigured factory. The execute path errors with
@@ -1068,6 +1083,15 @@ fn runSubagent(
     ai.log.log(.info, "subagent", "spawn", "preset={s} profile={s} call_id={s} model={s} role={s} timeout_ms={d} max_turns={d}", .{
         preset.name, effective_profile, call_id, provider_info.model_id, sub_role.toString(), parsed.timeout_ms, parsed.max_turns,
     });
+
+    // §6.7 — register cancel handle so the UI can abort by call_id.
+    if (ctx.register_cancel_fn) |reg| {
+        reg(ctx.register_userdata, call_id, &sub_agent.cancel);
+    }
+    defer if (ctx.unregister_cancel_fn) |unreg| {
+        unreg(ctx.register_userdata, call_id);
+    };
+
     sub_agent.prompt(parsed.prompt) catch |e| {
         supervisor_done.store(true, .release);
         supervisor.join();

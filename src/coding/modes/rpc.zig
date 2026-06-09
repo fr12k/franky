@@ -27,6 +27,7 @@ const agent = franky.agent;
 const at = agent.types;
 const rpc = franky.coding.rpc;
 const cli_mod = franky.coding.cli;
+const config_mod = franky.coding.config.resolver;
 const print_mode = @import("print.zig");
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
@@ -94,13 +95,14 @@ pub fn run(
 const Session = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    registry: ai.registry.Registry,
-    faux: ai.providers.faux.FauxProvider,
+    resolved: *config_mod.ResolvedConfig,
+    registry: *ai.registry.Registry,
+    faux: *ai.providers.faux.FauxProvider,
     provider: print_mode.ProviderInfo,
     tools: []const at.AgentTool,
     role_arena: std.heap.ArenaAllocator,
-    role_gate: role_mod.RoleGate,
-    permission_store: permissions_mod.Store,
+    role_gate: *role_mod.RoleGate,
+    permission_store: *permissions_mod.Store,
     session_gates: permissions_mod.SessionGates = .{},
     /// v1.11.3 — set during `runPrompt` so the dispatcher's
     /// `permission/resolve` arm can find the live prompter. Null
@@ -126,21 +128,17 @@ const Session = struct {
     /// when `FRANKY_HOME`/`HOME` is set. Falls back to `/tmp` when
     /// neither env var is set. Address stable for the rpc process's
     /// lifetime — referenced by `bash.toolWithState`.
-    bash_state: tools_mod.bash.SessionBashState,
+    bash_state: *tools_mod.bash.SessionBashState,
     web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
-    /// §6.10 — harness-enforced guardrails (stuck detection, compilation guard,
-    /// finish_task). Wired at session init; passed to loop.Config in runPrompt.
-    guardrail_state: agent.guardrails.GuardrailState = undefined,
+    guardrail_state: *agent.guardrails.GuardrailState,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
-        self.bash_state.deinit();
-        self.guardrail_state.deinit();
-        self.registry.deinit();
-        self.faux.deinit();
-        self.permission_store.deinit();
         self.role_arena.deinit();
+        // v2.22 Phase 3 — resolved owns registry, faux, bash_state,
+        // guardrail_state, permission_store, role_gate, tools, etc.
+        self.resolved.deinit();
     }
 };
 
@@ -152,118 +150,56 @@ fn initSession(
     environ_map: *std.process.Environ.Map,
     cfg: *cli_mod.Config,
 ) !void {
-    const active_role = if (cfg.role) |s|
-        role_mod.Role.fromString(s) catch |err| switch (err) {
-            error.UnknownRole => return print_mode.exitWithMessage(io, "unknown --role; pick one of read, plan, code, full\n", 2),
-        }
-    else
-        role_mod.Role.plan;
-    const role_gate = role_mod.RoleGate.init(active_role);
+    // ── Step 1: Unified config resolution ─────────────────────
+    // v2.22 Phase 3 — call the shared config resolver instead of
+    // duplicating settings loading, registry setup, tool building,
+    // permission store, preset registry, guardrails, etc. inline.
+    const resolved = try allocator.create(config_mod.ResolvedConfig);
+    errdefer allocator.destroy(resolved);
+    resolved.* = try config_mod.resolve(allocator, io, cfg, environ, environ_map, &.{});
+
+    // ── Step 2: RPC-specific role arena ───────────────────────
     var role_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer role_arena.deinit();
-    const all_tools = [_]at.AgentTool{
-        tools_mod.read.tool(),
-        tools_mod.write.tool(),
-        tools_mod.edit.tool(),
-        tools_mod.bash.tool(),
-        tools_mod.ls.tool(),
-        tools_mod.find.tool(),
-        tools_mod.grep.tool(),
-        tools_mod.web_search.tool(),
-        tools_mod.web_fetch.tool(),
-    };
-    const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
-    // v1.24.0 — subagent wiring deferred until after permission_store
-    // is built (we need its address). See the `final_tools` block below.
 
-    var permission_store = permissions_mod.Store.init(allocator);
-    errdefer permission_store.deinit();
-    var prompts_enabled: bool = cfg.prompts;
-    // v1.19.0 — settings-layer overlay first; CLI overlay below.
-    {
-        var settings = try print_mode.loadSettingsForOverlay(allocator, io, environ);
-        defer settings.deinit();
-        try print_mode.applyPermissionsSettingsOverlay(&permission_store, &settings);
-        prompts_enabled = print_mode.resolvePromptsDefault(cfg, &settings);
-        print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
-
-        // v2.16 — pre-render the review config block for system-prompt injection.
-        // Only populate when profiles are configured so the block is non-empty.
-        if (settings.review_profiles.len > 0) {
-            const ca = cfg.arena.allocator();
-            // Build a comma-separated profile list for readability.
-            var pb: std.ArrayList(u8) = .empty;
-            defer pb.deinit(ca);
-            for (settings.review_profiles, 0..) |p, i| {
-                if (i > 0) try pb.appendSlice(ca, ", ");
-                try pb.appendSlice(ca, p);
-            }
-            const profiles_csv = try pb.toOwnedSlice(ca);
-            defer ca.free(profiles_csv);
-            cfg.review_config_block = try std.fmt.allocPrint(
-                ca,
-                "## Review configuration\n" ++
-                    "profiles: {s}\n" ++
-                    "min_models: {d}\n" ++
-                    "max_models: {d}\n" ++
-                    "timeout_ms: {d}",
-                .{
-                    profiles_csv,
-                    settings.review_min_models,
-                    settings.review_max_models,
-                    settings.review_timeout_ms,
-                },
-            );
-        }
-    }
-    if (cfg.yes) permission_store.yes_to_all = true;
-    if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
-    if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
-    if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
-    try permissions_mod.maybeAttachPersistence(
-        &permission_store,
-        cfg.remember_permissions,
-        cfg.arena.allocator(),
-        io,
-        environ_map,
-    );
-
+    // ── Step 3: Build session from resolved config ────────────
     session.* = .{
         .allocator = allocator,
         .io = io,
-        .registry = ai.registry.Registry.init(allocator),
-        .faux = ai.providers.faux.FauxProvider.init(allocator),
-        .provider = undefined,
-        .tools = filtered,
+        .resolved = resolved,
+        .registry = &resolved.registry,
+        .faux = resolved.faux_provider,
+        .provider = .{
+            .provider_name = resolved.provider_name,
+            .api_tag = resolved.api_tag,
+            .model_id = resolved.model_id,
+            .api_key = resolved.api_key,
+            .auth_token = resolved.auth_token,
+            .base_url = resolved.base_url,
+            .context_window = resolved.context_window,
+            .max_output = resolved.max_output,
+            .capabilities = resolved.capabilities,
+        },
+        .tools = resolved.tools,
         .role_arena = role_arena,
-        .role_gate = role_gate,
-        .permission_store = permission_store,
+        .role_gate = resolved.role_gate,
+        .permission_store = resolved.permission_store,
         .system_prompt = undefined,
         .transcript = agent.loop.Transcript.init(allocator),
         .cfg = cfg,
         .environ_map = environ_map,
-        .prompts_enabled = prompts_enabled,
-        .bash_state = tools_mod.bash.SessionBashState.init(allocator),
+        .prompts_enabled = resolved.prompts_enabled,
+        .bash_state = resolved.bash_state,
+        .guardrail_state = resolved.guardrail_state,
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.session_gates = .{
-        .role = &session.role_gate,
-        .permissions = if (session.prompts_enabled) &session.permission_store else null,
+        .role = session.role_gate,
+        .permissions = if (session.prompts_enabled) session.permission_store else null,
     };
-    errdefer session.registry.deinit();
-    errdefer session.faux.deinit();
-    errdefer session.bash_state.deinit();
 
-    // v1.27.3 — synthesize a process-scoped session dir for bash
-    // spills. RPC has no on-disk transcript persistence (matching
-    // the v1 spec note about virtual-session multiplexing), but
-    // bash captures still want a discoverable home that isn't /tmp.
-    // Layout: `<FRANKY_HOME or $HOME/.franky>/sessions/rpc-<pid>-<unix_ms>/bash/<call_id>.log`.
-    // Best-effort — if neither env var is set, the spill writer
-    // falls back to /tmp via its own gate, matching v1.27.0
-    // behavior. The dir lives until manually cleaned (or until a
-    // future `--gc-sessions` reaps it); RPC processes are
-    // long-lived so leaving the dir around per-run is fine.
+    // ── Step 4: RPC-specific bash session dir ─────────────────
+    // v1.27.3 — synthesize a process-scoped session dir for bash spills.
     {
         const home_root = if (environ.getPosix("FRANKY_HOME")) |h|
             try std.fs.path.join(allocator, &.{ h, "sessions" })
@@ -273,10 +209,6 @@ fn initSession(
             null;
         if (home_root) |hr| {
             defer allocator.free(hr);
-            // Process-scoped id from the startup timestamp. Two rpc
-            // processes started in the same millisecond would collide,
-            // but that's vanishingly rare and the worst-case symptom is
-            // a shared spill dir — not corruption.
             const startup_ms: i64 = ai.stream.nowMillis();
             const rpc_id = try std.fmt.allocPrint(allocator, "rpc-{d}", .{startup_ms});
             defer allocator.free(rpc_id);
@@ -286,111 +218,40 @@ fn initSession(
         }
     }
 
-    // v1.27.3 — rebuild the filtered tool list with `bash.toolWithState`
-    // now that `&session.bash_state` is at a stable address. Same
-    // pattern as proxy.zig.
-    {
-        const all_tools_with_state = [_]at.AgentTool{
-            tools_mod.read.tool(),
-            tools_mod.write.tool(),
-            tools_mod.edit.tool(),
-            tools_mod.bash.toolWithState(&session.bash_state),
-            tools_mod.ls.tool(),
-            tools_mod.find.tool(),
-            tools_mod.grep.tool(),
-            tools_mod.web_search.toolWithCtx(&session.web_search_ctx),
-            tools_mod.web_fetch.toolWithCtx(&session.web_search_ctx),
-        };
-        session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
-    }
-
-    // §6.10 — harness-enforced guardrails (stuck detection, compilation guard, finish_task).
-    session.guardrail_state = try agent.guardrails.GuardrailState.init(
-        allocator,
-        .{ .workspace_dir = environ.getPosix("PWD") orelse "." },
-        io,
-    );
-    errdefer session.guardrail_state.deinit();
-    session.guardrail_state.setupAutoCommitBranch(allocator, io);
-
-    session.provider = try print_mode.resolveProviderIo(allocator, io, environ, cfg);
-
-    try session.registry.register(.{
-        .api = "faux",
-        .provider = "faux",
-        .stream_fn = fauxShim,
-        .userdata = @ptrCast(&session.faux),
-    });
-    try session.registry.register(.{
-        .api = "anthropic-messages",
-        .provider = "anthropic",
-        .stream_fn = ai.providers.anthropic.streamFn,
-    });
-    try session.registry.register(.{
-        .api = "openai-chat-completions",
-        .provider = "openai",
-        .stream_fn = ai.providers.openai_chat.streamFn,
-    });
-    try session.registry.register(.{
-        .api = "openai-compatible-gateway",
-        .provider = "gateway",
-        .stream_fn = ai.providers.openai_gateway.streamFn,
-    });
-    try session.registry.register(.{
-        .api = "google-gemini",
-        .provider = "google-gemini",
-        .stream_fn = ai.providers.google_gemini.streamFn,
-    });
-
+    // ── Step 5: Subagent ctx + preset_registry ────────────────
     // v1.24.0 — append subagent + list_subagent_presets tools.
-    // §5 — preset registry lives in role_arena alongside ctx.
-    //
-    // v1.28.0 — RPC reuses the same synthesized rpc-<startup_ms>
-    // dir that bash_state already points at (set via
-    // `setSessionDir` above). Sub-agent transcripts land at
-    // `<rpc-dir>/subagents/<call_id>/transcript.json` and the
-    // path is surfaced in the result so the parent can `read`
-    // it on demand. When neither `FRANKY_HOME` nor `HOME` is
-    // set the bash_state has no session dir — sub-agent
-    // persistence is then skipped and the result omits
-    // `transcript_path`.
-    const ra = session.role_arena.allocator();
+    {
+        const ra = role_arena.allocator();
 
-    const preset_reg = try ra.create(tools_mod.subagent.PresetRegistry);
-    preset_reg.* = tools_mod.subagent.PresetRegistry.init(ra);
-    try tools_mod.subagent.registerBuiltinPresets(preset_reg);
+        const params_json = try tools_mod.subagent.buildParametersJson(ra, &resolved.preset_registry);
 
-    const params_json = try tools_mod.subagent.buildParametersJson(ra, preset_reg);
-
-    const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
-    const parent_session_dir: ?[]const u8 = if (session.bash_state.getSessionDir()) |sd|
-        try ra.dupe(u8, sd)
-    else
-        null;
-    subagent_ctx.* = .{
-        .registry = &session.registry,
-        .environ = environ,
-        .environ_map = environ_map,
-        .parent_tools = session.tools,
-        .parent_role = session.role_gate.role,
-        .parent_profile = cfg.profile orelse "",
-        .presets = preset_reg,
-        .parameters_json_owned = params_json,
-        .permission_store = if (session.prompts_enabled) &session.permission_store else null,
-        // v1.24.3 — pointer-to-slot reads `session.current_prompter`
-        // at sub-agent spawn time (parent is mid-prompt then,
-        // so the slot holds the live prompter).
-        .permission_prompter_slot = &session.current_prompter,
-        .parent_session_dir = parent_session_dir,
-        // §6.6 — forward sub-agent events as JSON-RPC `event` notifications.
-        .progress_fn = subagentProgressForward,
-        .progress_userdata = session,
-    };
-    const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
-    @memcpy(final_tools[0..session.tools.len], session.tools);
-    final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-    final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
-    session.tools = final_tools;
+        const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
+        const parent_session_dir: ?[]const u8 = if (session.bash_state.getSessionDir()) |sd|
+            try ra.dupe(u8, sd)
+        else
+            null;
+        subagent_ctx.* = .{
+            .registry = session.registry,
+            .environ = environ,
+            .environ_map = environ_map,
+            .parent_tools = session.tools,
+            .parent_role = session.role_gate.role,
+            .parent_profile = cfg.profile orelse "",
+            .presets = &resolved.preset_registry,
+            .parameters_json_owned = params_json,
+            .permission_store = if (session.prompts_enabled) session.permission_store else null,
+            .permission_prompter_slot = &session.current_prompter,
+            .parent_session_dir = parent_session_dir,
+            // §6.6 — forward sub-agent events as JSON-RPC `event` notifications.
+            .progress_fn = subagentProgressForward,
+            .progress_userdata = session,
+        };
+        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
+        @memcpy(final_tools[0..session.tools.len], session.tools);
+        final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
+        final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&resolved.preset_registry);
+        session.tools = final_tools;
+    }
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
 }
@@ -685,10 +546,10 @@ fn runPrompt(
             },
             .system_prompt = session.system_prompt,
             .tools = session.tools,
-            .registry = &session.registry,
+            .registry = session.registry,
             .cancel = &session.cancel,
             .hook_userdata = @ptrCast(&session.session_gates),
-            .guardrails = &session.guardrail_state,
+            .guardrails = session.guardrail_state,
             .role_denied = permissions_mod.SessionGates.roleDenied,
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
             .text_tool_call_fallback = session.cfg.text_tool_call_fallback,

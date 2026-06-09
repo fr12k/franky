@@ -7,7 +7,7 @@ USER root
 # linux-tools-common needed for perf (CPU profiling), heaptrack (Memory profiling), cargo needed for inferno (CPU and Memory profiling reporting)
 # xxd tool multiple times deepseek tried to use xxd 
 RUN sudo apt-get update && \
-    sudo apt-get install -y wget gnupg podman xz-utils tcpdump xxd libbtrfs-dev libgpgme-dev cargo linux-tools-common heaptrack xxd && \
+    sudo apt-get install -y wget gnupg podman xz-utils tcpdump xxd libbtrfs-dev libgpgme-dev cargo linux-tools-common heaptrack xxd weasyprint && \
     sudo apt-get clean && \
     sudo rm -rf /var/lib/apt/lists/*
 

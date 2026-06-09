@@ -369,6 +369,15 @@ const Session = struct {
     web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
     guardrail_state: *agent.guardrails.GuardrailState,
 
+    /// vN — map of sub-agent call_id → Cancel handle. Registered
+    /// by sub-agent worker threads, read by `POST /subagent/abort/<id>`.
+    /// Keys are owned dupes of call_id; values are pointers into the
+    /// sub-agent's Cancel field (valid until the sub-agent finishes).
+    subagent_cancels: std.StringHashMapUnmanaged(*ai.stream.Cancel) = .{},
+    /// Guards `subagent_cancels` — written from sub-agent worker
+    /// threads, read from connection handler threads.
+    subagent_cancel_mutex: std.Io.Mutex = .init,
+
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
     tool_usage: std.StringHashMap(u32) = undefined,
@@ -433,6 +442,12 @@ const Session = struct {
         self.role_arena.deinit();
         // v2.17 — release restart module globals (owned dupes).
         restart_mod.deinit(self.allocator);
+        // vN — free any remaining subagent cancel registrations.
+        {
+            var it = self.subagent_cancels.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            self.subagent_cancels.deinit(self.allocator);
+        }
         // v1.16.0 — release any retained replay frames.
         for (self.replay_ring[0..]) |maybe| {
             if (maybe) |entry| self.allocator.free(entry.frame);
@@ -699,6 +714,9 @@ fn initSession(
             .progress_fn = subagentProgressForward,
             .progress_userdata = session,
             .verbose_progress = true,
+            .register_cancel_fn = subagentCancelRegister,
+            .unregister_cancel_fn = subagentCancelUnregister,
+            .register_userdata = session,
         };
         const final_tools = try ra.alloc(at.AgentTool, session.tools.len + @as(u32, @intCast(ext_tools.len)) + 3);
         @memcpy(final_tools[0..session.tools.len], session.tools);
@@ -1635,7 +1653,41 @@ fn subagentProgressForward(
     session.broadcastEvent(allocator, frame);
 }
 
-// ─── connection handling ─────────────────────────────────────────
+// ─── §6.7 — sub-agent cancel register/unregister ──────────────────
+//
+// Called from the sub-agent's worker thread. Stores the Cancel handle
+// keyed by call_id so `POST /subagent/abort/<call_id>` can fire it.
+
+/// Register a sub-agent's cancel handle.
+fn subagentCancelRegister(
+    userdata: ?*anyopaque,
+    call_id: []const u8,
+    cancel: *ai.stream.Cancel,
+) void {
+    const session: *Session = @ptrCast(@alignCast(userdata.?));
+    session.subagent_cancel_mutex.lockUncancelable(session.io);
+    defer session.subagent_cancel_mutex.unlock(session.io);
+
+    const owned_id = session.allocator.dupe(u8, call_id) catch return;
+    session.subagent_cancels.put(session.allocator, owned_id, cancel) catch {
+        session.allocator.free(owned_id);
+    };
+}
+
+/// Unregister a sub-agent's cancel handle.
+fn subagentCancelUnregister(
+    userdata: ?*anyopaque,
+    call_id: []const u8,
+) void {
+    const session: *Session = @ptrCast(@alignCast(userdata.?));
+    session.subagent_cancel_mutex.lockUncancelable(session.io);
+    defer session.subagent_cancel_mutex.unlock(session.io);
+
+    if (session.subagent_cancels.fetchRemove(call_id)) |kv| {
+        session.allocator.free(kv.key);
+        // kv.value is a borrowed pointer — do not free.
+    }
+}
 
 const ConnArg = struct {
     session: *Session,
@@ -1695,6 +1747,27 @@ fn handleConnection(arg: ConnArg) void {
         // which would race with the worker thread anyway.
         arg.session.cancel.fire();
         sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true,\"aborted\":true}");
+        return;
+    }
+    // vN — abort a specific sub-agent by call_id.
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.startsWith(u8, req.path, "/subagent/abort/")) {
+        const prefix_len = "/subagent/abort/".len;
+        if (req.path.len > prefix_len) {
+            const sub_call_id = req.path[prefix_len..];
+            arg.session.subagent_cancel_mutex.lockUncancelable(arg.session.io);
+            const cancel_ptr = arg.session.subagent_cancels.get(sub_call_id);
+            arg.session.subagent_cancel_mutex.unlock(arg.session.io);
+
+            if (cancel_ptr) |cancel| {
+                cancel.fire();
+                sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true,\"aborted\":true}");
+                ai.log.log(.info, "proxy", "subagent.abort", "aborted sub-agent call_id={s}", .{sub_call_id});
+            } else {
+                sse_mod.respondJson(&stream, arg.io, 404, "{\"ok\":false,\"error\":\"sub-agent not found or already finished\"}");
+            }
+        } else {
+            sse_mod.respondJson(&stream, arg.io, 400, "{\"ok\":false,\"error\":\"missing call_id\"}");
+        }
         return;
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/interrupt")) {
@@ -2236,10 +2309,9 @@ fn proxyStopRequestedFn(userdata: ?*anyopaque) bool {
 // ─── HTTP response helpers ──────────────────────────────────────
 
 /// `GET /transcript` (v1.6.1) — render the active session's
-/// transcript as UI-friendly JSON. Holds `events_mutex` (the same
-/// guard `broadcastFrame` / `broadcastEvent` use, repurposed since
-/// concurrent `runOneTurn` mutates `transcript.messages`) so we
-/// don't tear during snapshot. The body shape is the projection
+/// transcript as UI-friendly JSON. Holds `run_mutex` (the same
+/// guard the agent-loop holds while mutating transcript.messages)
+/// so we don't tear during snapshot. The body shape is the projection
 /// in `renderTranscriptForUi`.
 fn respondTranscript(
     session: *Session,
@@ -2247,13 +2319,13 @@ fn respondTranscript(
     io: std.Io,
     allocator: std.mem.Allocator,
 ) void {
-    session.events_mutex.lockUncancelable(session.io);
+    session.run_mutex.lockUncancelable(session.io);
     const body = renderTranscriptForUi(allocator, &session.transcript) catch {
-        session.events_mutex.unlock(session.io);
+        session.run_mutex.unlock(session.io);
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
-    session.events_mutex.unlock(session.io);
+    session.run_mutex.unlock(session.io);
     defer allocator.free(body);
     sse_mod.respondJson(stream, io, 200, body);
 }

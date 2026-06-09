@@ -224,6 +224,18 @@ pub fn applyEdits(
         );
     }
 
+    // Pre-check: if any `old` doesn't appear in the original file,
+    // short-circuit immediately without going through the edit pipeline.
+    // This saves the allocation/atomic-write setup cost on failures that
+    // are guaranteed regardless of prior edits.
+    for (edits, 0..) |ed, idx| {
+        if (std.mem.indexOf(u8, original, ed.old) == null) {
+            const msg = try buildNoMatchMsg(allocator, idx, ed.old, original);
+            defer allocator.free(msg);
+            return common.toolError(allocator, "edit_no_match", msg);
+        }
+    }
+
     // Apply edits into a growing buffer.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -425,10 +437,10 @@ fn buildNoMatchMsg(
 
     return std.fmt.allocPrint(
         allocator,
-        "edit {d}: `old` not found. " ++
-            "STOP. Do not retry with widened `old` — read the file with `read` and copy-paste exact bytes",
-        .{idx},
-    );
+            "edit {d}: `old` not found. Here are the actual file contents:\n---\n{s}\n---\n" ++
+            "Copy-paste the exact bytes you want to replace from above.",
+            .{ idx, file_content },
+        );
 }
 
 const PartialMatch = struct {
