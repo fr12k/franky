@@ -33,6 +33,25 @@ pub const AgentMessage = at.AgentMessage;
 const guardrails_mod = @import("guardrails/guardrails.zig");
 const truncate = @import("../coding/tools/truncate.zig");
 const tool_common = @import("../coding/tools/common.zig");
+/// v2.31 — content-aware compression library. Imported via the `zompress`
+/// module name wired in `build.zig` (see `b.dependency("zompress", ...)`).
+const zompress = @import("zompress");
+/// v2.31 — conversation compaction. Sibling of the tool-result
+/// compression path; both are gated on the master `compression_enabled`
+/// switch but live in different files because their compression
+/// targets differ (transcript history vs. individual tool outputs).
+const compaction_mod = @import("compaction.zig");
+/// v2.31 Phase 3 — CCR (Compress-Cache-Retrieve) integration.
+/// Holds the optional session that the loop's compression paths
+/// populate with originals before compressing.
+const ccr_integration_mod = @import("ccr_integration.zig");
+
+// v2.31 — fast-path gate before invoking zompress. Tool outputs below this
+// byte length are never compressed; the call is wasted CPU on a single JSON
+// key or one log line. The token-level `min_tokens_to_compress` lives in
+// `Config` and is forwarded to `CompressConfig`. Mirrors the byte-length
+// fast-path in docs/design/decided/v2.31-compression.md Phase 1.
+const tool_compress_min_bytes: usize = 256;
 
 pub const ConvertToLlmFn = *const fn (
     allocator: std.mem.Allocator,
@@ -325,6 +344,70 @@ pub const Config = struct {
     /// nowhere). Mode drivers populate this with
     /// `<session_dir>/offloaded-tool-results` or similar.
     offload_dir: ?[]const u8 = null,
+
+    /// v2.31 — master switch for the entire compression subsystem
+    /// (tool-result compression, conversation compaction, CCR). When
+    /// false (the v2.31 default), every per-feature flag below is
+    /// ignored and the existing 8 KiB flat-truncation path runs
+    /// unchanged. Reading order: CLI `--compression` / `--no-compression`
+    /// → `settings.json` `compression.enabled` → this field's default.
+    /// See docs/design/decided/v2.31-compression.md Phase 4 master switch.
+    compression_enabled: bool = false,
+    /// v2.31 — per-feature flag: content-aware tool-result compression
+    /// via the zompress dependency. Only consulted when
+    /// `compression_enabled` is true. When true, tool outputs are passed
+    /// through `zompress.compress(...)` before entering the conversation
+    /// history; the original 8 KiB cap remains the fallback when
+    /// zompress either fails or returns output no smaller than the
+    /// input. Default false.
+    compress_tool_results: bool = false,
+    /// v2.31 — fast-path gate. Tool outputs below this estimated-token
+    /// threshold are never handed to zompress (the heuristic token
+    /// counter inside zompress is bypassed entirely). The byte-length
+    /// check (`t.text.len >= 256`) below the zompress call is the
+    /// real guardrail; this value is forwarded to
+    /// `CompressConfig.min_tokens_to_compress` for the case where a
+    /// caller wants to raise the gate. Default 100 per the spec
+    /// ("the global default"; per-type overrides live in the
+    /// zompress `CompressConfig` if the caller needs them).
+    min_tokens_to_compress: u32 = 100,
+    /// v2.31 — conversation compaction threshold. Only consulted when
+    /// `compression_enabled` is true. When the transcript exceeds this
+    /// many messages, the older messages are collapsed into a single
+    /// `compaction_summary` custom-role message (see `defaultConvertToLlm`
+    /// for the LLM-side handling). 0 disables compaction (default).
+    compact_after_messages: u32 = 0,
+    /// v2.31 — number of most recent messages to protect from
+    /// compaction. These stay in full fidelity so the model has
+    /// immediate context. Default 8 — the empirical sweet spot
+    /// reported in the compaction literature is "the last system-prompt
+    /// worth of turns" (≈ 8–10 most recent exchanges). Per the design
+    /// doc, this is intentionally NOT tied to `compact_after_messages`
+    /// via a percentage — a flat default is easier to reason about
+    /// when a user sets `compact_after_messages = 200`.
+    compact_protect_recent: u32 = 8,
+    /// v2.31 Phase 3 — optional CCR (Compress-Cache-Retrieve) session.
+    /// When non-null, the loop stores the *original* (uncompressed)
+    /// content in the session before compressing, and the
+    /// `ccr_retrieve` tool wires through this session so the LLM
+    /// can pull back the original on demand. Null disables CCR —
+    /// compressed output has no recovery path. The session is
+    /// owned by the caller (the mode driver); the loop only
+    /// borrows the pointer.
+    ccr_session: ?*ccr_integration_mod.CcrSession = null,
+    /// v2.31 Phase 3 — CCR store cap. FIFO eviction kicks in when
+    /// the store grows past this many entries. Default 10 000 per
+    /// the design doc. The session owns its own copy of this value
+    /// (set at `CcrSession.init`); the field is here so callers
+    /// can read the configured cap without reaching into the
+    /// session.
+    ccr_max_entries: u32 = ccr_integration_mod.default_max_entries,
+    /// v2.31 Phase 5 — optional pointer to a `CompressionStats`
+    /// struct the loop bumps as it compresses tool results and
+    /// compacts the transcript. The mode (print.zig) reads the
+    /// final values after `worker.join()` to emit the
+    /// session-end summary. Null disables stats collection.
+    stats: ?*at.CompressionStats = null,
 };
 
 pub const Transcript = at.Transcript;
@@ -356,6 +439,19 @@ pub fn agentLoop(
         };
     }
 
+    // v2.31 — at-start compaction pass. Handles sessions resumed from a
+    // long transcript on disk: the loop entry sees the loaded history
+    // above the `compact_after_messages` threshold and immediately
+    // collapses it before the first LLM call. The periodic pass below
+    // (every 10 turns) keeps the in-session transcript from drifting
+    // back over the threshold mid-run.
+    if (config.compression_enabled and config.compact_after_messages > 0) {
+        maybeCompact(allocator, transcript, config) catch |err| {
+            ai.log.log(.warn, "loop", "compact_at_start_failed", "err={s}", .{@errorName(err)});
+            // Non-fatal: keep the full history and let later turns run.
+        };
+    }
+
     var turn_count: u32 = 0;
     var current_cap: u32 = config.max_turns;
     var nudge_count: u32 = 0; // v2.27 — nudges injected this episode
@@ -380,6 +476,23 @@ pub fn agentLoop(
                 pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
                 return;
             };
+            // v2.31 — periodic compaction. Every 10 turns, check whether
+            // the transcript has drifted back over `compact_after_messages`
+            // and collapse it. The at-start pass already handles
+            // resumed-from-disk sessions; this prevents in-session
+            // drift. Cadence is 10 turns (the spec's chosen floor) —
+            // tighter cadences pay compaction cost on every turn and
+            // gain nothing for short sessions (the size check is the
+            // real trigger; the cadence is the polling interval).
+            if (config.compression_enabled and
+                config.compact_after_messages > 0 and
+                turn_count > 0 and turn_count % 10 == 0)
+            {
+                maybeCompact(allocator, transcript, config) catch |err| {
+                    ai.log.log(.warn, "loop", "compact_periodic_failed",
+                        "turn={d} err={s}", .{ turn_count, @errorName(err) });
+                };
+            }
             if (config.guardrails) |gr| {
                 const gr_wants_turn = gr.betweenTurns(allocator, io, transcript, out) catch |err| blk: {
                     ai.log.log(.warn, "guardrails", "between_turns_error", "err={s}", .{@errorName(err)});
@@ -725,6 +838,64 @@ fn maybeNudgeAutoContinue(
     return true;
 }
 
+/// v2.31 — check whether the transcript has crossed the compaction
+/// threshold and, if so, collapse the historical prefix. Used both
+/// at agent start (to handle resumed-from-disk sessions) and
+/// periodically (every 10 turns) so the in-session transcript doesn't
+/// drift back over the threshold.
+///
+/// CCR is intentionally left null for v2.31 — the `ccr_store_path`
+/// plumbing lives in Phase 3. When Phase 3 lands, this function
+/// gains a `ccr_store: ?*zompress.ccr.CcrStore` parameter and the
+/// call sites pass it through.
+///
+/// No-op when the transcript is below the threshold, the master
+/// switch is off, or compaction is disabled (`compact_after_messages == 0`).
+/// The caller is expected to have already gated on those two
+/// conditions before calling; this function is a defensive second
+/// check.
+fn maybeCompact(
+    allocator: std.mem.Allocator,
+    transcript: *Transcript,
+    config: Config,
+) !void {
+    if (!config.compression_enabled) return;
+    if (config.compact_after_messages == 0) return;
+    const messages = transcript.messages.items;
+    if (messages.len < config.compact_after_messages) return;
+
+    const original_count = messages.len;
+    // v2.31 Phase 3 — unwrap the session to its underlying CcrStore
+    // for zompress's `compactConversation` API. The loop never sees
+    // the store internals; it only borrows the session pointer
+    // long enough to extract the store.
+    const ccr_store: ?*zompress.ccr.CcrStore = if (config.ccr_session) |s| &s.ccr_store else null;
+    const compacted = try compaction_mod.compactConversation(
+        allocator,
+        messages,
+        config.compact_protect_recent,
+        ccr_store,
+    );
+
+    // v2.31 — `replaceMessages` deep-copies into the transcript,
+    // so the old `compacted` items are still owned by this function.
+    // We free them here (items first, then the outer slice).
+    if (config.stats) |s| s.compaction_count += 1;
+    try transcript.replaceMessages(compacted);
+    for (compacted) |*m| m.deinit(allocator);
+    allocator.free(compacted);
+
+    ai.log.log(.info, "loop", "compacted_conversation",
+        "messages={d}→{d} protect_recent={d} ccr={any}",
+        .{
+            original_count,
+            transcript.messages.items.len,
+            config.compact_protect_recent,
+            config.ccr_session != null,
+        },
+    );
+}
+
 /// Run one turn. Returns true if the caller should loop again, false to stop.
 fn runTurn(
     allocator: std.mem.Allocator,
@@ -1058,7 +1229,7 @@ fn runTurn(
     var all_terminate = true;
     for (results.items) |r| {
         if (!r.terminate) all_terminate = false;
-        const tr_msg = try makeToolResultMessage(allocator, r);
+        const tr_msg = try makeToolResultMessage(allocator, r, config);
         try out.push(io, .{ .message_start = .{ .role = .tool_result } });
         try out.push(io, .{ .message_end = try dupeMessage(allocator, tr_msg) });
         if (ai.log.enabledForScope(.trace, "message")) logMessageTrace("result", 0, tr_msg);
@@ -1316,10 +1487,26 @@ fn pushToolEnd(
     } });
 }
 
+/// v2.31 — build a tool-result message from a finalized `ToolCallResult`.
+///
+/// The text blocks go through (in order):
+///   1. **Content-aware compression** (only when `config.compression_enabled`
+///      AND `config.compress_tool_results` are both true). Tool outputs
+///      below `tool_compress_min_bytes` skip this step entirely; the
+///      `Config.min_tokens_to_compress` field is forwarded to zompress as
+///      the inner gate. We use the compressed text only if BOTH
+///      `result.tokens_saved > 0` AND the byte length is shorter than the
+///      raw input — the byte-length check guards against the case where
+///      zompress's heuristic tokenizer and the model's real tokenizer
+///      disagree on whether compression was worthwhile.
+///   2. **8 KiB flat cap** (existing v1.27.0 behaviour). Always the
+///      fallback when compression is disabled, fails, or doesn't help.
 fn makeToolResultMessage(
     allocator: std.mem.Allocator,
     r: ToolCallResult,
+    config: Config,
 ) !ai.types.Message {
+    const want_compress = config.compression_enabled and config.compress_tool_results;
     var copied: std.ArrayList(ai.types.ContentBlock) = .empty;
     errdefer {
         for (copied.items) |cb| cb.deinit(allocator);
@@ -1328,19 +1515,34 @@ fn makeToolResultMessage(
     for (r.result.content) |cb| {
         const block: ai.types.ContentBlock = switch (cb) {
             .text => |t| blk: {
-                if (t.text.len <= truncate.tool_result_max_bytes) break :blk try cb.dupe(allocator);
-                // Slice at UTF-8 boundary, then append a size marker so the
-                // model knows content was dropped.
-                var end = truncate.tool_result_max_bytes;
-                while (end > 0 and (t.text[end] & 0xc0) == 0x80) end -= 1;
-                const size_str = try truncate.formatSize(allocator, t.text.len);
-                defer allocator.free(size_str);
-                const text = try std.fmt.allocPrint(
-                    allocator,
-                    "{s}\n[...{s} truncated]",
-                    .{ t.text[0..end], size_str },
-                );
-                break :blk .{ .text = .{ .text = text } };
+                // Small outputs are passed through unchanged — calling
+                // zompress on a 200-byte JSON snippet costs more than it
+                // saves. The 8 KiB cap below catches the "medium" case
+                // (16 KiB log line, 12 KiB diff hunk) where compression
+                // might still help.
+                if (!want_compress or t.text.len < tool_compress_min_bytes) {
+                    break :blk try truncateOrPassthrough(allocator, t.text);
+                }
+                // v2.31 — try content-aware compression. On any failure
+                // (uncompressible input, allocator error, etc.) fall back
+                // to the 8 KiB cap so the model still gets a bounded
+                // payload. We never silently drop bytes.
+                // Note: CCR storage happens inside `compressText` before
+                // the zompress call — we do NOT pre-store here to avoid
+                // double-storing the same blob.
+                const zompress_cfg: zompress.CompressConfig = .{
+                    .smart_crusher_enabled = true,
+                    .log_compressor_enabled = true,
+                    .search_compressor_enabled = true,
+                    .diff_compressor_enabled = true,
+                    .min_tokens_to_compress = config.min_tokens_to_compress,
+                };
+                if (try compressText(allocator, t.text, zompress_cfg, config.ccr_session, config.stats)) |compressed| {
+                    break :blk .{ .text = .{ .text = compressed } };
+                }
+                // zompress did not save space (or returned a passthrough) —
+                // fall through to the existing 8 KiB cap path.
+                break :blk try truncateOrPassthrough(allocator, t.text);
             },
             else => try cb.dupe(allocator),
         };
@@ -1353,6 +1555,115 @@ fn makeToolResultMessage(
         .tool_call_id = try allocator.dupe(u8, r.call_id),
         .is_error = r.result.is_error,
     };
+}
+
+/// v2.31 — try `zompress.compress` and return the compressed text ONLY if
+/// it actually saves bytes. Returns `null` on any failure (caller falls back
+/// to the 8 KiB cap) or when compression was uneconomical.
+///
+/// We intentionally do NOT raise on zompress errors: the spec calls for a
+/// "fail silent → 8 KiB cap" fallback so a buggy compressor cannot break
+/// the agent loop. The caller logs the failure at debug level.
+///
+/// v2.31 ownership note: zompress's internal compressors (smart_crusher,
+/// log_compressor, etc.) allocate intermediate scratch state on the
+/// allocator we pass in. The result's `compressed`, `transforms_applied`,
+/// and `ccr_keys` slices are also allocated on that allocator. To avoid
+/// leaking the scratch state into the per-turn allocator (which is the
+/// caller's responsibility to free), we pass an arena allocator and free
+/// it on return. The result data we want to keep is duped onto the
+/// caller's allocator before the arena dies.
+fn compressText(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    zompress_cfg: zompress.CompressConfig,
+    ccr_session: ?*ccr_integration_mod.CcrSession,
+    stats: ?*at.CompressionStats,
+) !?[]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    // v2.31 Phase 5 — every call to zompress counts as an attempt
+    // regardless of outcome. The next two branches distinguish the
+    // "applied" and "skipped_uneconomical" outcomes.
+    if (stats) |s| s.compress_attempted += 1;
+
+    // v2.31 Phase 3 — store the ORIGINAL in CCR before compressing
+    // so the LLM can pull the full content back via the ccr_retrieve
+    // tool. Failures are non-fatal: the model still gets the
+    // compressed output, and the retrieve call returns CcrKeyNotFound
+    // for the missing key (clean degradation, not a crash).
+    if (ccr_session) |session| {
+        // Discard the CCR key — the loop only needs the side-effect
+        // of populating the store. The LLM pulls the key back via
+        // the ccr_retrieve tool, with the marker embedded in the
+        // compaction summary envelope.
+        _ = session.store(text) catch |err| {
+            ai.log.log(.debug, "loop", "ccr_store_failed",
+                "err={s}", .{@errorName(err)});
+        };
+    }
+
+    const result = zompress.compress(scratch, text, zompress_cfg) catch |err| {
+        ai.log.log(.debug, "loop", "compress_tool_result",
+            "zompress failed: {s}; falling back to 8KiB cap",
+            .{@errorName(err)},
+        );
+        return null;
+    };
+    // Two-pronged guardrail from the design doc (Phase 1): (a) zompress's
+    // internal token gate says it saved tokens, AND (b) the byte length is
+    // shorter than the input. The byte check catches the case where the
+    // model's tokenizer disagrees with zompress's heuristic by more than
+    // ~10%.
+    if (result.tokens_saved > 0 and result.compressed.len < text.len) {
+        // Copy the result slices onto the caller's allocator BEFORE the
+        // arena deinits (the result lives on the arena). This is the
+        // only durable copy of the data.
+        const owned = try allocator.dupe(u8, result.compressed);
+        ai.log.log(.debug, "loop", "compress_tool_result",
+            "input={d}B output={d}B ratio={d:.2} transforms={d} ccr_keys={d}",
+            .{ text.len, result.compressed.len, result.compression_ratio, result.transforms_applied.len, result.ccr_keys.len },
+        );
+        // v2.31 Phase 5 — bump the per-turn stats: applied
+        // counter and the byte totals. The `total_output_bytes`
+        // is the post-compression size, not the pre-cap 8 KiB
+        // size, so the ratio reflects what actually reaches the
+        // transcript.
+        if (stats) |s| {
+            s.compress_applied += 1;
+            s.total_input_bytes += text.len;
+            s.total_output_bytes += result.compressed.len;
+        }
+        return owned;
+    }
+    // v2.31 Phase 5 — zompress ran but lost the byte-length comparison.
+    // The user can use this counter to see whether their
+    // `min_tokens_to_compress` is set too low for their workload.
+    if (stats) |s| s.compress_skipped_uneconomical += 1;
+    return null;
+}
+
+/// Existing 8 KiB cap with size-marker suffix (unchanged from v1.27.0).
+/// Extracted so `makeToolResultMessage` can fall back here when
+/// compression is disabled or uneconomical.
+fn truncateOrPassthrough(allocator: std.mem.Allocator, text: []const u8) !ai.types.ContentBlock {
+    if (text.len <= truncate.tool_result_max_bytes) {
+        return .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    }
+    // Slice at UTF-8 boundary, then append a size marker so the
+    // model knows content was dropped.
+    var end = truncate.tool_result_max_bytes;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    const size_str = try truncate.formatSize(allocator, text.len);
+    defer allocator.free(size_str);
+    const truncated = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n[...{s} truncated]",
+        .{ text[0..end], size_str },
+    );
+    return .{ .text = .{ .text = truncated } };
 }
 
 fn makeErrorResult(allocator: std.mem.Allocator, text: []const u8) !at.ToolResult {
@@ -2095,6 +2406,40 @@ fn dupeMessage(allocator: std.mem.Allocator, m: ai.types.Message) !ai.types.Mess
 
 const testing = std.testing;
 
+/// v2.31 — minimal `Config` for unit tests that exercise pure functions
+/// (e.g. `makeToolResultMessage`, future `compactConversation`). Wires an
+/// empty registry, an empty tools slice, a no-op cancel handle, and lets
+/// the caller override any field via `overrides`. Caller must keep
+/// `reg` and `cancel` alive for as long as the Config is in use.
+fn testConfig(
+    reg: *ai.registry.Registry,
+    cancel: *ai.stream.Cancel,
+    overrides: struct {
+        compression_enabled: ?bool = null,
+        compress_tool_results: ?bool = null,
+        min_tokens_to_compress: ?u32 = null,
+        compact_after_messages: ?u32 = null,
+        compact_protect_recent: ?u32 = null,
+        ccr_session: ?*ccr_integration_mod.CcrSession = null,
+        ccr_max_entries: ?u32 = null,
+    },
+) Config {
+    var cfg: Config = .{
+        .model = .{ .id = "test", .provider = "test", .api = "test" },
+        .tools = &.{},
+        .registry = reg,
+        .cancel = cancel,
+    };
+    if (overrides.compression_enabled) |v| cfg.compression_enabled = v;
+    if (overrides.compress_tool_results) |v| cfg.compress_tool_results = v;
+    if (overrides.min_tokens_to_compress) |v| cfg.min_tokens_to_compress = v;
+    if (overrides.compact_after_messages) |v| cfg.compact_after_messages = v;
+    if (overrides.compact_protect_recent) |v| cfg.compact_protect_recent = v;
+    if (overrides.ccr_session) |v| cfg.ccr_session = v;
+    if (overrides.ccr_max_entries) |v| cfg.ccr_max_entries = v;
+    return cfg;
+}
+
 test "defaultConvertToLlm: compaction_summary rewritten to user + prefix" {
     const gpa = testing.allocator;
     var c_sum = [_]ai.types.ContentBlock{.{ .text = .{ .text = "the user fixed a bug" } }};
@@ -2553,6 +2898,9 @@ test "maybeApplyTextToolCallFallback: leaves message untouched when no match" {
 
 test "makeToolResultMessage: text blocks over 8KB are truncated with size marker" {
     const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
 
     // Build a 16KB text block — double the cap. The source buffer is stack-
     // owned by the fake ToolResult; makeToolResultMessage allocates new memory
@@ -2565,7 +2913,13 @@ test "makeToolResultMessage: text blocks over 8KB are truncated with size marker
     const result: at.ToolResult = .{ .content = (&cb)[0..1] };
     const call_result: ToolCallResult = .{ .call_id = "test_id", .result = result, .terminate = false };
 
-    var msg = try makeToolResultMessage(gpa, call_result);
+    // v2.31 — compression disabled (master switch off) — exercises the
+    // existing 8 KiB truncation path. The byte-length fast-path skips
+    // zompress anyway, but pinning compression_enabled=false guarantees
+    // we hit the legacy code path.
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compression_enabled = false,
+    }));
     defer msg.deinit(gpa);
 
     try testing.expect(msg.content.len == 1);
@@ -2577,6 +2931,9 @@ test "makeToolResultMessage: text blocks over 8KB are truncated with size marker
 
 test "makeToolResultMessage: text blocks under 8KB pass through unchanged" {
     const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
 
     // Source text is not owned by at.ToolResult — makeToolResultMessage dupes
     // it, so we free the original here.
@@ -2586,7 +2943,11 @@ test "makeToolResultMessage: text blocks under 8KB pass through unchanged" {
     const result: at.ToolResult = .{ .content = (&cb)[0..1] };
     const call_result: ToolCallResult = .{ .call_id = "id2", .result = result, .terminate = false };
 
-    var msg = try makeToolResultMessage(gpa, call_result);
+    // v2.31 — master switch off; the per-feature flag is irrelevant
+    // because the master is off (per the spec's precedence rule).
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compress_tool_results = true,
+    }));
     defer msg.deinit(gpa);
 
     try testing.expectEqualStrings("hello tool result", msg.content[0].text.text);
@@ -2649,4 +3010,384 @@ test "offloadToolResults: non-tool-result messages pass through unchanged" {
     try testing.expect(result.len == 2);
     try testing.expectEqualStrings("hello", result[0].content[0].text.text);
     try testing.expect(std.mem.indexOf(u8, result[1].content[0].text.text, "(offloaded)") != null);
+}
+
+// ─── v2.31 — tool-result compression tests ──────────────────────────────────
+//
+// Each test exercises a row in docs/design/decided/v2.31-compression.md
+// §3.1 Acceptance Check. The compression library is zompress; we treat
+// it as a black box and assert only on the *output* shape, never on
+// internal zompress behaviour (e.g. we don't pin the exact byte count
+// for compression — we only assert the output is shorter than the
+// input AND that error / structural markers survive).
+
+test "v2.31 makeToolResultMessage: < 256B input passes through unchanged (compression enabled)" {
+    // Spec §3.1 row: "< 256 bytes | Passthrough unchanged".
+    // Even with compression_enabled=true and compress_tool_results=true,
+    // tiny inputs skip the zompress call entirely.
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+
+    const small = try gpa.dupe(u8, "tiny");
+    defer gpa.free(small);
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = small } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "c1", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compression_enabled = true,
+        .compress_tool_results = true,
+    }));
+    defer msg.deinit(gpa);
+
+    try testing.expectEqualStrings("tiny", msg.content[0].text.text);
+}
+
+test "v2.31 makeToolResultMessage: master switch overrides per-feature flag" {
+    // Spec §6 master-switch precedence rule: master switch wins.
+    // compression_enabled=false forces the 8 KiB cap path even when
+    // compress_tool_results=true.
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+
+    // 16 KiB of plain prose. With compression off, this falls into the
+    // existing 8 KiB cap path — the marker `[...N truncated]` is the
+    // observable we check for.
+    const big = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'x');
+
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = big } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "c1", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compression_enabled = false, // master off
+        .compress_tool_results = true, // per-feature wants compression
+    }));
+    defer msg.deinit(gpa);
+
+    const text = msg.content[0].text.text;
+    // 8 KiB cap path emits the truncation marker.
+    try testing.expect(std.mem.indexOf(u8, text, "truncated]") != null);
+    try testing.expect(text.len <= truncate.tool_result_max_bytes + 64);
+}
+
+test "v2.31 makeToolResultMessage: large JSON array compresses, error marker preserved" {
+    // Spec §3.1 row 1: JSON array → compressed, error marker survives.
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+
+    // Build a synthetic JSON array of 200 items (~8 KiB) with one
+    // trailing error item that the SmartCrusher is supposed to keep.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "[");
+    var i: usize = 0;
+    while (i < 199) : (i += 1) {
+        if (i > 0) try buf.append(gpa, ',');
+        try buf.print(gpa, "{{\"id\":{d},\"msg\":\"ok item {d}\"}}", .{ i, i });
+    }
+    // The error item — must be kept verbatim by the SmartCrusher.
+    try buf.appendSlice(gpa, ",{\"id\":200,\"msg\":\"error: timeout reached\"}");
+    try buf.append(gpa, ']');
+    const input = try buf.toOwnedSlice(gpa);
+    defer gpa.free(input);
+
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = input } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "c1", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compression_enabled = true,
+        .compress_tool_results = true,
+    }));
+    defer msg.deinit(gpa);
+
+    const text = msg.content[0].text.text;
+    // We only assert the structural property: the compressed text is
+    // SHORTER than the input AND the error marker survives. The exact
+    // byte count varies with zompress's heuristic — we don't pin it.
+    if (text.len < input.len) {
+        // Compression actually helped — error marker MUST survive.
+        try testing.expect(std.mem.indexOf(u8, text, "error: timeout") != null);
+    } else {
+        // zompress returned a passthrough (e.g. couldn't classify) —
+        // 8 KiB cap kicks in. Verify the size-marker truncation.
+        try testing.expect(std.mem.indexOf(u8, text, "truncated]") != null);
+    }
+}
+
+test "v2.31 makeToolResultMessage: build log compresses, ERROR lines preserved" {
+    // Spec §3.1 row 3: "ERROR: crash\nTraceback\n...10K lines..." →
+    // ERROR + Traceback + context preserved, < input.len.
+    //
+    // The content detector's `looksLikeBuildOutput` only inspects the
+    // first 50 lines and needs error_count >= 3 to classify as
+    // `build_output`. We therefore sprinkle error/warning markers in
+    // the first 50 lines so the detector picks the right compressor.
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+
+    // First 50 lines: a mix of INFO + a few ERROR/WARNING lines so the
+    // detector hits error_count >= 3.
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        if (i == 10) {
+            try buf.appendSlice(gpa, "ERROR: first failure\n");
+        } else if (i == 25) {
+            try buf.appendSlice(gpa, "Traceback (most recent call last):\n");
+        } else if (i == 40) {
+            try buf.appendSlice(gpa, "WARNING: something looks off\n");
+        } else {
+            try buf.print(gpa, "INFO line {d}: everything is fine\n", .{i});
+        }
+    }
+    // 200 more INFO lines to push the input above the 8 KiB cap.
+    while (i < 250) : (i += 1) {
+        try buf.print(gpa, "INFO line {d}: everything is fine and stable\n", .{i});
+    }
+    // Tail with a fresh error.
+    try buf.appendSlice(gpa, "ERROR: tail error\n");
+    const input = try buf.toOwnedSlice(gpa);
+    defer gpa.free(input);
+    try testing.expect(input.len >= tool_compress_min_bytes);
+
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = input } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "c1", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compression_enabled = true,
+        .compress_tool_results = true,
+    }));
+    defer msg.deinit(gpa);
+
+    const text = msg.content[0].text.text;
+    if (text.len < input.len) {
+        // Compressed (log_compressor kept only the errors + context).
+        // At least one ERROR or traceback marker MUST survive.
+        const has_error = std.mem.indexOf(u8, text, "ERROR") != null;
+        const has_traceback = std.mem.indexOf(u8, text, "Traceback") != null;
+        try testing.expect(has_error or has_traceback);
+    } else {
+        // zompress passthrough (rare — only if the detector failed
+        // and passthrough returned input verbatim). The 8 KiB cap
+        // path emits the marker.
+        try testing.expect(std.mem.indexOf(u8, text, "truncated]") != null);
+    }
+}
+
+test "v2.31 makeToolResultMessage: git diff header preserved when compressed" {
+    // Spec §3.1 row 2: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ ..." →
+    // diff headers + +/- lines kept.
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "diff --git a/src/foo.zig b/src/foo.zig\n");
+    try buf.appendSlice(gpa, "--- a/src/foo.zig\n");
+    try buf.appendSlice(gpa, "+++ b/src/foo.zig\n");
+    try buf.appendSlice(gpa, "@@ -1,3 +1,3 @@\n");
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        try buf.print(gpa, "+line {d}\n", .{i});
+    }
+    const input = try buf.toOwnedSlice(gpa);
+    defer gpa.free(input);
+    try testing.expect(input.len >= tool_compress_min_bytes);
+
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = input } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "c1", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compression_enabled = true,
+        .compress_tool_results = true,
+    }));
+    defer msg.deinit(gpa);
+
+    const text = msg.content[0].text.text;
+    if (text.len < input.len) {
+        // Compressed — the diff header MUST survive.
+        try testing.expect(std.mem.indexOf(u8, text, "diff --git") != null);
+    } else {
+        // zompress passthrough → 8 KiB cap.
+        try testing.expect(std.mem.indexOf(u8, text, "truncated]") != null);
+    }
+}
+
+test "v2.31 makeToolResultMessage: no compression falls back to 8 KiB cap" {
+    // Spec §3.1 row 4: "Plain text prose | Same as old 8 KiB cap".
+    // With compression disabled, behaviour MUST be byte-identical to
+    // the pre-v2.31 path. We assert against the marker.
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+
+    const big = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'p'); // 'p' for "plain text prose"
+
+    var cb: ai.types.ContentBlock = .{ .text = .{ .text = big } };
+    const result: at.ToolResult = .{ .content = (&cb)[0..1] };
+    const call_result: ToolCallResult = .{ .call_id = "c1", .result = result, .terminate = false };
+
+    var msg = try makeToolResultMessage(gpa, call_result, testConfig(&reg, &cancel, .{
+        .compression_enabled = false,
+    }));
+    defer msg.deinit(gpa);
+
+    const text = msg.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, text, "truncated]") != null);
+    try testing.expect(text.len <= truncate.tool_result_max_bytes + 64);
+}
+
+// ─── v2.31 Phase 2 — maybeCompact wiring tests ───────────────────────
+
+test "v2.31 maybeCompact: no-op when master switch is off" {
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    // Fill the transcript with 60 messages. The text content is
+    // duplicated onto the test allocator; the transcript takes
+    // ownership via `append` and `deinit` will free it on cleanup.
+    // We do NOT use `defer gpa.free(txt)` inside the loop — `defer`
+    // would fire on the next iteration, freeing the previous iteration's
+    // text and leaving the transcript with a dangling pointer.
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        const txt = try gpa.dupe(u8, "hello");
+        const content = try gpa.alloc(ai.types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = txt } };
+        try transcript.append(.{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = content,
+            .timestamp = @intCast(i),
+        });
+    }
+
+    // Master switch off → no compaction.
+    try maybeCompact(gpa, &transcript, testConfig(&reg, &cancel, .{
+        .compression_enabled = false,
+        .compact_after_messages = 50,
+    }));
+    try testing.expectEqual(@as(usize, 60), transcript.messages.items.len);
+}
+
+test "v2.31 maybeCompact: no-op when compact_after_messages is 0" {
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        const txt = try gpa.dupe(u8, "hi");
+        const content = try gpa.alloc(ai.types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = txt } };
+        try transcript.append(.{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = content,
+            .timestamp = @intCast(i),
+        });
+    }
+
+    try maybeCompact(gpa, &transcript, testConfig(&reg, &cancel, .{
+        .compression_enabled = true,
+        .compact_after_messages = 0,
+    }));
+    try testing.expectEqual(@as(usize, 60), transcript.messages.items.len);
+}
+
+test "v2.31 maybeCompact: no-op when transcript is below threshold" {
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    // Only 30 messages — below the 50 threshold.
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        const txt = try gpa.dupe(u8, "x");
+        const content = try gpa.alloc(ai.types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = txt } };
+        try transcript.append(.{
+            .role = .user,
+            .content = content,
+            .timestamp = @intCast(i),
+        });
+    }
+
+    try maybeCompact(gpa, &transcript, testConfig(&reg, &cancel, .{
+        .compression_enabled = true,
+        .compact_after_messages = 50,
+    }));
+    try testing.expectEqual(@as(usize, 30), transcript.messages.items.len);
+}
+
+test "v2.31 maybeCompact: compacts when transcript exceeds threshold" {
+    const gpa = testing.allocator;
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    var cancel = ai.stream.Cancel{};
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    // 60 messages with text long enough to compress.
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        var txt_buf: [128]u8 = undefined;
+        const txt = std.fmt.bufPrint(
+            txt_buf[0..],
+            "message {d} with some text content that should compress well",
+            .{i},
+        ) catch unreachable;
+        const duped = try gpa.dupe(u8, txt);
+        const content = try gpa.alloc(ai.types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = duped } };
+        try transcript.append(.{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = content,
+            .timestamp = @intCast(i),
+        });
+    }
+
+    try maybeCompact(gpa, &transcript, testConfig(&reg, &cancel, .{
+        .compression_enabled = true,
+        .compact_after_messages = 50,
+        .compact_protect_recent = 8,
+    }));
+
+    // Should be reduced to 1 summary + 8 protected = 9 messages
+    // (or the "too small" path may keep it longer if compression
+    // didn't help — we just check it's smaller than the input).
+    try testing.expect(transcript.messages.items.len < 60);
+    // The first message is the compaction_summary.
+    try testing.expectEqual(ai.types.Role.custom, transcript.messages.items[0].role);
+    try testing.expect(transcript.messages.items[0].custom_role != null);
+    try testing.expectEqualStrings("compaction_summary", transcript.messages.items[0].custom_role.?);
 }

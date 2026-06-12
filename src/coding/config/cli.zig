@@ -195,6 +195,41 @@ pub const Config = struct {
     /// Read from profile `base_delay_ms` in settings.json.
     retry_base_delay_ms: ?u32 = null,
 
+    /// v2.31 — `--compression` / `--no-compression` — master switch for
+    /// the entire compression subsystem. `null` means "no CLI flag" and
+    /// the settings.json / built-in default wins. `--compression` flips
+    /// it to `true`; `--no-compression` flips it to `false`. Passing any
+    /// per-feature compression flag (e.g. `--compress-tool-results`) also
+    /// implicitly flips this to `true` — per the design doc, those flags
+    /// are shortcuts that enable the master switch.
+    compression_enabled: ?bool = null,
+    /// v2.31 — `--compress-tool-results` — per-feature opt-in for
+    /// content-aware tool-result compression. `null` means "no CLI flag";
+    /// the settings.json / built-in default (off) wins. When the user
+    /// sets this CLI flag, `compression_enabled` is also flipped to
+    /// `true` (in dispatchFlag) so the master switch is on.
+    compress_tool_results: ?bool = null,
+    /// v2.31 — `--min-tokens-to-compress N` — override the per-type
+    /// token gate forwarded to zompress as
+    /// `CompressConfig.min_tokens_to_compress`. Default 100.
+    min_tokens_to_compress: ?u32 = null,
+    /// v2.31 — `--compact-after N` — conversation compaction
+    /// threshold. When the transcript exceeds N messages, older
+    /// messages are collapsed into a single `compaction_summary`
+    /// custom-role message. 0 disables (default). Implicit
+    /// `--compression` per the design doc Phase 4 master-switch rule.
+    compact_after_messages: ?u32 = null,
+    /// v2.31 — `--compact-protect-recent N` — number of most recent
+    /// messages to protect from compaction. Default 8.
+    compact_protect_recent: ?u32 = null,
+    /// v2.31 Phase 3 — `--ccr-store <path>` — enable CCR with
+    /// on-disk persistence at `<path>`. Default null (CCR disabled).
+    /// Implicit master-on.
+    ccr_store_path: ?[]const u8 = null,
+    /// v2.31 Phase 3 — `--ccr-max-entries N` — FIFO cap for the
+    /// CCR store. Default 10 000.
+    ccr_max_entries: ?u32 = null,
+
     /// v2.16 — pre-rendered review configuration block for system-prompt
     /// injection. Populated by mode drivers from settings before calling
     /// buildSystemPromptIo. Null when multi-model review is not configured.
@@ -398,6 +433,25 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
         cfg.no_standards = true;
         return true;
     }
+    // v2.31 — compression master switch + per-feature opt-in. Per the
+    // design doc, any per-feature flag implicitly enables the master
+    // switch (it's the "kill it entirely" knob, not the per-feature
+    // toggles). The implicit-enable happens by setting
+    // `compression_enabled` to `true` whenever the user passes a
+    // per-feature flag like `--compress-tool-results`.
+    if (std.mem.eql(u8, name, "--compression")) {
+        cfg.compression_enabled = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compression")) {
+        cfg.compression_enabled = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-tool-results")) {
+        cfg.compress_tool_results = true;
+        cfg.compression_enabled = true; // implicit master-on
+        return true;
+    }
     if (std.mem.eql(u8, name, "--autocontinue")) {
         cfg.autocontinue = true;
         return true;
@@ -477,6 +531,36 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
     } else if (std.mem.eql(u8, name, "--proxy-port")) {
         const v = try takeValue(argv, i, inline_value);
         cfg.proxy_port = std.fmt.parseInt(u16, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--min-tokens-to-compress")) {
+        // v2.31 — the only compression flag that takes a value.
+        // Per the design doc, passing this implicitly enables the
+        // master switch — same as the per-feature boolean flags.
+        const v = try takeValue(argv, i, inline_value);
+        cfg.min_tokens_to_compress = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        cfg.compression_enabled = true; // implicit master-on
+    } else if (std.mem.eql(u8, name, "--compact-after")) {
+        // v2.31 — Phase 2 conversation compaction. Implicit
+        // master-on per the design doc.
+        const v = try takeValue(argv, i, inline_value);
+        cfg.compact_after_messages = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        cfg.compression_enabled = true;
+    } else if (std.mem.eql(u8, name, "--compact-protect-recent")) {
+        // v2.31 — Phase 2. Implicit master-on.
+        const v = try takeValue(argv, i, inline_value);
+        cfg.compact_protect_recent = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        cfg.compression_enabled = true;
+    } else if (std.mem.eql(u8, name, "--ccr-store")) {
+        // v2.31 Phase 3 — enable CCR with on-disk persistence.
+        // Implicit master-on. Empty path disables CCR even if the
+        // flag was passed.
+        const v = try takeValue(argv, i, inline_value);
+        cfg.ccr_store_path = try a.dupe(u8, v);
+        cfg.compression_enabled = true;
+    } else if (std.mem.eql(u8, name, "--ccr-max-entries")) {
+        // v2.31 Phase 3 — CCR FIFO cap. Default 10 000.
+        const v = try takeValue(argv, i, inline_value);
+        cfg.ccr_max_entries = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+        cfg.compression_enabled = true;
     } else if (std.mem.eql(u8, name, "--register")) {
         cfg.register_url = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--connect-timeout-ms")) {
@@ -599,6 +683,32 @@ pub const usage_text: []const u8 =
     \\  --max-turns N                Cap agent-loop turns per prompt (default 100).
     \\                               Reaching the cap emits agent_error{max_turns_exceeded};
     \\                               interactive mode prompts to extend.
+    \\  --compression / --no-compression
+    \\                               Master switch for content-aware compression
+    \\                               (tool results, conversation compaction, CCR).
+    \\                               Per-feature flags below implicitly enable this.
+    \\  --compress-tool-results      Run tool outputs through zompress before
+    \\                               sending to the LLM. Falls back to 8 KiB
+    \\                               cap on failure or when compression doesn't
+    \\                               help. (Implicit --compression.)
+    \\  --min-tokens-to-compress N   Token gate forwarded to zompress
+    \\                               (default 100). (Implicit --compression.)
+    \\  --compact-after N            Compact conversation history after N
+    \\                               messages (default 0 = off). The last
+    \\                               8 messages stay in full fidelity
+    \\                               (tune with --compact-protect-recent).
+    \\                               (Implicit --compression.)
+    \\  --compact-protect-recent N   Number of most recent messages to
+    \\                               protect from compaction (default 8).
+    \\                               (Implicit --compression.)
+    \\  --ccr-store PATH             Enable Compress-Cache-Retrieve with
+    \\                               on-disk persistence at PATH. The store
+    \\                               lets the LLM pull back the original
+    \\                               content of compressed tool outputs.
+    \\                               (Implicit --compression.)
+    \\  --ccr-max-entries N         FIFO cap for the CCR store (default
+    \\                               10000). Eviction is logged at debug.
+    \\                               (Implicit --compression.)
     \\  --prompts                    Enable per-tool permission gate (Approach A)
     \\  --yes, -y                    Auto-allow every "ask" decision (CI mode)
     \\  --allow-tools LIST           CSV of tool names or bash:<fingerprint>
@@ -819,4 +929,88 @@ test "parse: every v0.10.0 flag defaults to null/false" {
     try testing.expect(cfg.theme == null);
     try testing.expect(!cfg.offline);
     try testing.expect(cfg.extensions == null);
+}
+
+// v2.31 — compression flag tests. Mirrors the design doc Phase 4
+// precedence rule: per-feature flags implicitly enable the master
+// switch; the explicit `--no-compression` flips it off regardless.
+test "parse: --compression sets the master switch" {
+    var cfg = try parse(testing.allocator, &.{ "franky", "--compression" });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?bool, true), cfg.compression_enabled);
+}
+
+test "parse: --no-compression clears the master switch" {
+    var cfg = try parse(testing.allocator, &.{ "franky", "--no-compression" });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?bool, false), cfg.compression_enabled);
+}
+
+test "parse: --compress-tool-results implicitly enables master switch" {
+    var cfg = try parse(testing.allocator, &.{ "franky", "--compress-tool-results" });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?bool, true), cfg.compress_tool_results);
+    // Per the spec: per-feature flags implicitly enable the master switch.
+    try testing.expectEqual(@as(?bool, true), cfg.compression_enabled);
+}
+
+test "parse: --min-tokens-to-compress accepts an integer" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky", "--min-tokens-to-compress", "250",
+    });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, 250), cfg.min_tokens_to_compress);
+    // Implicit master-on.
+    try testing.expectEqual(@as(?bool, true), cfg.compression_enabled);
+}
+
+test "parse: --no-compression overrides per-feature implicit master-on" {
+    // Spec: master switch wins. Per-feature flags enable the master by
+    // default, but `--no-compression` is a direct override.
+    var cfg = try parse(testing.allocator, &.{
+        "franky", "--compress-tool-results", "--no-compression",
+    });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?bool, false), cfg.compression_enabled);
+    // The per-feature flag itself is still on; the master switch is off.
+    try testing.expectEqual(@as(?bool, true), cfg.compress_tool_results);
+}
+
+// v2.31 — Phase 2 compaction flags. Implicit master-on per the spec.
+test "parse: --compact-after accepts an integer" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky", "--compact-after", "50",
+    });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, 50), cfg.compact_after_messages);
+    try testing.expectEqual(@as(?bool, true), cfg.compression_enabled);
+}
+
+test "parse: --compact-protect-recent accepts an integer" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky", "--compact-protect-recent", "12",
+    });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, 12), cfg.compact_protect_recent);
+    try testing.expectEqual(@as(?bool, true), cfg.compression_enabled);
+}
+
+// v2.31 Phase 3 — CCR flag tests. Implicit master-on per the spec.
+test "parse: --ccr-store accepts a path" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky", "--ccr-store", "/tmp/franky.ccr.jsonl",
+    });
+    defer cfg.deinit();
+    try testing.expect(cfg.ccr_store_path != null);
+    try testing.expectEqualStrings("/tmp/franky.ccr.jsonl", cfg.ccr_store_path.?);
+    try testing.expectEqual(@as(?bool, true), cfg.compression_enabled);
+}
+
+test "parse: --ccr-max-entries accepts an integer" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky", "--ccr-max-entries", "5000",
+    });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(?u32, 5000), cfg.ccr_max_entries);
+    try testing.expectEqual(@as(?bool, true), cfg.compression_enabled);
 }

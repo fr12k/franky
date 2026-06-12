@@ -117,12 +117,38 @@ pub const Settings = struct {
     /// `review.timeoutMs` — per-subagent wall-clock timeout in ms. Default 180 000 (3 min).
     review_timeout_ms: u64 = 180_000,
 
+    /// v2.31 — `compression.enabled` — master switch for the entire
+    /// compression subsystem. Mirrors `loop.Config.compression_enabled`.
+    /// `null` means "no compression block at any settings layer" — the
+    /// Agent.Config field's built-in default (false) applies. Non-null
+    /// values from a user/project layer win over the default per the
+    /// standard settings precedence (CLI > settings > built-in).
+    compression_enabled: ?bool = null,
+    /// v2.31 — `compression.min_tokens_to_compress` — forwarded to
+    /// zompress as `CompressConfig.min_tokens_to_compress`. Same
+    /// `null` semantics as `compression_enabled` — built-in default
+    /// of 100 tokens applies when no layer sets a value.
+    compression_min_tokens_to_compress: ?u32 = null,
+    /// v2.31 — `compression.compactAfterMessages` — conversation
+    /// compaction threshold. 0 disables. Mirrors `Config.compact_after_messages`.
+    compression_compact_after_messages: ?u32 = null,
+    /// v2.31 — `compression.compactProtectRecent` — number of most
+    /// recent messages protected from compaction. Default 8.
+    compression_compact_protect_recent: ?u32 = null,
+    /// v2.31 Phase 3 — `compression.ccrStorePath` — path to the
+    /// on-disk CCR store. Null disables CCR entirely.
+    compression_ccr_store_path: ?[]const u8 = null,
+    /// v2.31 Phase 3 — `compression.ccrMaxEntries` — FIFO cap for
+    /// the CCR store. Default 10 000.
+    compression_ccr_max_entries: ?u32 = null,
+
     pub fn deinit(self: *Settings) void {
         self.allocator.free(self.default_provider);
         self.allocator.free(self.default_model_anthropic);
         self.allocator.free(self.default_model_openai);
         self.allocator.free(self.thinking);
         self.allocator.free(self.theme);
+        if (self.compression_ccr_store_path) |p| self.allocator.free(p);
         deinitStringArray(self.allocator, self.permissions_always_allow_tools);
         deinitStringArray(self.allocator, self.permissions_always_allow_bash);
         deinitStringArray(self.allocator, self.permissions_always_deny_tools);
@@ -328,6 +354,41 @@ fn applyReviewSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     };
 }
 
+/// v2.31 — `compression.*` settings-layer overlay. The master switch
+/// is `compression.enabled`; `compression.min_tokens_to_compress` is
+/// forwarded to zompress as `CompressConfig.min_tokens_to_compress`.
+/// Mirrors the design doc Phase 4 settings-zig wiring — same `null`
+/// semantics as every other optional setting: `null` means "no
+/// setting at any layer" and the Agent.Config default wins. Per the
+/// design doc precedence rule (CLI > settings > default), the CLI
+/// `--compression` / `--no-compression` flags are applied by the
+/// caller after `loadLayered` returns and override whatever this
+/// section set. `compression.compactAfterMessages` and
+/// `compression.compactProtectRecent` configure conversation
+/// compaction (Phase 2).
+fn applyCompressionSection(settings: *Settings, obj: std.json.ObjectMap) !void {
+    if (obj.get("compression")) |c_v| if (c_v == .object) {
+        if (c_v.object.get("enabled")) |e| if (e == .bool) {
+            settings.compression_enabled = e.bool;
+        };
+        if (c_v.object.get("min_tokens_to_compress")) |m| if (m == .integer and m.integer >= 0 and m.integer <= std.math.maxInt(u32)) {
+            settings.compression_min_tokens_to_compress = @intCast(m.integer);
+        };
+        if (c_v.object.get("compactAfterMessages")) |m| if (m == .integer and m.integer >= 0 and m.integer <= std.math.maxInt(u32)) {
+            settings.compression_compact_after_messages = @intCast(m.integer);
+        };
+        if (c_v.object.get("compactProtectRecent")) |m| if (m == .integer and m.integer >= 0 and m.integer <= std.math.maxInt(u32)) {
+            settings.compression_compact_protect_recent = @intCast(m.integer);
+        };
+        if (c_v.object.get("ccrStorePath")) |p| if (p == .string and p.string.len > 0) {
+            settings.compression_ccr_store_path = try settings.allocator.dupe(u8, p.string);
+        };
+        if (c_v.object.get("ccrMaxEntries")) |m| if (m == .integer and m.integer > 0 and m.integer <= std.math.maxInt(u32)) {
+            settings.compression_ccr_max_entries = @intCast(m.integer);
+        };
+    };
+}
+
 fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !bool {
     const alloc = settings.allocator;
     // Scratch arena for the file read only; JSON parsing has its own scratch in
@@ -364,6 +425,7 @@ fn applyLayerBytes(settings: *Settings, bytes: []const u8) !void {
     try applyTopLevelFields(settings, obj);
     try applyToolsSection(settings, obj);
     try applyPermissionsSection(settings, obj);
+    try applyCompressionSection(settings, obj);
 
     if (obj.get("prompts")) |v| if (v == .bool) {
         settings.prompts_default = v.bool;
@@ -529,6 +591,90 @@ test "loadLayered: tools.bash.timeoutMs + tools.read.maxBytes" {
     defer s.deinit();
     try testing.expectEqual(@as(?u64, 30_000), s.bash_timeout_ms);
     try testing.expectEqual(@as(?usize, 524_288), s.read_max_bytes);
+}
+
+// v2.31 — compression block test (mirrors `tools.bash.timeoutMs` above).
+test "loadLayered: compression.enabled + min_tokens_to_compress" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_compression_overlay";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"compression":{"enabled":true,"min_tokens_to_compress":200}}
+        );
+    }
+
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?bool, true), s.compression_enabled);
+    try testing.expectEqual(@as(?u32, 200), s.compression_min_tokens_to_compress);
+}
+
+test "loadLayered: compression overlay defaults remain null when absent" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var s = try loadLayered(testing.allocator, io, null, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?bool, null), s.compression_enabled);
+    try testing.expectEqual(@as(?u32, null), s.compression_min_tokens_to_compress);
+    try testing.expectEqual(@as(?u32, null), s.compression_compact_after_messages);
+    try testing.expectEqual(@as(?u32, null), s.compression_compact_protect_recent);
+}
+
+test "loadLayered: compression.compactAfterMessages + compactProtectRecent" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_compaction_overlay";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"compression":{"compactAfterMessages":50,"compactProtectRecent":12}}
+        );
+    }
+
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expectEqual(@as(?u32, 50), s.compression_compact_after_messages);
+    try testing.expectEqual(@as(?u32, 12), s.compression_compact_protect_recent);
+}
+
+test "loadLayered: compression.ccrStorePath + ccrMaxEntries" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "/tmp/franky_settings_ccr_overlay";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, base ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"compression":{"ccrStorePath":"/tmp/franky.ccr","ccrMaxEntries":5000}}
+        );
+    }
+
+    var s = try loadLayered(testing.allocator, io, base, null);
+    defer s.deinit();
+    try testing.expect(s.compression_ccr_store_path != null);
+    try testing.expectEqualStrings("/tmp/franky.ccr", s.compression_ccr_store_path.?);
+    try testing.expectEqual(@as(?u32, 5000), s.compression_ccr_max_entries);
 }
 
 test "loadLayered: tools overlay defaults remain null when absent" {

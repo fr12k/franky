@@ -67,6 +67,18 @@ pub fn build(b: *std.Build) void {
     });
     franky_module.addOptions("build_options", franky_options);
 
+    // v2.31 — content-aware compression via the zompress dependency.
+    // The dep is pinned in `build.zig.zon`; the `zompress` module is
+    // registered by zompress's own `build.zig` (see the local patch note
+    // in the dependency cache). Re-exported from `src/root.zig` so the
+    // rest of franky can `@import("zompress")` through the public facade.
+    const zompress_dep = b.dependency("zompress", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zompress_mod = zompress_dep.module("zompress");
+    franky_module.addImport("zompress", zompress_mod);
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/bin/main.zig"),
         .target = target,
@@ -143,6 +155,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_module.addOptions("build_options", test_options);
+    // v2.31 — same `zompress` import wiring for the test module so unit
+    // tests in `src/` can exercise the compression path directly.
+    test_module.addImport("zompress", zompress_mod);
     const unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = test_module,
@@ -256,6 +271,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     profile_test_module.addOptions("build_options", franky_options);
+    profile_test_module.addImport("zompress", zompress_mod);
     const profile_unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = profile_test_module,

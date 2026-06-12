@@ -28,6 +28,7 @@ const settings_mod = franky.coding.settings;
 const profiles_mod = franky.coding.profiles;
 const auth_mod = franky.coding.auth;
 const models_mod = franky.coding.models;
+const ccr_integration_mod = franky.agent.ccr_integration;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
 const skills_mod = franky.coding.skills;
@@ -99,6 +100,23 @@ pub const ResolvedConfig = struct {
     retry_policy: ai.retry.Policy,
     max_turns: u32,
     prompts_enabled: bool,
+
+    // ── v2.31 — compression overlay values ──────────────────────
+    // Mirrors the precedence CLI > settings > default. The print
+    // mode reads these from `resolved` and applies them to
+    // `loop.Config` after construction.
+    compression_enabled: bool,
+    compress_tool_results: bool,
+    min_tokens_to_compress: u32,
+    /// v2.31 Phase 2 — conversation compaction threshold. 0 disables.
+    compact_after_messages: u32,
+    /// v2.31 Phase 2 — number of most recent messages protected from
+    /// compaction. Default 8.
+    compact_protect_recent: u32,
+    /// v2.31 Phase 3 — on-disk CCR store path. Null disables CCR.
+    ccr_store_path: ?[]const u8,
+    /// v2.31 Phase 3 — CCR FIFO cap. Default 10 000.
+    ccr_max_entries: u32,
 
     // ── Workspace ────────────────────────────────────────────────
     workspace: ?*tools_mod.workspace.Workspace,
@@ -449,6 +467,86 @@ pub fn resolvePromptsDefault(
 ) bool {
     if (cfg.prompts) return true; // CLI wins.
     return settings.prompts_default orelse false;
+}
+
+/// v2.31 — resolve the master `compression.enabled` switch for the
+/// agent loop. Precedence (per the design doc Phase 4):
+///   1. CLI flag (`--compression` / `--no-compression`) wins.
+///   2. settings.json `compression.enabled` (when set).
+///   3. Built-in default: false (compression is opt-in).
+/// Per-feature flags (`--compress-tool-results`,
+/// `--min-tokens-to-compress`) implicitly flip the master switch in
+/// `cli_mod.parse`, so by the time we get here, `cfg.compression_enabled`
+/// is non-null whenever the user passed ANY compression-related CLI flag.
+pub fn resolveCompressionEnabled(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) bool {
+    if (cfg.compression_enabled) |v| return v;
+    return settings.compression_enabled orelse false;
+}
+
+/// v2.31 — same chain as `resolveCompressionEnabled` for the per-feature
+/// `compress_tool_results` flag. Distinct from the master switch: the
+/// per-feature flag is always opt-in, the master switch is the kill
+/// switch. settings.json doesn't currently have a per-feature override
+/// (the spec keeps per-feature flags behind the master switch), so this
+/// resolves to `false` unless the CLI sets it.
+pub fn resolveCompressToolResults(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) bool {
+    _ = settings; // no settings-layer override exists today.
+    return cfg.compress_tool_results orelse false;
+}
+
+/// v2.31 — same chain for the per-type token gate forwarded to zompress
+/// as `CompressConfig.min_tokens_to_compress`. Default 100 per the spec.
+pub fn resolveMinTokensToCompress(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) u32 {
+    if (cfg.min_tokens_to_compress) |v| return v;
+    return settings.compression_min_tokens_to_compress orelse 100;
+}
+
+/// v2.31 Phase 2 — same chain for `compact_after_messages`. 0 disables
+/// compaction. Mirrors the design doc's `compression.compactAfterMessages`
+/// settings key and the `--compact-after N` CLI flag.
+pub fn resolveCompactAfterMessages(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) u32 {
+    if (cfg.compact_after_messages) |v| return v;
+    return settings.compression_compact_after_messages orelse 0;
+}
+
+/// v2.31 Phase 2 — same chain for `compact_protect_recent`. Default 8.
+pub fn resolveCompactProtectRecent(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) u32 {
+    if (cfg.compact_protect_recent) |v| return v;
+    return settings.compression_compact_protect_recent orelse 8;
+}
+
+/// v2.31 Phase 3 — same chain for the CCR persist path. Null
+/// disables CCR entirely.
+pub fn resolveCcrStorePath(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) ?[]const u8 {
+    if (cfg.ccr_store_path) |v| return v;
+    return settings.compression_ccr_store_path;
+}
+
+/// v2.31 Phase 3 — same chain for the CCR FIFO cap. Default 10 000.
+pub fn resolveCcrMaxEntries(
+    cfg: *const cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) u32 {
+    if (cfg.ccr_max_entries) |v| return v;
+    return settings.compression_ccr_max_entries orelse 10_000;
 }
 
 /// Resolve max_turns from CLI flag, env var, or null.
@@ -871,6 +969,14 @@ pub fn resolve(
     environ: std.process.Environ,
     environ_map: *std.process.Environ.Map,
     argv: []const []const u8,
+    /// v2.31 Phase 3 — optional CCR session to wire into the tool
+    /// list. The mode (which owns the session because it owns the
+    /// `io` lifetime) passes it in; passing null disables the
+    /// `ccr_retrieve` tool registration but does NOT disable the
+    /// CCR store on the compression path — the loop's
+    /// `Config.ccr_session` is independent (the mode sets that
+    /// directly on the loop_cfg, not through the resolver).
+    ccr_session: ?*ccr_integration_mod.CcrSession,
 ) !ResolvedConfig {
     _ = argv; // needed only for proxy mode restart
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1116,7 +1222,11 @@ pub fn resolve(
     };
     const all_final_tools = blk: {
         const base_len = role_filtered_tools.len + ext_tools.len;
-        const slice = try a.alloc(at.AgentTool, base_len + 3);
+        // v2.31 Phase 3 — the ccr_retrieve tool is appended LAST
+        // and only when a session was passed in. We size the slice
+        // for the full +4 case up front; if CCR is disabled we
+        // truncate by rebuilding the slice without the last entry.
+        const slice = try a.alloc(at.AgentTool, base_len + 4);
         @memcpy(slice[0..role_filtered_tools.len], role_filtered_tools);
         if (ext_tools.len > 0) {
             @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
@@ -1124,7 +1234,16 @@ pub fn resolve(
         slice[base_len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
         slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
         slice[base_len + 2] = guardrail_state.finishTaskTool();
-        break :blk slice;
+        // ccr_retrieve only registers when the mode passed a
+        // session in. Without a session there's nothing to retrieve
+        // from; registering a tool that always fails would be
+        // worse than not registering it at all.
+        if (ccr_session) |session| {
+            slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithSession(session);
+            break :blk slice[0 .. base_len + 4];
+        } else {
+            break :blk slice[0 .. base_len + 3];
+        }
     };
 
     // ── Step 14: Build review config block ───────────────────────
@@ -1176,6 +1295,16 @@ pub fn resolve(
         .retry_policy = retry_policy,
         .max_turns = max_turns_val,
         .prompts_enabled = prompts_enabled,
+        // v2.31 — resolve compression precedence (CLI > settings > default).
+        // The helpers in this file mirror the standard `resolveXxx`
+        // shape used by max_turns / prompts — each is a one-liner.
+        .compression_enabled = resolveCompressionEnabled(cfg, &settings),
+        .compress_tool_results = resolveCompressToolResults(cfg, &settings),
+        .min_tokens_to_compress = resolveMinTokensToCompress(cfg, &settings),
+        .compact_after_messages = resolveCompactAfterMessages(cfg, &settings),
+        .compact_protect_recent = resolveCompactProtectRecent(cfg, &settings),
+        .ccr_store_path = resolveCcrStorePath(cfg, &settings),
+        .ccr_max_entries = resolveCcrMaxEntries(cfg, &settings),
         .workspace = workspace_state,
         .bash_state = bash_state,
         .read_ctx = read_ctx,

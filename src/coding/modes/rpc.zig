@@ -156,7 +156,7 @@ fn initSession(
     // permission store, preset registry, guardrails, etc. inline.
     const resolved = try allocator.create(config_mod.ResolvedConfig);
     errdefer allocator.destroy(resolved);
-    resolved.* = try config_mod.resolve(allocator, io, cfg, environ, environ_map, &.{});
+    resolved.* = try config_mod.resolve(allocator, io, cfg, environ, environ_map, &.{}, null);
 
     // ── Step 2: RPC-specific role arena ───────────────────────
     var role_arena = std.heap.ArenaAllocator.init(allocator);

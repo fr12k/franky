@@ -12,6 +12,12 @@ pub const ai = @import("ai/mod.zig");
 pub const agent = @import("agent/mod.zig");
 pub const coding = @import("coding/mod.zig");
 pub const tui = @import("tui/mod.zig");
+/// v2.31 — content-aware compression library. Re-exported at the top
+/// level so dependents of franky can `franky.zompress.compress(...)` etc.
+/// The dependency is wired in `build.zig` via `b.dependency("zompress", …)`
+/// and the `zompress` module is registered by the upstream build script
+/// (see patch note in `zig-pkg/zompress-*/build.zig`).
+pub const zompress = @import("zompress");
 /// Programmatic SDK facade (§5.9). Re-exports the stable public
 /// surface for embedding franky in other Zig programs without
 /// learning the ai/ vs agent/ vs coding/ layering. Deeper modules
@@ -41,4 +47,5 @@ test {
     _ = tui;
     _ = sdk;
     _ = test_helpers;
+    _ = zompress;
 }

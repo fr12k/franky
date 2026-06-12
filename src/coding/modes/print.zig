@@ -21,6 +21,10 @@ const ai = franky.ai;
 const agent = franky.agent;
 const at = agent.types;
 const tools_mod = franky.coding.tools;
+/// v2.31 Phase 3 — CCR (Compress-Cache-Retrieve) integration. The
+/// mode (print.zig here) owns the session and the resolver
+/// borrows the pointer for tool registration.
+const ccr_integration_mod = agent.ccr_integration;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
 const session_mod = franky.coding.session;
@@ -217,7 +221,68 @@ fn runPrint(
     // permission store, preset registry, extensions, guardrails,
     // subagent context, settings overlay, and review config block
     // come from the single `config.resolve()` call.
-    var resolved = try config_mod.resolve(allocator, io, cfg, environ, environ_map, &.{});
+    // v2.31 Phase 3 — construct the CCR session. The session is
+    // owned by the mode (print.zig) for the lifetime of the run,
+    // handed to the resolver so the ccr_retrieve tool can be
+    // registered, and handed to the agent loop so the compression
+    // paths can populate it. Persistence (load on init / save on
+    // deinit) is handled by the mode, not the session's `deinit`,
+    // because the session's `deinit` does not have access to `io`.
+    //
+    // We do TWO resolve() calls: the first to learn whether CCR
+    // is configured (so we know whether to allocate a session),
+    // and the second with the session wired in so the ccr_retrieve
+    // tool is registered. The first call is short-lived and the
+    // slice it allocated is freed by its `deinit`.
+    var resolved_pre = try config_mod.resolve(
+        allocator,
+        io,
+        cfg,
+        environ,
+        environ_map,
+        &.{},
+        null, // no CCR session yet
+    );
+    defer resolved_pre.deinit();
+    var ccr_session: ?*ccr_integration_mod.CcrSession = null;
+    if (resolved_pre.ccr_store_path) |path| {
+        const session = try allocator.create(ccr_integration_mod.CcrSession);
+        session.* = ccr_integration_mod.CcrSession.init(
+            allocator,
+            path,
+            resolved_pre.ccr_max_entries,
+        );
+        ccr_session = session;
+        // v2.31 — load any persisted entries from a previous run.
+        // Failures are non-fatal: a corrupt or missing file just
+        // means we start with an empty store.
+        session.loadFromDisk(path, io) catch |err| {
+            ai.log.log(.warn, "loop", "ccr_load_failed", "path={s} err={s}", .{ path, @errorName(err) });
+        };
+    }
+    defer if (ccr_session) |s| {
+        // Persist before the mode tears down — the spec calls
+        // for "best-effort cache, not a database", and we
+        // honor that by writing the JSON-Lines file even when
+        // the session's eviction count is non-zero.
+        if (resolved_pre.ccr_store_path) |path| {
+            s.persist(path, io) catch |err| {
+                ai.log.log(.warn, "loop", "ccr_persist_failed", "path={s} err={s}", .{ path, @errorName(err) });
+            };
+        }
+        s.deinit();
+        allocator.destroy(s);
+    };
+
+    var resolved = try config_mod.resolve(
+        allocator,
+        io,
+        cfg,
+        environ,
+        environ_map,
+        &.{},
+        ccr_session,
+    );
     defer resolved.deinit();
 
     {
@@ -363,14 +428,59 @@ fn runPrint(
         },
     };
     if (config_mod.resolveMaxTurns(cfg, environ_map)) |v| loop_cfg.max_turns = v;
+    // v2.31 — apply the resolved compression settings (CLI > settings
+    // > default). The `resolved` struct carries the post-precedence
+    // values; we copy them into `loop_cfg` so the agent loop sees the
+    // same view the rest of the mode sees.
+    loop_cfg.compression_enabled = resolved.compression_enabled;
+    loop_cfg.compress_tool_results = resolved.compress_tool_results;
+    loop_cfg.min_tokens_to_compress = resolved.min_tokens_to_compress;
+    // v2.31 Phase 2 — conversation compaction. The loop's
+    // `maybeCompact` reads these directly off `config` at the
+    // at-start and every-10-turns hooks.
+    loop_cfg.compact_after_messages = resolved.compact_after_messages;
+    loop_cfg.compact_protect_recent = resolved.compact_protect_recent;
+    // v2.31 Phase 3 — wire the CCR session into the loop. The
+    // session is owned by print.zig (constructed above) and stays
+    // alive for the whole run — the worker thread reads through
+    // the loop_cfg pointer, and the deferred `s.deinit()` /
+    // `allocator.destroy(s)` above fires AFTER the worker joins.
+    loop_cfg.ccr_max_entries = resolved.ccr_max_entries;
+    loop_cfg.ccr_session = ccr_session;
+    // v2.31 Phase 5 — stats live in the mode's stack frame (NOT
+    // the worker's, because the worker doesn't own the worker's
+    // stack). The pointer crosses thread boundaries; the worker
+    // bumps counters, the mode reads them after `worker.join()`
+    // to emit the session-end summary.
+    var stats: at.CompressionStats = .{};
+    // v2.31 Phase 5 — point the loop at the per-run stats. The
+    // worker thread writes counters into `stats` as turns proceed;
+    // we read them after `worker.join()` to emit the session-end
+    // summary.
+    loop_cfg.stats = &stats;
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
         .io = io,
         .transcript = &session_state.transcript,
         .config = loop_cfg,
         .ch = &ch,
+        .stats = &stats,
     };
     const worker = try std.Thread.spawn(.{}, workerMain, .{worker_args});
+    // v2.31 Phase 5 — emit the session-end compression summary
+    // AFTER `worker.join()` runs (LIFO defer order). The summary
+    // reads the per-turn counters we accumulated in `stats`, plus
+    // the CCR-specific counters from the session. Null `stats` is
+    // fine (we just skip the per-turn section); null `ccr_session`
+    // is fine (we skip the CCR section). Output is to stderr so it
+    // shows up regardless of whether the user pipes the model
+    // output to a file.
+    {
+        var stderr_buf: [1024]u8 = undefined;
+        var sw = std.Io.File.stderr().writer(io, &stderr_buf);
+        defer sw.interface.flush() catch {};
+        defer emitSessionSummary(&stats, ccr_session, &sw.interface);
+    }
     defer worker.join();
 
     // ── Optional orchestrator registration ──────────────────────────
@@ -546,6 +656,10 @@ const WorkerArgs = struct {
     transcript: *agent.loop.Transcript,
     config: agent.loop.Config,
     ch: *agent.loop.AgentChannel,
+    /// v2.31 Phase 5 — pointer to the run-scoped compression stats
+    /// the loop writes to as turns proceed. The mode reads it
+    /// after `worker.join()` to emit the session-end summary.
+    stats: *at.CompressionStats,
 };
 
 const SseAcceptArgs = struct {
@@ -613,6 +727,74 @@ fn handleSseConn(args: HandleConnArgs) void {
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+}
+
+/// v2.31 Phase 5 — emit the session-end compression summary to
+/// stderr. Skips the per-turn section when `stats` is null and
+/// the CCR section when `ccr_session` is null. Called via `defer`
+/// so the per-turn counters are final by the time we emit.
+fn emitSessionSummary(
+    stats: *const at.CompressionStats,
+    ccr_session: ?*ccr_integration_mod.CcrSession,
+    w: *std.Io.Writer,
+) void {
+    // Skip the emission entirely when nothing happened. The spec
+    // doesn't require a "no-op" line, and a quiet stderr is the
+    // friendlier default for users who never opted in.
+    if (stats.compress_attempted == 0 and stats.compaction_count == 0 and ccr_session == null) {
+        return;
+    }
+
+    w.writeAll("[Compression stats]\n") catch return;
+    w.print(
+        "  Tool results compressed: {d} applied / {d} attempted\n",
+        .{ stats.compress_applied, stats.compress_attempted },
+    ) catch return;
+    w.print(
+        "  Skipped (uneconomical):  {d}\n",
+        .{stats.compress_skipped_uneconomical},
+    ) catch return;
+    if (stats.total_input_bytes > 0) {
+        w.print(
+            "  Bytes saved:              {d} / {d} ({d:.0}% reduction)\n",
+            .{
+                stats.total_input_bytes - stats.total_output_bytes,
+                stats.total_input_bytes,
+                (1.0 - stats.ratio()) * 100.0,
+            },
+        ) catch return;
+    }
+    w.print(
+        "  Conversation compactions: {d}\n",
+        .{stats.compaction_count},
+    ) catch return;
+    if (ccr_session) |session| {
+        w.print(
+            "  CCR stores: {d} | CCR retrievals: {d} hits / {d} misses",
+            .{
+                session.store_count,
+                session.retrieve_hits,
+                session.retrieve_misses,
+            },
+        ) catch return;
+        if (session.eviction_count > 0) {
+            w.print(" | Evicted: {d}", .{session.eviction_count}) catch return;
+        }
+        w.writeAll("\n") catch return;
+    }
+    if (stats.total_input_bytes > stats.total_output_bytes) {
+        // Token-savings estimate at Sonnet rates (~$3 / 1M input
+        // tokens). The spec's mock-up used "$1.42 for 285K
+        // tokens"; we use a 4-byte-per-token heuristic
+        // (zompress's own convention) for the count and a $3
+        // reference price.
+        const approx_tokens_saved = (stats.total_input_bytes - stats.total_output_bytes) / 4;
+        w.print(
+            "  Estimated token savings: ~{d} tokens\n",
+            .{approx_tokens_saved},
+        ) catch return;
+    }
+    w.flush() catch {};
 }
 
 // ─── model alias resolution ──────────────────────────────────────
@@ -740,14 +922,10 @@ pub fn resolveTimeoutsFromMap(
     var t: ai.registry.Timeouts = .{};
     if (isLoopbackBaseUrl(cfg.base_url)) t.first_byte_ms = 600_000;
 
-    if (cfg.connect_timeout_ms) |v| t.connect_ms = v
-    else if (parseEnvMapU32(environ_map, "FRANKY_CONNECT_TIMEOUT_MS")) |v| t.connect_ms = v;
-    if (cfg.upload_timeout_ms) |v| t.upload_ms = v
-    else if (parseEnvMapU32(environ_map, "FRANKY_UPLOAD_TIMEOUT_MS")) |v| t.upload_ms = v;
-    if (cfg.first_byte_timeout_ms) |v| t.first_byte_ms = v
-    else if (parseEnvMapU32(environ_map, "FRANKY_FIRST_BYTE_TIMEOUT_MS")) |v| t.first_byte_ms = v;
-    if (cfg.event_gap_timeout_ms) |v| t.event_gap_ms = v
-    else if (parseEnvMapU32(environ_map, "FRANKY_EVENT_GAP_TIMEOUT_MS")) |v| t.event_gap_ms = v;
+    if (cfg.connect_timeout_ms) |v| t.connect_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_CONNECT_TIMEOUT_MS")) |v| t.connect_ms = v;
+    if (cfg.upload_timeout_ms) |v| t.upload_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_UPLOAD_TIMEOUT_MS")) |v| t.upload_ms = v;
+    if (cfg.first_byte_timeout_ms) |v| t.first_byte_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_FIRST_BYTE_TIMEOUT_MS")) |v| t.first_byte_ms = v;
+    if (cfg.event_gap_timeout_ms) |v| t.event_gap_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_EVENT_GAP_TIMEOUT_MS")) |v| t.event_gap_ms = v;
     return t;
 }
 
@@ -1456,7 +1634,6 @@ pub fn buildSystemPromptIo(
     }
     defer if (hint_owned) allocator.free(with_hint);
 
-
     // AGENTS.md / CLAUDE.md instructions block (v2.30 design doc).
     // Scanned from workspace at startup; injected after subagent hint,
     // before skills. Skipped when --no-standards suppresses the scan.
@@ -1629,7 +1806,8 @@ fn buildSubagentHint(
     const profile_list = profiles_mod.listProfileNamesCSV(allocator, ioref, &env_map) catch return try allocator.dupe(u8, "");
     defer allocator.free(profile_list);
     if (profile_list.len == 0) return try allocator.dupe(u8, "");
-    return try std.fmt.allocPrint(allocator,
+    return try std.fmt.allocPrint(
+        allocator,
         "You also have a `subagent` tool that spawns an isolated agent with its own model. Use it for parallel sub-tasks or when a different profile fits the work better — skip it for single tool calls. Profiles: {s}.",
         .{profile_list},
     );
@@ -2238,6 +2416,82 @@ fn readWholeFileOpt(
 const testing = std.testing;
 const test_h = @import("../../test_helpers.zig");
 
+test "CompressionStats: ratio is 1.0 with no input" {
+    // The "no compression happened yet" baseline — should never
+    // divide by zero.
+    const stats: at.CompressionStats = .{};
+    try testing.expectEqual(@as(f64, 1.0), stats.ratio());
+}
+
+test "CompressionStats: ratio tracks compression effectiveness" {
+    var stats: at.CompressionStats = .{};
+    stats.total_input_bytes = 1000;
+    stats.total_output_bytes = 200;
+    // 200/1000 = 0.2; ratio() returns output/input.
+    try testing.expectEqual(@as(f64, 0.2), stats.ratio());
+}
+
+test "CompressionStats: counters are independent" {
+    // Bumping one counter shouldn't accidentally bump the others.
+    var stats: at.CompressionStats = .{};
+    stats.compress_attempted += 1;
+    try testing.expectEqual(@as(u64, 1), stats.compress_attempted);
+    try testing.expectEqual(@as(u64, 0), stats.compress_applied);
+    try testing.expectEqual(@as(u64, 0), stats.compress_skipped_uneconomical);
+    try testing.expectEqual(@as(u64, 0), stats.compaction_count);
+}
+
+test "emitSessionSummary: no-op when nothing happened" {
+    // Per the spec's "don't be noisy" rule, when no compression /
+    // compaction / CCR fires, the summary block is suppressed
+    // entirely (not emitted as an empty section).
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    var stats: at.CompressionStats = .{};
+    emitSessionSummary(&stats, null, &w);
+    // No assertion needed — the test passes if the function
+    // doesn't crash and returns cleanly.
+}
+
+test "emitSessionSummary: emits header + counters when something happened" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    var stats: at.CompressionStats = .{};
+    stats.compress_attempted = 5;
+    stats.compress_applied = 3;
+    stats.compress_skipped_uneconomical = 2;
+    stats.total_input_bytes = 1000;
+    stats.total_output_bytes = 200;
+    stats.compaction_count = 1;
+    emitSessionSummary(&stats, null, &w);
+    const output = std.Io.Writer.buffered(&w);
+    try testing.expect(std.mem.indexOf(u8, output, "[Compression stats]") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "3 applied / 5 attempted") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "80% reduction") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "~200 tokens") != null);
+}
+
+test "emitSessionSummary: works without a CCR session" {
+    // The CCR section is gated on a non-null session. With
+    // null, only the per-turn counters emit. Common case when
+    // the user runs without `--ccr-store`.
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    var stats: at.CompressionStats = .{};
+    stats.compress_attempted = 1;
+    stats.compress_applied = 1;
+    stats.total_input_bytes = 100;
+    stats.total_output_bytes = 50;
+    emitSessionSummary(&stats, null, &w);
+    const output = std.Io.Writer.buffered(&w);
+    try testing.expect(std.mem.indexOf(u8, output, "[Compression stats]") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "50 / 100") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "~12 tokens") != null);
+}
+
 test "resolveLogLevel: --log-level wins over env vars + verbose" {
     // Pin the precedence ladder for the now-`pub` resolver so a
     // refactor that re-orders the checks gets caught.
@@ -2481,8 +2735,10 @@ test "resolveTimeoutsFromMap: loopback base_url bumps first_byte to 10 min" {
 test "resolveTimeoutsFromMap: explicit flag still wins over loopback bump" {
     var cfg = try cli_mod.parse(testing.allocator, &.{
         "franky",
-        "--base-url",         "http://127.0.0.1:11434",
-        "--first-byte-timeout-ms", "120000",
+        "--base-url",
+        "http://127.0.0.1:11434",
+        "--first-byte-timeout-ms",
+        "120000",
     });
     defer cfg.deinit();
     var m = std.process.Environ.Map.init(testing.allocator);

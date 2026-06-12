@@ -60,6 +60,41 @@ pub const AgentMessage = ai.types.Message;
 
 pub const AgentChannel = ai.channel.Channel(AgentEvent);
 
+/// v2.31 Phase 5 — session-end compression summary counters.
+/// The agent loop accumulates these across turns; the mode
+/// (print.zig) reads the final values after `worker.join()` and
+/// emits a stderr summary block. CCR-specific counters live on
+/// the `CcrSession` itself (insertion-order / FIFO-aware) — the
+/// mode reads them from there too and merges them in.
+pub const CompressionStats = struct {
+    /// v2.31 — every call to `zompress.compress` for a tool
+    /// result. First of the three per-call counters from
+    /// Phase 5 of the design doc.
+    compress_attempted: u64 = 0,
+    /// v2.31 — those that produced a smaller output than the
+    /// 8 KiB cap would have. Second of the three per-call
+    /// counters from Phase 5.
+    compress_applied: u64 = 0,
+    /// v2.31 — those that ran but lost the byte-length
+    /// comparison (i.e. zompress returned a passthrough). Third
+    /// of the three per-call counters from Phase 5.
+    compress_skipped_uneconomical: u64 = 0,
+    /// v2.31 — conversation compaction events (at-start and
+    /// periodic passes that actually fired).
+    compaction_count: u64 = 0,
+    /// v2.31 — total input bytes across all compress calls
+    /// (attempted — the pre-compression size).
+    total_input_bytes: u64 = 0,
+    /// v2.31 — total output bytes across all applied compressions.
+    total_output_bytes: u64 = 0,
+
+    pub fn ratio(self: CompressionStats) f64 {
+        if (self.total_input_bytes == 0) return 1.0;
+        return @as(f64, @floatFromInt(self.total_output_bytes)) /
+            @as(f64, @floatFromInt(self.total_input_bytes));
+    }
+};
+
 /// Ordered sequence of messages that forms the conversation context.
 ///
 /// Callers seed it with prior history; the loop appends assistant and
@@ -78,6 +113,28 @@ pub const Transcript = struct {
     }
     pub fn append(self: *Transcript, msg: AgentMessage) !void {
         try self.messages.append(self.allocator, msg);
+    }
+    /// v2.31 — atomically replace the entire message list with a
+    /// **deep copy** of `new_messages`. The old list is deinited;
+    /// the new messages are deep-copied so the transcript owns
+    /// independent copies of every `content` block and every
+    /// optional string field. After this call the caller is free
+    /// to deinit or free `new_messages` — the transcript holds
+    /// its own durable copies. The deep-copy ensures that a
+    /// future refactor of the call site (e.g. `maybeCompact`
+    /// freeing the outer `compacted` slice) cannot cause a
+    /// use-after-free or double-free.
+    pub fn replaceMessages(self: *Transcript, new_messages: []AgentMessage) !void {
+        for (self.messages.items) |*m| m.deinit(self.allocator);
+        self.messages.clearRetainingCapacity();
+        // Deep-copy each message so the transcript owns the data.
+        var i: usize = 0;
+        errdefer {
+            for (self.messages.items[0..i]) |*m| m.deinit(self.allocator);
+        }
+        while (i < new_messages.len) : (i += 1) {
+            try self.messages.append(self.allocator, try new_messages[i].dupe(self.allocator));
+        }
     }
 };
 

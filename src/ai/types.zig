@@ -284,6 +284,34 @@ pub const Message = struct {
     /// Free-form extension metadata stored as JSON string (for persistence).
     meta_json: ?[]const u8 = null,
 
+    /// v2.31 — deep-copy this message onto `allocator`. The
+    /// returned copy owns all its slices independently of the original.
+    pub fn dupe(self: Message, allocator: std.mem.Allocator) !Message {
+        const content = try allocator.alloc(ContentBlock, self.content.len);
+        errdefer allocator.free(content);
+        for (self.content, 0..) |cb, i| {
+            content[i] = try cb.dupe(allocator);
+        }
+        var out: Message = .{
+            .role = self.role,
+            .content = content,
+            .timestamp = self.timestamp,
+            .is_error = self.is_error,
+        };
+        errdefer out.deinit(allocator);
+        if (self.stop_reason) |v| out.stop_reason = v;
+        if (self.usage) |v| out.usage = v;
+        if (self.error_message) |s| out.error_message = try allocator.dupe(u8, s);
+        if (self.provider) |s| out.provider = try allocator.dupe(u8, s);
+        if (self.model) |s| out.model = try allocator.dupe(u8, s);
+        if (self.api) |s| out.api = try allocator.dupe(u8, s);
+        if (self.diagnostics) |d| out.diagnostics = try d.dupe(allocator);
+        if (self.tool_call_id) |s| out.tool_call_id = try allocator.dupe(u8, s);
+        if (self.custom_role) |s| out.custom_role = try allocator.dupe(u8, s);
+        if (self.meta_json) |s| out.meta_json = try allocator.dupe(u8, s);
+        return out;
+    }
+
     pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
         for (self.content) |block| block.deinit(allocator);
         allocator.free(self.content);

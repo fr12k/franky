@@ -12,6 +12,11 @@ pub const tools = struct {
     pub const web_search = @import("tools/web_search.zig");
     pub const web_fetch = @import("tools/web_fetch.zig");
     pub const workspace = @import("tools/workspace.zig");
+    /// v2.31 Phase 3 — `ccr_retrieve` tool. Lets the LLM pull back
+    /// content that was compressed by the tool-result path or
+    /// collapsed by the conversation-compaction path. The tool
+    /// requires an active `CcrSession` (wires via `toolWithSession`).
+    pub const ccr_retrieve = @import("tools/ccr_retrieve.zig");
     pub const common = @import("tools/common.zig");
     pub const truncate = @import("tools/truncate.zig");
 };

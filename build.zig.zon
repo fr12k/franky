@@ -1,12 +1,17 @@
 .{
     .name = .franky,
     .version = "0.29.0",
+    .dependencies = .{
+        .zompress = .{
+            .url = "git+https://github.com/fr12k/zompress.git?ref=HEAD#881fdd1bcd92b425c6c53ca813832203868e1dba",
+            .hash = "zompress-0.0.1-hHj4JgVhAQAsMJZICBg1PEune-jwq-73OcPE6pNIulct",
+        },
+    },
     .fingerprint = 0x827ef3f35d829231,
     .minimum_zig_version = "0.17.0-dev",
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "lib",
         "src",
         "test",
     },

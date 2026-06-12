@@ -628,7 +628,7 @@ fn initSession(
     // v2.22 Phase 3 — call the shared config resolver.
     const resolved = try allocator.create(config_mod.ResolvedConfig);
     errdefer allocator.destroy(resolved);
-    resolved.* = try config_mod.resolve(allocator, io, cfg, environ, environ_map, original_argv);
+    resolved.* = try config_mod.resolve(allocator, io, cfg, environ, environ_map, original_argv, null);
 
     // ── Step 3: Proxy-specific role arena ─────────────────────
     var role_arena = std.heap.ArenaAllocator.init(allocator);
@@ -3487,6 +3487,17 @@ fn initSessionForTestWithDir(
         .retry_policy = .{},
         .max_turns = 100,
         .prompts_enabled = false,
+        // v2.31 — compression defaults for the test fixture. Real
+        // CLI/setting layers populate these via `resolveCompression*`.
+        .compression_enabled = false,
+        .compress_tool_results = false,
+        .min_tokens_to_compress = 100,
+        // v2.31 Phase 2 — conversation compaction defaults.
+        .compact_after_messages = 0,
+        .compact_protect_recent = 8,
+        // v2.31 Phase 3 — CCR defaults.
+        .ccr_store_path = null,
+        .ccr_max_entries = 10_000,
         .workspace = null,
         .bash_state = bash_ptr,
         .read_ctx = read_ptr,
