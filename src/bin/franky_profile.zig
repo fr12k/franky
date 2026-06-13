@@ -370,6 +370,11 @@ fn runCpuPipeline(
     out_dir_abs: []const u8,
 ) !void {
     try writeOut(io, "\n=== CPU pipeline ===\n");
+
+    // perf record cannot write to FUSE filesystems ("Bad address" error).
+    // Write perf.data to /tmp and copy it to the output directory after.
+    const perf_data_tmp = try std.fmt.allocPrint(gpa, "/tmp/franky-perf-{d}.data", .{franky.ai.stream.nowMillis()});
+    defer gpa.free(perf_data_tmp);
     const perf_data = try std.fmt.allocPrint(gpa, "{s}/perf.data", .{out_dir_abs});
     defer gpa.free(perf_data);
     const cpu_folded = try std.fmt.allocPrint(gpa, "{s}/cpu.folded", .{out_dir_abs});
@@ -385,11 +390,23 @@ fn runCpuPipeline(
     };
 
     const perf_argv = [_][]const u8{
-        "perf", "record", "-F", freq_str, "--call-graph", cg_str, "-o", perf_data, "--",
+        "perf", "record", "-F", freq_str, "--call-graph", cg_str, "-o", perf_data_tmp, "--",
         binary_abs,
     };
     try writeOutFmt(io, "$ perf record (freq={d}, call-graph={s})\n", .{ opts.freq, cg_str });
     try runInherit(io, env, &perf_argv, null, "perf record");
+
+    // Copy perf.data from /tmp to the output directory (FUSE-safe write).
+    {
+        const src_q = try shellQuoteAlloc(gpa, perf_data_tmp);
+        defer gpa.free(src_q);
+        const dst_q = try shellQuoteAlloc(gpa, perf_data);
+        defer gpa.free(dst_q);
+        const cmd = try std.fmt.allocPrint(gpa, "cp {s} {s}", .{ src_q, dst_q });
+        defer gpa.free(cmd);
+        try writeOut(io, "$ cp perf.data to output directory\n");
+        try runShell(io, env, cmd, "copy perf.data");
+    }
 
     {
         const a = try shellQuoteAlloc(gpa, perf_data);
@@ -415,6 +432,8 @@ fn runCpuPipeline(
     if (!opts.keep_trace) {
         std.Io.Dir.cwd().deleteFile(io, perf_data) catch {};
     }
+    // Always clean up the temp perf.data.
+    std.Io.Dir.cwd().deleteFile(io, perf_data_tmp) catch {};
 }
 
 fn runMemPipeline(
