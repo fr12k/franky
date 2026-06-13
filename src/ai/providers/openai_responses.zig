@@ -34,6 +34,81 @@ const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
 pub const default_endpoint: []const u8 = "https://api.openai.com/v1/responses";
 
+/// JSON Schema keywords that OpenAI Responses API (and most
+/// OpenAI-compatible providers) do NOT support. These are stripped
+/// from tool parameter schemas before serialization.
+const unsupported_schema_keys = [_][]const u8{
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "$ref",
+    "$defs",
+    "definitions",
+    "if",
+    "then",
+    "else",
+    "not",
+    "const",
+    "contains",
+};
+
+/// Parse `schema_json`, walk it recursively, drop keys that
+/// OpenAI-compatible providers reject (oneOf, anyOf, allOf, $ref,
+/// etc.), then serialize the result back into `buf`. Falls back
+/// to inlining the original (unsanitized) schema if parsing fails.
+///
+/// Fast path: substring scan — if none of the unsupported keywords
+/// appear, inline verbatim.
+fn appendSanitizedSchema(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    schema_json: []const u8,
+) !void {
+    var needs_sanitize = false;
+    for (unsupported_schema_keys) |key| {
+        if (std.mem.indexOf(u8, schema_json, key) != null) {
+            needs_sanitize = true;
+            break;
+        }
+    }
+    if (!needs_sanitize) {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, aalloc, schema_json, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    var root = parsed.value;
+    sanitizeValue(&root);
+
+    const out = std.json.Stringify.valueAlloc(aalloc, root, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    try buf.appendSlice(allocator, out);
+}
+
+/// Recursively strip unsupported keys from `v`'s objects.
+fn sanitizeValue(v: *std.json.Value) void {
+    switch (v.*) {
+        .object => |*obj| {
+            for (unsupported_schema_keys) |k| _ = obj.swapRemove(k);
+            var it = obj.iterator();
+            while (it.next()) |entry| sanitizeValue(entry.value_ptr);
+        },
+        .array => |*arr| {
+            for (arr.items) |*item| sanitizeValue(item);
+        },
+        else => {},
+    }
+}
+
 // ─── request serialization ────────────────────────────────────────
 
 pub fn buildRequestJson(
@@ -73,7 +148,7 @@ pub fn buildRequestJson(
             try buf.appendSlice(allocator, ",\"description\":");
             try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"parameters\":");
-            try buf.appendSlice(allocator, t.parameters_json);
+            try appendSanitizedSchema(&buf, allocator, t.parameters_json);
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');

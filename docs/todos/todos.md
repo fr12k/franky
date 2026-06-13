@@ -267,7 +267,7 @@ pattern	["**/FlagManager.zig","**/types.zig","**/enums.zig","**/SerfState.zig","
 [invalid_args] pattern must be a string
 ```
 
-# Lets support multiple query args in the web_search tool
+# Lets support multiple query args in the web_search tool (Done)
 ```
 web_search error
 max_results	10
@@ -276,4 +276,28 @@ query	["öffentlicher Dienst IT Stellenangebote Berlin 2025 Senior DevOps SRE","
 {"max_results":10,"query":["öffentlicher Dienst IT Stellenangebote Berlin 2025 Senior DevOps SRE","Bund Berlin IT Stellenausschreibung Platform Engineer 2025","German government IT jobs Berlin 2025 DevOps Platform Engineer Bundesamt"]}
 
 [invalid_args] query must be a string
+```
+
+# Disconnected Web UI (Done)
+
+```
+<span id="status" class="status status-idle">disconnected</span>
+```
+
+The command `curl -v http://127.0.0.1:8788/transcript` hangs while the llm loop is working
+what happened earlier the messages where displayed correctly.
+
+# Grep Tool multi pattern support (In Progress)
+
+```
+grep error
+path	["/Users/frankittermann/github/franky/src/coding/modes/print.zig","/Users/frankittermann/github/franky/src/coding/modes/proxy.zig"]
+pattern	["emitSessionSummary","fn slashHandler|POST /command|/command|slash_mod"]
+[invalid_args] pattern must be a string
+```
+```
+grep error
+path	["/Users/frankittermann/github/franky/src/coding/modes/proxy.zig","/Users/frankittermann/github/franky/src/coding/slash.zig"]
+pattern	["commandHandler|POST.*command|/command","pub fn|pub const"]
+[invalid_args] pattern must be a string
 ```

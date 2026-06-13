@@ -83,7 +83,7 @@ pub const ResolvedConfig = struct {
     session_gates: *permissions_mod.SessionGates,
 
     // ── Preset registry ──────────────────────────────────────────
-    preset_registry: tools_mod.subagent.PresetRegistry,
+    preset_registry: *tools_mod.subagent.PresetRegistry,
 
     // ── Extension manager ────────────────────────────────────────
     ext_manager: extensions_mod.Manager,
@@ -168,6 +168,7 @@ pub const ResolvedConfig = struct {
         self.ext_manager.deinit();
         // Preset registry deinits its presets.
         self.preset_registry.deinit();
+        a.destroy(self.preset_registry);
         // Permission store deinits its internal maps.
         self.permission_store.deinit();
         a.destroy(self.permission_store);
@@ -1168,12 +1169,14 @@ pub fn resolve(
     };
 
     // ── Step 10: Preset registry + extensions ────────────────────
-    var preset_registry = tools_mod.subagent.PresetRegistry.init(allocator);
+    const preset_registry = try a.create(tools_mod.subagent.PresetRegistry);
+    errdefer a.destroy(preset_registry);
+    preset_registry.* = tools_mod.subagent.PresetRegistry.init(allocator);
     errdefer preset_registry.deinit();
-    try tools_mod.subagent.registerBuiltinPresets(&preset_registry);
+    try tools_mod.subagent.registerBuiltinPresets(preset_registry);
 
     var ext_manager = extensions_mod.Manager.init(allocator);
-    ext_manager.presets = &preset_registry;
+    ext_manager.presets = preset_registry;
     errdefer ext_manager.deinit();
     try ext_manager.loadFromConfig(io, cfg.extensions, ext_catalog.lookup);
 
@@ -1203,7 +1206,7 @@ pub fn resolve(
     // ── Step 13: Subagent context ────────────────────────────────
     // Build the Ctx first, then wire in the tools that reference it.
     // `parent_session_dir` is late-bound by the mode after session init.
-    const subagent_params_json = try tools_mod.subagent.buildParametersJson(a, &preset_registry);
+    const subagent_params_json = try tools_mod.subagent.buildParametersJson(a, preset_registry);
 
     const subagent_ctx = try a.create(tools_mod.subagent.Ctx);
     errdefer a.destroy(subagent_ctx);
@@ -1214,7 +1217,7 @@ pub fn resolve(
         .parent_tools = final_tools,
         .parent_role = active_role,
         .parent_profile = cfg.profile orelse "",
-        .presets = &preset_registry,
+        .presets = preset_registry,
         .parameters_json_owned = subagent_params_json,
         .permission_store = if (prompts_enabled) permission_store else null,
         .permission_prompter_slot = null,
@@ -1232,7 +1235,7 @@ pub fn resolve(
             @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
         }
         slice[base_len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
+        slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
         slice[base_len + 2] = guardrail_state.finishTaskTool();
         // ccr_retrieve only registers when the mode passed a
         // session in. Without a session there's nothing to retrieve

@@ -382,9 +382,15 @@ const Session = struct {
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
     tool_usage: std.StringHashMap(u32) = undefined,
 
+    /// v2.31 Phase 5 — session-scoped compression stats.
+    /// The loop's worker thread bumps these each turn via
+    /// `loop_cfg.stats`. The `/compression` slash command reads
+    /// them to show a cumulative summary.
+    compression_stats: at.CompressionStats = .{},
+
     /// Single-flight gate around the agent loop. Concurrent
     /// `POST /prompt` requests queue here.
-    run_mutex: std.Io.Mutex = .init,
+    run_mutex: std.Io.RwLock = .init,
 
     /// Handle to the most recently spawned `/retry` worker thread.
     /// `retryHandler` stores the handle here (instead of detaching)
@@ -689,10 +695,10 @@ fn initSession(
         const ext_manager = try ra.create(extensions_mod.Manager);
         ext_manager.* = extensions_mod.Manager.init(ra);
         errdefer ext_manager.deinit();
-        ext_manager.presets = &resolved.preset_registry;
+        ext_manager.presets = resolved.preset_registry;
         try ext_manager.loadFromConfig(io, cfg.extensions, ext_catalog.lookup);
         const ext_tools = ext_manager.tools();
-        const params_json = try tools_mod.subagent.buildParametersJson(ra, &resolved.preset_registry);
+        const params_json = try tools_mod.subagent.buildParametersJson(ra, resolved.preset_registry);
         const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
         var parent_session_dir: ?[]const u8 = null;
         if (session.parent_dir) |parent| {
@@ -706,7 +712,7 @@ fn initSession(
             .parent_tools = session.tools,
             .parent_role = session.role_gate.role,
             .parent_profile = cfg.profile orelse "",
-            .presets = &resolved.preset_registry,
+            .presets = resolved.preset_registry,
             .parameters_json_owned = params_json,
             .permission_store = if (session.prompts_enabled) session.permission_store else null,
             .permission_prompter_slot = &session.current_prompter,
@@ -725,7 +731,7 @@ fn initSession(
         }
         const off = session.tools.len + ext_tools.len;
         final_tools[off] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(&resolved.preset_registry);
+        final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(resolved.preset_registry);
         final_tools[off + 2] = session.guardrail_state.finishTaskTool();
         session.tools = final_tools;
     }
@@ -801,6 +807,7 @@ fn helpHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
         \\| `/tool <name>` | Show a tool's schema |
         \\| `/thinking <level>` | Set thinking level (off/minimal/low/medium/high/xhigh) |
         \\| `/cost` | Show token usage summed across the session |
+        \\| `/compression` | Show compression stats |
         \\| `/export <fmt>` | Dump transcript as `markdown` or `json` |
         \\| `/retry` | Re-run the last turn |
         \\| `/edit` | Edit the last user message in the composer |
@@ -1078,6 +1085,42 @@ fn costHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
         .{ total_in, total_out, total_cache_r, total_cache_w, total_usd },
     ) catch unreachable;
     try ctx.output.appendSlice(ctx.allocator, s);
+}
+
+fn compressionHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
+    const px = proxySlashCtx(ctx);
+    const stats = &px.session.compression_stats;
+    if (stats.compress_attempted == 0 and stats.compaction_count == 0) {
+        try ctx.output.appendSlice(ctx.allocator, "No compression activity this session (either compression is disabled or no turns were long enough to trigger it).");
+        return;
+    }
+    var buf: [1024]u8 = undefined;
+    var line: []const u8 = undefined;
+
+    line = std.fmt.bufPrint(&buf, "[Compression stats]\n", .{}) catch unreachable;
+    try ctx.output.appendSlice(ctx.allocator, line);
+
+    line = std.fmt.bufPrint(&buf, "  Tool results compressed: {d} applied / {d} attempted\n", .{ stats.compress_applied, stats.compress_attempted }) catch unreachable;
+    try ctx.output.appendSlice(ctx.allocator, line);
+
+    line = std.fmt.bufPrint(&buf, "  Skipped (uneconomical):  {d}\n", .{stats.compress_skipped_uneconomical}) catch unreachable;
+    try ctx.output.appendSlice(ctx.allocator, line);
+
+    if (stats.total_input_bytes > 0) {
+        const saved = stats.total_input_bytes - stats.total_output_bytes;
+        const pct = (1.0 - stats.ratio()) * 100.0;
+        line = std.fmt.bufPrint(&buf, "  Bytes saved:              {d} / {d} ({d:.0}% reduction)\n", .{ saved, stats.total_input_bytes, pct }) catch unreachable;
+        try ctx.output.appendSlice(ctx.allocator, line);
+    }
+
+    line = std.fmt.bufPrint(&buf, "  Conversation compactions: {d}\n", .{stats.compaction_count}) catch unreachable;
+    try ctx.output.appendSlice(ctx.allocator, line);
+
+    if (stats.total_input_bytes > stats.total_output_bytes) {
+        const approx_tokens_saved = (stats.total_input_bytes - stats.total_output_bytes) / 4;
+        line = std.fmt.bufPrint(&buf, "  Estimated token savings: ~{d} tokens\n", .{approx_tokens_saved}) catch unreachable;
+        try ctx.output.appendSlice(ctx.allocator, line);
+    }
 }
 
 fn exportHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!void {
@@ -1474,6 +1517,7 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "tool", .description = "Show a tool's schema", .handler = toolHandler });
     try reg.register(.{ .name = "thinking", .description = "Set thinking level", .handler = thinkingHandler });
     try reg.register(.{ .name = "cost", .description = "Show token usage", .handler = costHandler });
+    try reg.register(.{ .name = "compression", .description = "Show compression stats", .handler = compressionHandler });
     try reg.register(.{ .name = "export", .description = "Dump transcript", .handler = exportHandler });
     try reg.register(.{ .name = "retry", .description = "Re-run the last turn", .handler = retryHandler });
     try reg.register(.{ .name = "edit", .description = "Edit the last user message", .handler = editHandler });
@@ -2170,6 +2214,7 @@ fn runOneTurnInternal(
             },
             .system_prompt = session.system_prompt,
             .tools = session.tools,
+            .stats = &session.compression_stats,
             .registry = session.registry,
             .cancel = &session.cancel,
             .guardrails = session.guardrail_state,
@@ -2309,23 +2354,29 @@ fn proxyStopRequestedFn(userdata: ?*anyopaque) bool {
 // ─── HTTP response helpers ──────────────────────────────────────
 
 /// `GET /transcript` (v1.6.1) — render the active session's
-/// transcript as UI-friendly JSON. Holds `run_mutex` (the same
-/// guard the agent-loop holds while mutating transcript.messages)
-/// so we don't tear during snapshot. The body shape is the projection
-/// in `renderTranscriptForUi`.
+/// transcript as UI-friendly JSON. Uses a **shared (read) lock** on
+/// `run_mutex` so the agent loop (which holds the exclusive lock)
+/// doesn't stall. If the shared lock is contended (i.e. the loop is
+/// running), we return a 503 with `Retry-After: 1` so the browser
+/// retries after 1 second rather than blocking the rehydration fetch
+/// and losing the SSE connection.
 fn respondTranscript(
     session: *Session,
     stream: *std.Io.net.Stream,
     io: std.Io,
     allocator: std.mem.Allocator,
 ) void {
-    session.run_mutex.lockUncancelable(session.io);
+    const locked = session.run_mutex.tryLockShared(session.io);
+    if (!locked) {
+        // The agent loop holds the exclusive lock — retry shortly.
+        sse_mod.respondStatus(stream, io, 503, "Transcript locked; retry");
+        return;
+    }
+    defer session.run_mutex.unlockShared(session.io);
     const body = renderTranscriptForUi(allocator, &session.transcript) catch {
-        session.run_mutex.unlock(session.io);
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
-    session.run_mutex.unlock(session.io);
     defer allocator.free(body);
     sse_mod.respondJson(stream, io, 200, body);
 }
@@ -3478,7 +3529,11 @@ fn initSessionForTestWithDir(
         .tools = test_tools,
         .permission_store = perm_store_ptr,
         .session_gates = undefined,
-        .preset_registry = tools_mod.subagent.PresetRegistry.init(ra),
+        .preset_registry = blk: {
+            const reg_ptr = try ra.create(tools_mod.subagent.PresetRegistry);
+            reg_ptr.* = tools_mod.subagent.PresetRegistry.init(ra);
+            break :blk reg_ptr;
+        },
         .ext_manager = extensions_mod.Manager.init(ra),
         .skills = .{ .owned = false, .skills = .empty, .active = .empty },
         .guardrail_state = guard_ptr,

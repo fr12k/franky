@@ -60,7 +60,12 @@ pub const parameters_json: []const u8 =
     \\  "type": "object",
     \\  "required": ["query"],
     \\  "properties": {
-    \\    "query":       {"type": "string"},
+    \\    "query": {
+    \\      "oneOf": [
+    \\        {"type": "string"},
+    \\        {"type": "array", "items": {"type": "string"}, "minItems": 1}
+    \\      ]
+    \\    },
     \\    "max_results": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5}
     \\  },
     \\  "additionalProperties": false
@@ -110,8 +115,6 @@ fn executeSearch(
 
     const query_v = root.object.get("query") orelse
         return common.toolError(allocator, "invalid_args", "missing query");
-    if (query_v != .string) return common.toolError(allocator, "invalid_args", "query must be a string");
-    const query = query_v.string;
 
     const max_results: u32 = if (root.object.get("max_results")) |v|
         if (v == .integer and v.integer >= 1 and v.integer <= 10) @intCast(v.integer) else 5
@@ -123,22 +126,52 @@ fn executeSearch(
     const api_key = resolveApiKey(ctx, provider);
     const environ_map: ?*const std.process.Environ.Map = if (ctx) |c| c.environ_map else null;
 
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.appendSlice(allocator, "{\"query\":");
-    try utils.appendJsonStr(&body, allocator, query);
-    {
-        var num: [16]u8 = undefined;
-        try body.appendSlice(allocator, ",\"max_results\":");
-        try body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{max_results}) catch unreachable);
+    // Collect all query strings (single string or array of strings).
+    var queries: std.ArrayList([]const u8) = .empty;
+    defer queries.deinit(allocator);
+
+    if (query_v == .string) {
+        try queries.append(allocator, query_v.string);
+    } else if (query_v == .array) {
+        if (query_v.array.items.len == 0)
+            return common.toolError(allocator, "invalid_args", "query array must not be empty");
+        for (query_v.array.items) |item| {
+            if (item != .string)
+                return common.toolError(allocator, "invalid_args", "each query in array must be a string");
+            try queries.append(allocator, item.string);
+        }
+    } else {
+        return common.toolError(allocator, "invalid_args", "query must be a string or array of strings");
     }
-    try body.append(allocator, '}');
 
-    const resp = doPost(allocator, io, cancel, searchEndpoint(provider), api_key, body.items, environ_map) catch |e|
-        return httpError(allocator, "web_search", e);
-    defer allocator.free(resp);
+    // Run one search per query and combine results.
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(allocator);
 
-    return parseSearchResponse(allocator, resp, query);
+    for (queries.items, 0..) |q, i| {
+        if (i > 0) try combined.appendSlice(allocator, "\n---\n\n");
+
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        try body.appendSlice(allocator, "{\"query\":");
+        try utils.appendJsonStr(&body, allocator, q);
+        {
+            var num: [16]u8 = undefined;
+            try body.appendSlice(allocator, ",\"max_results\":");
+            try body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{max_results}) catch unreachable);
+        }
+        try body.append(allocator, '}');
+
+        const resp = doPost(allocator, io, cancel, searchEndpoint(provider), api_key, body.items, environ_map) catch |e|
+            return httpError(allocator, "web_search", e);
+        defer allocator.free(resp);
+
+        var parsed_res = try parseSearchResponse(allocator, resp, q);
+        defer parsed_res.deinit(allocator);
+        try combined.appendSlice(allocator, parsed_res.content[0].text.text);
+    }
+
+    return makeTextResult(allocator, combined.items);
 }
 
 // ─── HTTP transport (shared with web_fetch) ──────────────────────

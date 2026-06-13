@@ -36,6 +36,96 @@ const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
 pub const default_endpoint: []const u8 = "https://api.openai.com/v1/chat/completions";
 
+/// JSON Schema keywords that OpenAI Chat Completions (and most
+/// OpenAI-compatible providers) do NOT support. These are stripped
+/// from tool parameter schemas before serialization.
+///
+/// OpenAI supports a subset of JSON Schema — `type`, `properties`,
+/// `required`, `items`, `enum`, `description`, `minimum`, `maximum`,
+/// `additionalProperties` (strict mode), etc. — but keywords like
+/// `oneOf`, `anyOf`, `allOf`, `$ref`, `$defs`, `definitions`,
+/// `if`/`then`/`else`, `not`, `const`, `contains` are rejected.
+const unsupported_schema_keys = [_][]const u8{
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "$ref",
+    "$defs",
+    "definitions",
+    "if",
+    "then",
+    "else",
+    "not",
+    "const",
+    "contains",
+};
+
+/// Parse `schema_json`, walk it recursively, drop keys that
+/// OpenAI-compatible providers reject (oneOf, anyOf, allOf, $ref,
+/// etc.), then serialize the result back into `buf`. Falls back
+/// to inlining the original (unsanitized) schema if parsing
+/// fails — better to attempt a request with the original than to
+/// fail closed; the provider will return its own error which the
+/// user can act on.
+///
+/// Fast path (most schemas): a substring scan. If none of the
+/// unsupported keywords appear, the schema is already valid and
+/// we inline it verbatim — skipping the parse / walk / re-stringify
+/// entirely. This avoids ~1KB of allocations × N tools per HTTP
+/// request.
+fn appendSanitizedSchema(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    schema_json: []const u8,
+) !void {
+    var needs_sanitize = false;
+    for (unsupported_schema_keys) |key| {
+        if (std.mem.indexOf(u8, schema_json, key) != null) {
+            needs_sanitize = true;
+            break;
+        }
+    }
+    if (!needs_sanitize) {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, aalloc, schema_json, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    var root = parsed.value;
+    sanitizeValue(&root);
+
+    const out = std.json.Stringify.valueAlloc(aalloc, root, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    try buf.appendSlice(allocator, out);
+}
+
+/// Recursively strip unsupported keys from `v`'s objects.
+/// Mutates in place. Arrays' elements are walked too so
+/// unsupported keywords nested inside `items` (e.g. an array of
+/// edit-records) gets removed.
+fn sanitizeValue(v: *std.json.Value) void {
+    switch (v.*) {
+        .object => |*obj| {
+            for (unsupported_schema_keys) |k| _ = obj.swapRemove(k);
+            var it = obj.iterator();
+            while (it.next()) |entry| sanitizeValue(entry.value_ptr);
+        },
+        .array => |*arr| {
+            for (arr.items) |*item| sanitizeValue(item);
+        },
+        else => {},
+    }
+}
+
 // ─── request serialization ────────────────────────────────────────
 
 pub fn buildRequestJson(
@@ -78,7 +168,7 @@ pub fn buildRequestJson(
             try buf.appendSlice(allocator, ",\"description\":");
             try utils.appendJsonStr(&buf, allocator, t.description);
             try buf.appendSlice(allocator, ",\"parameters\":");
-            try buf.appendSlice(allocator, t.parameters_json);
+            try appendSanitizedSchema(&buf, allocator, t.parameters_json);
             try buf.appendSlice(allocator, "}}");
         }
         try buf.append(allocator, ']');

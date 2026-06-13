@@ -223,7 +223,7 @@ fn initSession(
     {
         const ra = role_arena.allocator();
 
-        const params_json = try tools_mod.subagent.buildParametersJson(ra, &resolved.preset_registry);
+        const params_json = try tools_mod.subagent.buildParametersJson(ra, resolved.preset_registry);
 
         const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
         const parent_session_dir: ?[]const u8 = if (session.bash_state.getSessionDir()) |sd|
@@ -237,7 +237,7 @@ fn initSession(
             .parent_tools = session.tools,
             .parent_role = session.role_gate.role,
             .parent_profile = cfg.profile orelse "",
-            .presets = &resolved.preset_registry,
+            .presets = resolved.preset_registry,
             .parameters_json_owned = params_json,
             .permission_store = if (session.prompts_enabled) session.permission_store else null,
             .permission_prompter_slot = &session.current_prompter,
@@ -249,7 +249,7 @@ fn initSession(
         const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
         @memcpy(final_tools[0..session.tools.len], session.tools);
         final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&resolved.preset_registry);
+        final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(resolved.preset_registry);
         session.tools = final_tools;
     }
 

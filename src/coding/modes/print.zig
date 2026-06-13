@@ -733,7 +733,7 @@ fn workerMain(args: WorkerArgs) void {
 /// stderr. Skips the per-turn section when `stats` is null and
 /// the CCR section when `ccr_session` is null. Called via `defer`
 /// so the per-turn counters are final by the time we emit.
-fn emitSessionSummary(
+pub fn emitSessionSummary(
     stats: *const at.CompressionStats,
     ccr_session: ?*ccr_integration_mod.CcrSession,
     w: *std.Io.Writer,
