@@ -1939,7 +1939,13 @@ const SessionBinding = struct {
 
             const subagent_ctx = try aa.create(tools_mod.subagent.Ctx);
             subagent_ctx.* = .{
-                .registry = &binding.registry,
+                // v1.x — `Ctx.registry` is now a value (was `*const
+                // Registry`); copy the struct by value. The Ctx lives
+                // on `aa` (binding's arena), so the copy's address is
+                // stable for the sub-agent's lifetime. Using a value
+                // here also insulates the sub-agent from any future
+                // `binding` moves (the copy is independent).
+                .registry = binding.registry,
                 .environ = environ,
                 .environ_map = environ_map,
                 .parent_tools = binding.tools,
@@ -1960,12 +1966,12 @@ const SessionBinding = struct {
             const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 3);
             @memcpy(final_tools[0..binding.tools.len], binding.tools);
             final_tools[binding.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-            final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
+            final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry, environ_map, aa);
             final_tools[binding.tools.len + 2] = binding.guardrail_state.finishTaskTool();
             binding.tools = final_tools;
         }
 
-        binding.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
+        binding.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg);
     }
 
     fn deinit(self: *SessionBinding) void {

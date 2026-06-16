@@ -706,7 +706,12 @@ fn initSession(
             parent_session_dir = sd;
         }
         subagent_ctx.* = .{
-            .registry = session.registry,
+            // v1.x — `Ctx.registry` is now a value (was `*const
+            // Registry`); deref the session's pointer to copy the
+            // struct into the Ctx. The Ctx lives on `ra` (the
+            // session's role arena), so the copy's address is stable
+            // for the sub-agent's lifetime.
+            .registry = session.registry.*,
             .environ = environ,
             .environ_map = environ_map,
             .parent_tools = session.tools,
@@ -731,12 +736,12 @@ fn initSession(
         }
         const off = session.tools.len + ext_tools.len;
         final_tools[off] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(resolved.preset_registry);
+        final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(resolved.preset_registry, environ_map, ra);
         final_tools[off + 2] = session.guardrail_state.finishTaskTool();
         session.tools = final_tools;
     }
 
-    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
+    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg);
 }
 
 // ─── §J + v1.7.3: server-side slash command registry ───────────

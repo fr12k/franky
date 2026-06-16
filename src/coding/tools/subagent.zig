@@ -508,13 +508,24 @@ const list_presets_params_json: []const u8 =
     \\{"type":"object","properties":{},"required":[]}
 ;
 
-pub fn listPresetsToolWithCtx(registry: *const PresetRegistry) at.AgentTool {
+const ListPresetsCtx = struct {
+    registry: *const PresetRegistry,
+    environ_map: *const std.process.Environ.Map,
+};
+
+pub fn listPresetsToolWithCtx(
+    registry: *const PresetRegistry,
+    environ_map: *const std.process.Environ.Map,
+    allocator: std.mem.Allocator,
+) at.AgentTool {
+    const ctx = allocator.create(ListPresetsCtx) catch @panic("OOM");
+    ctx.* = .{ .registry = registry, .environ_map = environ_map };
     return .{
         .name = list_presets_tool_name,
         .description = "List available sub-agent presets (with their purpose, default profile, and default role) plus all available profile names you can use with the `profile` parameter.",
         .parameters_json = list_presets_params_json,
         .execution_mode = .sequential,
-        .ctx = @ptrCast(@constCast(registry)),
+        .ctx = @ptrCast(@constCast(ctx)),
         .execute = executeListPresets,
     };
 }
@@ -533,12 +544,12 @@ fn executeListPresets(
     _ = cancel;
     _ = on_update;
 
-    const registry: *const PresetRegistry = @ptrCast(@alignCast(self.ctx.?));
+    const ctx: *const ListPresetsCtx = @ptrCast(@alignCast(self.ctx.?));
+    const registry = ctx.registry;
+    const environ_map = ctx.environ_map;
 
     // Compute available profiles — same approach as buildSubagentHint.
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    const profiles_csv = profiles_mod.listProfileNamesCSV(allocator, io, &env_map) catch "";
+    const profiles_csv = profiles_mod.listProfileNamesCSV(allocator, io, environ_map) catch "";
     defer if (profiles_csv.len > 0) allocator.free(profiles_csv);
 
     var buf: std.ArrayList(u8) = .empty;
@@ -595,7 +606,19 @@ pub const Ctx = struct {
     /// Provider registry the sub-agent will dispatch through. The
     /// SAME registry as the parent — sub-agents share the
     /// pre-registered streamFn entries.
-    registry: *const ai.registry.Registry,
+    ///
+    /// v1.x — held by value, not pointer. The previous `*const`
+    /// shape captured a pointer to a stack-local in `config.resolve`
+    /// (the pre-built subagent_ctx's `registry` field), which
+    /// dangled once `resolve()` returned. The Ctx itself is on a
+    /// long-lived arena, so storing the `Registry` by value here
+    /// makes the copy stable for the Ctx's lifetime. The underlying
+    /// `entries` buffer is owned by `ResolvedConfig.arena` and freed
+    /// only when that arena is deinitialized — after every
+    /// sub-agent has joined — so the copy stays valid for the
+    /// sub-agent's whole run. `Agent.init` takes `*const Registry`
+    /// (the Agent doesn't own it), so we hand it `&ctx.registry`.
+    registry: ai.registry.Registry,
     /// Parent's environ — passed to `applyProfile` for `${VAR}`
     /// interpolation and to `resolveProviderIo` for credential
     /// lookup. Same `std.process.Environ` the parent runs against.
@@ -946,9 +969,7 @@ fn runSubagent(
         // Detect missing API key — give a hint with available profiles
         // rather than a raw error name the parent model can't act on.
         if (e == error.MissingApiKey) {
-            var env_map = std.process.Environ.Map.init(allocator);
-            defer env_map.deinit();
-            const list = profiles_mod.listProfileNamesCSV(allocator, io, &env_map) catch "";
+            const list = profiles_mod.listProfileNamesCSV(allocator, io, &local_env_map) catch "";
             defer if (list.len > 0) allocator.free(list);
             const hint = if (list.len > 0)
                 try std.fmt.allocPrint(allocator, "the requested profile needs an API key that is not configured; please retry with one of these: {s}", .{list})
@@ -1020,7 +1041,7 @@ fn runSubagent(
         .model = sub_model,
         .system_prompt = sys_prompt,
         .tools = sub_tools,
-        .registry = ctx.registry,
+        .registry = &ctx.registry,
         .thinking_level = sub_cfg.thinking,
         .stream_options = .{
             .api_key = provider_info.api_key,
@@ -1950,8 +1971,13 @@ test "subagentProgressHandler: turn_start/turn_end are no-ops (turn removed)" {
     };
 
     var ts: TestState = .{};
+    // v1.x — `Ctx.registry` is a value now; allocate an empty
+    // registry on the test allocator. Deinit at the end so the
+    // test allocator's leak check stays clean.
+    var test_registry = ai.registry.Registry.init(testing.allocator);
+    defer test_registry.deinit();
     const test_ctx: Ctx = .{
-        .registry = undefined,
+        .registry = test_registry,
         .environ = .empty,
         .environ_map = undefined,
         .parent_tools = &.{},
@@ -2005,8 +2031,13 @@ test "subagentProgressHandler: verbose_progress=false suppresses text_delta" {
     };
 
     var ctr: TestCounter = .{};
+    // v1.x — `Ctx.registry` is a value now; allocate an empty
+    // registry on the test allocator. Deinit at the end so the
+    // test allocator's leak check stays clean.
+    var test_registry = ai.registry.Registry.init(testing.allocator);
+    defer test_registry.deinit();
     const test_ctx: Ctx = .{
-        .registry = undefined,
+        .registry = test_registry,
         .environ = .empty,
         .environ_map = undefined,
         .parent_tools = &.{},

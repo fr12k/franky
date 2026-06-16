@@ -490,7 +490,6 @@ fn applyProfileMode(cfg: *cli.Config, profile: Profile) ProfileError!void {
     };
 }
 
-
 fn parseThinking(s: []const u8) !ait.ThinkingLevel {
     if (std.mem.eql(u8, s, "off")) return .off;
     if (std.mem.eql(u8, s, "minimal")) return .minimal;
@@ -651,7 +650,7 @@ pub fn getBuiltinBody(name: []const u8) ?[]const u8 {
 pub fn listProfileNamesCSV(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environ_map: *std.process.Environ.Map,
+    environ_map: *const std.process.Environ.Map,
 ) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -664,7 +663,10 @@ pub fn listProfileNamesCSV(
         const path = maybe_path orelse continue;
         try collectUserProfileNames(a, io, path, &names);
     }
-    for (builtin_catalog) |b| try names.put(try a.dupe(u8, b.name), {});
+    // Only include builtin profiles when no user profiles exist.
+    if (names.count() == 0) {
+        for (builtin_catalog) |b| try names.put(try a.dupe(u8, b.name), {});
+    }
 
     var sorted: std.ArrayList([]const u8) = .empty;
     var it = names.iterator();

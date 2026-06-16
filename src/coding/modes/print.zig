@@ -379,7 +379,7 @@ fn runPrint(
     }
 
     // ── Agent loop ─────────────────────────────────────────────────
-    const system_prompt = try buildSystemPromptIo(allocator, io, environ, cfg);
+    const system_prompt = try buildSystemPromptIo(allocator, io, environ, environ_map, cfg);
     defer allocator.free(system_prompt);
 
     const model: ai.types.Model = .{
@@ -1580,6 +1580,7 @@ pub fn buildSystemPromptIo(
     allocator: std.mem.Allocator,
     io: ?std.Io,
     environ: std.process.Environ,
+    environ_map: *const std.process.Environ.Map,
     cfg: *const cli_mod.Config,
 ) ![]u8 {
     if (cfg.system_prompt) |s| return try allocator.dupe(u8, s);
@@ -1624,7 +1625,7 @@ pub fn buildSystemPromptIo(
     var with_hint: []u8 = base;
     var hint_owned = false;
     if (!loaded_from_disk) {
-        const hint = try buildSubagentHint(allocator, io, cfg);
+        const hint = try buildSubagentHint(allocator, io, cfg, environ_map);
         defer allocator.free(hint);
         if (hint.len > 0) {
             const trimmed = std.mem.trimEnd(u8, base, &std.ascii.whitespace);
@@ -1793,17 +1794,11 @@ fn buildSubagentHint(
     allocator: std.mem.Allocator,
     io: ?std.Io,
     cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
 ) ![]u8 {
     _ = cfg;
     const ioref = io orelse return try allocator.dupe(u8, "");
-    // Build a borrowed environ_map view for the profiles helper.
-    // The helper needs a *Map; we don't have a stable one here, so
-    // synthesize a transient one from the standard env. Empty map
-    // is fine — it just means no `${VAR}` interpolation in profile
-    // bodies, which is irrelevant for name-listing.
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    const profile_list = profiles_mod.listProfileNamesCSV(allocator, ioref, &env_map) catch return try allocator.dupe(u8, "");
+    const profile_list = profiles_mod.listProfileNamesCSV(allocator, ioref, environ_map) catch return try allocator.dupe(u8, "");
     defer allocator.free(profile_list);
     if (profile_list.len == 0) return try allocator.dupe(u8, "");
     return try std.fmt.allocPrint(
@@ -3015,7 +3010,9 @@ test "buildSystemPromptIo: --system-prompt flag beats disk + default" {
     cfg.system_prompt = explicit;
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, null, env, &cfg);
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const out = try buildSystemPromptIo(gpa, null, env, &env_map, &cfg);
     defer gpa.free(out);
     try testing.expectEqualStrings("you are a test", out);
 }
@@ -3031,7 +3028,9 @@ test "buildSystemPromptIo: missing system.md falls back to default + appends sub
 
     // Env with no FRANKY_HOME/HOME → no disk lookup attempted.
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg);
     defer gpa.free(out);
     // Default prompt body is preserved verbatim at the start.
     try testing.expect(std.mem.startsWith(u8, out, default_system_prompt));
@@ -3083,7 +3082,9 @@ test "buildSystemPromptIo: --skill NAME injects body under Active skills (§6.1)
     cfg.skills_select_csv = try cfg.arena.allocator().dupe(u8, "demo");
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "## Active skills") != null);
@@ -3125,7 +3126,9 @@ test "buildSystemPromptIo: skill stays out when not selected and no auto_apply (
     // No skills_select_csv, no auto_apply on the skill → inactive.
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "Active skills") == null);

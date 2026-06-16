@@ -1211,7 +1211,14 @@ pub fn resolve(
     const subagent_ctx = try a.create(tools_mod.subagent.Ctx);
     errdefer a.destroy(subagent_ctx);
     subagent_ctx.* = .{
-        .registry = &reg,
+        // v1.x — copy `reg` by value, not by `&reg`. The Ctx lives on
+        // the resolver arena (heap-stable for the session's lifetime);
+        // storing a value here removes the UAR pointer to a stack-local
+        // in this function. The `entries.items` buffer inside the copy
+        // points at the same heap allocation `reg` owns, which is freed
+        // only by `ResolvedConfig.deinit()` (after every sub-agent has
+        // joined) so the copy stays valid for the sub-agent's run.
+        .registry = reg,
         .environ = environ,
         .environ_map = environ_map,
         .parent_tools = final_tools,
@@ -1235,7 +1242,7 @@ pub fn resolve(
             @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
         }
         slice[base_len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
+        slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry, environ_map, a);
         slice[base_len + 2] = guardrail_state.finishTaskTool();
         // ccr_retrieve only registers when the mode passed a
         // session in. Without a session there's nothing to retrieve
