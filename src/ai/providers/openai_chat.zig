@@ -467,6 +467,7 @@ const Driver = struct {
                     .args_json = try self.allocator.dupe(u8, ""),
                 } });
             }
+            const diag_candidates = self.candidates_tokens;
             stream_mod.closeWithDiagnostics(self.out, self.io, self.allocator, .{
                 .provider = "openai-chat",
                 .stop_reason = self.stop_reason orelse .stop,
@@ -475,7 +476,7 @@ const Driver = struct {
                 .tool_count = self.seen_tool_slots,
                 .parts_seen = self.parts_seen,
                 .finish_reason_raw = self.finish_reason_owned,
-                .candidates_tokens = self.candidates_tokens,
+                .candidates_tokens = diag_candidates,
             });
             self.closed = true;
             return;
@@ -488,6 +489,9 @@ const Driver = struct {
         const root = parsed.value.object;
 
         // Usage-only chunk (final chunk with empty `choices`).
+        // Some providers (e.g. Ollama Cloud) may not return usage even
+        // when `stream_options.include_usage: true` is set — see
+        // https://github.com/ollama/ollama/issues/15169
         if (root.get("usage")) |uv| if (uv == .object) {
             const inp: u64 = if (uv.object.get("prompt_tokens")) |v|
                 (if (v == .integer) @intCast(v.integer) else 0)

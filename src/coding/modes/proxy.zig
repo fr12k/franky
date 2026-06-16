@@ -1197,8 +1197,9 @@ fn retryHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void
     const retryWorker = struct {
         fn run(args: RetryArgs) void {
             args.session.run_mutex.lockUncancelable(args.session.io);
-            defer args.session.run_mutex.unlock(args.session.io);
-            runOneTurnInternal(args.session, args.session.allocator, args.session.io, null);
+            var unlocked = false;
+            defer if (!unlocked) args.session.run_mutex.unlock(args.session.io);
+            runOneTurnInternal(args.session, args.session.allocator, args.session.io, null, &unlocked);
         }
     }.run;
     const t = std.Thread.spawn(.{}, retryWorker, .{RetryArgs{ .session = px.session }}) catch {
@@ -1494,8 +1495,9 @@ fn reviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!
     const reviewWorker = struct {
         fn run(s: ReviewArgs) void {
             s.session.run_mutex.lockUncancelable(s.session.io);
-            defer s.session.run_mutex.unlock(s.session.io);
-            runOneTurnInternal(s.session, s.session.allocator, s.session.io, null);
+            var unlocked = false;
+            defer if (!unlocked) s.session.run_mutex.unlock(s.session.io);
+            runOneTurnInternal(s.session, s.session.allocator, s.session.io, null, &unlocked);
         }
     }.run;
     const t = std.Thread.spawn(.{}, reviewWorker, .{ReviewArgs{ .session = session }}) catch {
@@ -2092,14 +2094,15 @@ fn runPrompt(
 
     // Single-flight: only one prompt-driven turn at a time.
     session.run_mutex.lockUncancelable(io);
-    defer session.run_mutex.unlock(io);
+    var unlocked = false;
+    defer if (!unlocked) session.run_mutex.unlock(io);
 
     // Acknowledge before kicking off the loop so the client can
     // immediately start consuming `/events`. (`/prompt` returns
     // a result, not the stream — events fan out via subscribers.)
     sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
 
-    runOneTurn(session, allocator, io, text);
+    runOneTurn(session, allocator, io, text, &unlocked);
 }
 
 fn runOneTurn(
@@ -2107,8 +2110,9 @@ fn runOneTurn(
     allocator: std.mem.Allocator,
     io: std.Io,
     text: []const u8,
+    unlocked: *bool,
 ) void {
-    runOneTurnInternal(session, allocator, io, text);
+    runOneTurnInternal(session, allocator, io, text, unlocked);
 }
 
 /// v1.7.8 — when `text` is null, the caller has already prepared
@@ -2121,6 +2125,7 @@ fn runOneTurnInternal(
     allocator: std.mem.Allocator,
     io: std.Io,
     text: ?[]const u8,
+    unlocked: *bool,
 ) void {
     // Append user message when the caller passed text.
     if (text) |t| {
@@ -2284,9 +2289,16 @@ fn runOneTurnInternal(
         ev.deinit(allocator);
     }
 
-    // v1.7.0 — auto-persist after each turn. Held under run_mutex
-    // (acquired by caller in `runPrompt`) so transcript can't
-    // mutate during the atomic write.
+    // Release the exclusive lock so the browser's /transcript
+    // fetch (tryLockShared) succeeds immediately. The worker has
+    // joined and the transcript is stable — no more mutation this
+    // turn.
+    unlocked.* = true;
+    session.run_mutex.unlock(io);
+
+    // v1.7.0 — auto-persist after each turn. The transcript is
+    // stable (no exclusive lock needed — the next turn acquires
+    // its own before appending).
     persistSession(session);
 }
 
@@ -2371,9 +2383,14 @@ fn respondTranscript(
     io: std.Io,
     allocator: std.mem.Allocator,
 ) void {
+    // v1.30: the exclusive lock is released in runOneTurnInternal before
+    // persistSession (see the unlocked flag pattern), so this 503 should
+    // no longer fire during normal operation. It remains as a safety net
+    // for other code paths that may hold the exclusive lock concurrently.
+    // A lock-free design is sketched in docs/design/lock-free-transcript-access.md.
     const locked = session.run_mutex.tryLockShared(session.io);
     if (!locked) {
-        // The agent loop holds the exclusive lock — retry shortly.
+        // The agent loop holds the exclusive lock — frontend will retry.
         sse_mod.respondStatus(stream, io, 503, "Transcript locked; retry");
         return;
     }

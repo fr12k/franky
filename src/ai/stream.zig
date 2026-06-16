@@ -608,12 +608,17 @@ pub const Reducer = struct {
 
         // Build message as local so errdefer can clean up
         // if any of the later fields fail.
+        //
+        // v1.29.10 — only stamp usage when a real `.usage` event was
+        // received. A zero-valued Usage struct coerces to non-null `?Usage` and
+        // makes downstream display code show "in 0 + out 0 tokens".
+        const usage_stamp: ?types.Usage = if (self.usage.total() > 0) self.usage else null;
         var msg: types.Message = .{
             .role = .assistant,
             .content = content_slice,
             .timestamp = nowMillis(),
             .stop_reason = self.stop_reason orelse .stop,
-            .usage = self.usage,
+            .usage = usage_stamp,
             .error_message = owned_err,
             .provider = owned_provider,
             .model = owned_model,

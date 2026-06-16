@@ -1355,10 +1355,15 @@ fn runOneTurn(
                         usage_out += u.output;
                     };
                 }
+                const usage_suffix = if (usage_in > 0 or usage_out > 0)
+                    try std.fmt.allocPrint(allocator, " · in {d} + out {d} tokens", .{ usage_in, usage_out })
+                else
+                    "";
+                defer if (usage_in > 0 or usage_out > 0) allocator.free(usage_suffix);
                 const status_full = try std.fmt.allocPrint(
                     allocator,
-                    "{s}{s}  ({d}s · in {d} + out {d} tokens)",
-                    .{ status, queued_marker, elapsed_s, usage_in, usage_out },
+                    "{s}{s}  ({d}s{s})",
+                    .{ status, queued_marker, elapsed_s, usage_suffix },
                 );
                 defer allocator.free(status_full);
                 paintFrame(buf, scrollback, editor, .{ .status = status_full, .palette = palette_line });

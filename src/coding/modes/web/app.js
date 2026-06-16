@@ -2932,7 +2932,18 @@ function highlightCodeBlocks(container) {
         } catch (_) {}
 
         try {
-            const r = await fetch('/transcript');
+            // v1.30 — retry transcript fetch up to 5 times with
+            // 200ms backoff when the lock is contended (503).
+            // The agent loop holds the exclusive run_mutex during
+            // the final event drain; a race with turn_end means the
+            // shared-lock `/transcript` endpoint may return 503.
+            var r = await fetch('/transcript');
+            var retries = 0;
+            while (r.status === 503 && retries < 5) {
+                await new Promise(function (resolve) { setTimeout(resolve, 200); });
+                r = await fetch('/transcript');
+                retries++;
+            }
             if (r.ok) {
                 const data = await r.json();
                 const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
