@@ -1196,10 +1196,7 @@ fn retryHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void
     const RetryArgs = struct { session: *Session };
     const retryWorker = struct {
         fn run(args: RetryArgs) void {
-            args.session.run_mutex.lockUncancelable(args.session.io);
-            var unlocked = false;
-            defer if (!unlocked) args.session.run_mutex.unlock(args.session.io);
-            runOneTurnInternal(args.session, args.session.allocator, args.session.io, null, &unlocked);
+            runOneTurnInternal(args.session, args.session.allocator, args.session.io, null);
         }
     }.run;
     const t = std.Thread.spawn(.{}, retryWorker, .{RetryArgs{ .session = px.session }}) catch {
@@ -1494,10 +1491,7 @@ fn reviewHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Error!
     const ReviewArgs = struct { session: *Session };
     const reviewWorker = struct {
         fn run(s: ReviewArgs) void {
-            s.session.run_mutex.lockUncancelable(s.session.io);
-            var unlocked = false;
-            defer if (!unlocked) s.session.run_mutex.unlock(s.session.io);
-            runOneTurnInternal(s.session, s.session.allocator, s.session.io, null, &unlocked);
+            runOneTurnInternal(s.session, s.session.allocator, s.session.io, null);
         }
     }.run;
     const t = std.Thread.spawn(.{}, reviewWorker, .{ReviewArgs{ .session = session }}) catch {
@@ -2092,17 +2086,12 @@ fn runPrompt(
         return;
     }
 
-    // Single-flight: only one prompt-driven turn at a time.
-    session.run_mutex.lockUncancelable(io);
-    var unlocked = false;
-    defer if (!unlocked) session.run_mutex.unlock(io);
-
     // Acknowledge before kicking off the loop so the client can
     // immediately start consuming `/events`. (`/prompt` returns
     // a result, not the stream — events fan out via subscribers.)
     sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
 
-    runOneTurn(session, allocator, io, text, &unlocked);
+    runOneTurn(session, allocator, io, text);
 }
 
 fn runOneTurn(
@@ -2110,9 +2099,8 @@ fn runOneTurn(
     allocator: std.mem.Allocator,
     io: std.Io,
     text: []const u8,
-    unlocked: *bool,
 ) void {
-    runOneTurnInternal(session, allocator, io, text, unlocked);
+    runOneTurnInternal(session, allocator, io, text);
 }
 
 /// v1.7.8 — when `text` is null, the caller has already prepared
@@ -2125,8 +2113,13 @@ fn runOneTurnInternal(
     allocator: std.mem.Allocator,
     io: std.Io,
     text: ?[]const u8,
-    unlocked: *bool,
 ) void {
+    // Single-flight: shared lock allows /transcript reads while turn runs.
+    // Upgraded to exclusive lock before persistSession (see below).
+    session.run_mutex.lockSharedUncancelable(io);
+    var shared_released = false;
+    defer if (!shared_released) session.run_mutex.unlockShared(io);
+
     // Append user message when the caller passed text.
     if (text) |t| {
         const content = allocator.alloc(ai.types.ContentBlock, 1) catch return;
@@ -2289,17 +2282,20 @@ fn runOneTurnInternal(
         ev.deinit(allocator);
     }
 
-    // Release the exclusive lock so the browser's /transcript
-    // fetch (tryLockShared) succeeds immediately. The worker has
-    // joined and the transcript is stable — no more mutation this
-    // turn.
-    unlocked.* = true;
-    session.run_mutex.unlock(io);
+    // Release shared lock, acquire exclusive for the disk write.
+    // The shared_released flag suppresses the outer defer so we
+    // don't double-unlock.
+    shared_released = true;
+    session.run_mutex.unlockShared(io);
+    {
+        session.run_mutex.lockUncancelable(io);
+        defer session.run_mutex.unlock(io);
 
-    // v1.7.0 — auto-persist after each turn. The transcript is
-    // stable (no exclusive lock needed — the next turn acquires
-    // its own before appending).
-    persistSession(session);
+        // v1.7.0 — auto-persist after each turn. Under exclusive lock
+        // so no other persist (from a retry/reset) races with the
+        // disk write. /transcript readers queue politely behind us.
+        persistSession(session);
+    }
 }
 
 // ─── §4.7 + v1.7.4: SSE keepalive ────────────────────────────────
@@ -2383,18 +2379,11 @@ fn respondTranscript(
     io: std.Io,
     allocator: std.mem.Allocator,
 ) void {
-    // v1.30: the exclusive lock is released in runOneTurnInternal before
-    // persistSession (see the unlocked flag pattern), so this 503 should
-    // no longer fire during normal operation. It remains as a safety net
-    // for other code paths that may hold the exclusive lock concurrently.
-    // A lock-free design is sketched in docs/design/lock-free-transcript-access.md.
-    const locked = session.run_mutex.tryLockShared(session.io);
-    if (!locked) {
-        // The agent loop holds the exclusive lock — frontend will retry.
-        sse_mod.respondStatus(stream, io, 503, "Transcript locked; retry");
-        return;
-    }
-    defer session.run_mutex.unlockShared(session.io);
+    // Shared lock: if persistSession is writing (exclusive lock),
+    // this blocks briefly — no more 503 retries. The exclusive lock
+    // is only held during the short disk write window.
+    session.run_mutex.lockSharedUncancelable(io);
+    defer session.run_mutex.unlockShared(io);
     const body = renderTranscriptForUi(allocator, &session.transcript) catch {
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;

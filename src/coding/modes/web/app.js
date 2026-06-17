@@ -2932,11 +2932,10 @@ function highlightCodeBlocks(container) {
         } catch (_) {}
 
         try {
-            // v1.30 — retry transcript fetch up to 5 times with
-            // 200ms backoff when the lock is contended (503).
-            // The agent loop holds the exclusive run_mutex during
-            // the final event drain; a race with turn_end means the
-            // shared-lock `/transcript` endpoint may return 503.
+            // v1.30 — safety net: the backend now uses an RwLock so
+            // /transcript never returns 503 during normal operation.
+            // The retry loop is kept for other code paths that may
+            // briefly hold the exclusive lock (e.g. /reset).
             var r = await fetch('/transcript');
             var retries = 0;
             while (r.status === 503 && retries < 5) {

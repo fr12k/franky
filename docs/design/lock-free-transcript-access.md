@@ -18,74 +18,91 @@ There is a race condition:
    exclusive lock is still held.
 5. A `503 Transcript locked; retry` is returned.
 
-### Initial fix (v1.30, frontend retry — superseded)
+### Attempted fix 1 (frontend retry — superseded)
 
 The frontend retried `/transcript` on 503 (up to 5× at 200ms intervals).
 This worked when the lock hold-time was short (event drain only) but failed
 once `persistSession` (disk I/O) also ran under the exclusive lock — the
 1-second retry window exhausted before the lock released.
 
-## Implemented solution (v1.30, backend unlock before persist)
+### Attempted fix 2 (boolean flag + early unlock — superseded)
 
-The exclusive lock is now released **before** `persistSession` via a boolean
-flag + `defer` guard pattern. At each call site that acquires the lock:
+The exclusive lock was released **before** `persistSession` via a boolean
+flag + `defer` guard pattern. This eliminated the race but introduced a
+new one: a concurrent turn (e.g. `/retry`) could start and call
+`persistSession` while the first turn's `persistSession` was still writing
+to disk, causing a data race on the transcript buffer and possible file
+corruption.
 
-```zig
-session.run_mutex.lockUncancelable(io);
-var unlocked = false;
-defer if (!unlocked) session.run_mutex.unlock(io);
-// ... pass &unlocked through runOneTurn → runOneTurnInternal
+## Implemented solution (v1.30, RwLock with shared/exclusive split)
+
+`run_mutex` is `std.Io.RwLock`. The key insight: the **exclusive lock is
+only needed during `persistSession`** — the disk write. The rest of the
+turn (event drain, tool execution, LLM call) only needs a **shared lock**
+to prevent a concurrent `/prompt` from starting. Multiple shared holders
+are fine — `/transcript` reads proceed in parallel with the turn.
+
+### Lock lifecycle
+
+```
+Turn execution (event drain, tool calls):
+  lockSharedUncancelable  ← shared: serialises /prompt, allows /transcript
+  ... run turn ...
+  unlockShared
+
+persistSession:
+  lockUncancelable        ← exclusive: no other writer, /transcript queues
+  persistSession(session)
+  unlock
+
+/transcript HTTP handler:
+  lockSharedUncancelable  ← shared: blocks briefly if persistSession writing
+  renderTranscriptForUi
+  unlockShared
 ```
 
-At the end of `runOneTurnInternal`, after the event drain finishes and the
-worker thread has joined, the flag is set and the lock is released:
+### Why this is safe
 
-```zig
-unlocked.* = true;
-session.run_mutex.unlock(io);
-
-persistSession(session);  // runs without exclusive lock
-```
-
-This eliminates the race entirely: by the time the browser receives
-`turn_end` and fetches `/transcript`, the exclusive lock is already free.
-The frontend retry logic remains as a safety net for other code paths
-(e.g. `/reset` which also acquires the exclusive lock).
-
-### Why a boolean flag instead of a scoped block
-
-Zig's `defer` runs at scope exit regardless of the path taken. Three
-options were considered:
-
-| Option | Description | Chosen? |
+| Scenario | Lock state | Outcome |
 |---|---|---|
-| **A. Boolean flag** | `var unlocked = false; defer if (!unlocked) unlock();` Thread the `*bool` through the call chain. The flag is set before the early `unlock()` call, so the `defer` becomes a no-op. Clean `defer`-based safety on early returns. | ✅ |
-| **B. Inner scope** | Restructure so the lock is acquired, the critical section runs, then the lock falls out of scope before persist. Requires more invasive restructuring of the call sites. | ❌ |
-| **C. LockGuard struct** | Encapsulate the flag in a local struct with `init`/`release`/`deinit`. Cleaner API but adds another type. | ❌ (overkill) |
+| Turn A running, browser fetches `/transcript` | A holds **shared** | `/transcript` also acquires **shared** — proceeds immediately ✅ |
+| Turn A persisting, browser fetches `/transcript` | A holds **exclusive** | `/transcript` blocks on `lockShared` until persist finishes (few ms) ✅ |
+| Turn A persisting, Turn B `/retry` starts | A holds **exclusive** | B blocks on `lockSharedUncancelable` until A finishes — serialised ✅ |
+| Turn A persisting, Turn B `/retry` reaches its own `persistSession` | A holds **exclusive**, B holds **shared** | B upgrades to exclusive after A releases — no concurrent writes ✅ |
 
-Option A was chosen because it's the simplest change with the least
-restructuring: the `*bool` flows naturally through the existing
-`runOneTurn` → `runOneTurnInternal` delegation, and the pattern is
-recognisable to Zig programmers familiar with the `defer` idiom.
+### Code changes
+
+1. **4 call sites** (`runPrompt`, retry worker, review worker, `/reset`):
+   `lockUncancelable` → `lockSharedUncancelable`, `unlock` → `unlockShared`.
+   Removed the `unlocked` boolean flag and `*bool` parameter threading.
+
+2. **`runOneTurnInternal`**: after event drain, releases shared lock,
+   acquires exclusive lock, runs `persistSession`, releases exclusive lock.
+
+3. **`respondTranscript`**: `tryLockShared` + 503 fallback → blocking
+   `lockSharedUncancelable`. No more 503 retries.
+
+4. **Frontend** (`app.js`): retry loop kept as safety net for other code
+   paths (e.g. `/reset` which holds exclusive lock during session swap).
 
 ### Lock guard safety
 
-The `defer if (!unlocked) unlock()` guarantees that:
+The `defer` pattern at each call site guarantees unlock on early returns:
 
-1. **Normal path**: `unlocked = true` + explicit `unlock()` in
-   `runOneTurnInternal` → `defer` is a no-op.
-2. **Early return** (before the event drain completes): `unlocked` remains
-   `false` → `defer` fires and releases the lock, preventing deadlock.
-3. **Panic / unreachable**: Zig does not unwind the stack on panic, so
-   `defer` does not fire. This is acceptable because the process typically
-   exits on panic; a held lock is harmless.
+```zig
+session.run_mutex.lockSharedUncancelable(io);
+defer session.run_mutex.unlockShared(io);
+// ... body ...
+```
+
+No boolean flag needed — the shared lock is released on every exit path
+(early return, normal completion, panic).
 
 ## Requirements for a lock-free solution (future)
 
-The current boolean-flag approach is pragmatic but not lock-free. The
-`/transcript` handler still acquires a shared lock — it just no longer
-competes with the exclusive holder. Future work could eliminate the shared
-lock entirely:
+The current RwLock approach is pragmatic but not lock-free. The `/transcript`
+handler still acquires a shared lock — it just no longer competes with the
+exclusive holder. Future work could eliminate the shared lock entirely:
 
 1. **No blocking read** — the `/transcript` handler must never attempt to
    acquire `run_mutex` (shared or exclusive). The transcript must be
@@ -292,8 +309,8 @@ const SegmentedTranscript = struct {
 
 ## See also
 
-- `proxy.zig:respondTranscript` — current locked implementation.
-- `web/app.js:refreshStatusLineUsage` — frontend retry logic (safety net).
-- `proxy.zig:runOneTurnInternal` — the `unlocked` flag pattern.
+- `proxy.zig:respondTranscript` — now uses blocking `lockSharedUncancelable`.
+- `proxy.zig:runOneTurnInternal` — upgrades to exclusive lock for persist.
+- `web/app.js:refreshStatusLineUsage` — frontend retry safety net.
 - Zig issue [#13267](https://github.com/ziglang/zig/issues/13267) — atomic
   memory model discussion (tracking for correctness review).

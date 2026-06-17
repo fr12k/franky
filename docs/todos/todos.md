@@ -115,7 +115,7 @@ Here is a failed example. The path value was deleted not the path field name the
 For long session without activity the web-ui disconnects and the user needs to refresh the page to reconnect.
 We need to add a reconnect logic to the web-ui to handle this case and also show a message to the user that the connection was lost and we are trying to reconnect.
 
-# Abort Sub Agent
+# Abort Sub Agent (Done | Need Improvement)
 
 Add the ability to abort a sub agent execution from the web-ui. This is useful in case the sub agent is going in a wrong direction or taking too long and we want to stop it and try a different approach.
 
@@ -132,11 +132,6 @@ How PI and Hermes for example:
 * how they handle tools and MCP ? Can tools be added ? WHen yes how ?
 
 Create a design doc on how we can support the LLM standard.
-
-# The session id should be a path parameter (Done)
-
-This make it possible to jump between session but consider there is only one active session but still how we can support at least jumping between sessions and view them while still keep the active session
-MAke a design doc
 
 # the tool call ids aren't unique (Not working)
 
@@ -165,31 +160,6 @@ Let me search for the skill file.
 Since I'm not in interactive mode with the /review slash command available, I'll run the code review directly using sub-agents per the configured review profiles. Let me review the changes I just made to proxy.zig.
 ```
 
-# Improve Edit tool Error Handling (Done)
-
-With some changes we can save some turns and tokens when we handle error cases with better response.
-Auto-read on first edit_no_match
-
-Server-side: when edit_no_match occurs, instead of just returning an error, return the actual file content in the error message so the model can retry immediately without an extra read call:
-
-return common.toolError(allocator, "edit_no_match",
-    "old not found. Here are the actual file contents:\n---\n{s}\n---\n" ++
-    "Copy-paste the exact bytes you want to replace from above.",
-    .{original}
-);
-
-This eliminates the "waste a turn re-reading" excuse — the model gets the correct bytes in the error and can immediately retry with matching old.
-
-Validate old against file before attempting edits
-
-Run a pre-check: if old appears nowhere in the file (not even partially), short-circuit to the auto-read error immediately without going through the full edit pipeline. Saves the allocation/atomic-write setup cost on what is guaranteed to fail.
-
-# Add ast-grep (Removed)
-
-The grep is good for text search but its missing programming language syntax there is tool 
-https://github.com/ast-grep/ast-grep that does. How could we intgrate it so that the Model use ast-grep instread of grep or we offer normal grep and run ast-grep in the background or
-merge the result from grep and ast-grep in the tool result what would be the prefred way ?
-
 # Auto Continue (DONE)
 
 When --autocontinue is enabled, after the model stops (any stop_reason except
@@ -204,90 +174,18 @@ Implementation:
 - Wired in print, interactive, proxy, and rpc modes
 - Caps at 2 nudges per session
 
-# Fix segafult (Done)
 
-Segmentation fault at address 0x13fc13300
-/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/compiler_rt/memcpy.zig:170:17: 0x100f9f92c in copyFixedLength (compiler_rt)
-        d[i] = s[i];
-                ^
-/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:2473:11: 0x100b92e3f in writeMessageForUi (franky)
-    for (m.content) |cb| {
-          ^
-/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:2424:30: 0x100b93c77 in renderTranscriptForUi (franky)
-        try writeMessageForUi(&buf, allocator, m, &tool_call_seq, &tool_result_seq);
-                             ^
-/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:2376:39: 0x100bb6fc3 in respondTranscript (franky)
-    const body = renderTranscriptForUi(allocator, &session.transcript) catch {
-                                      ^
-/Users/frankittermann/github/franky/src/coding/modes/proxy.zig:1808:26: 0x100b76e3b in handleConnection (franky)
-        respondTranscript(arg.session, &stream, arg.io, arg.allocator);
-                         ^
-/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std/Thread.zig:422:13: 0x100b76373 in callFn__anon_70414 (franky)
-            @call(.auto, f, args);
-            ^
-/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std/Thread.zig:752:30: 0x100b761eb in entryFn (franky)
-                return callFn(f, args_ptr.*);
-                             ^
-???:?:?: 0x186f7bc57 in __pthread_cond_wait (/usr/lib/system/libsystem_pthread.dylib)
-???:?:?: 0x186f76c1b in _pthread_cond_broadcast (/usr/lib/system/libsystem_pthread.dylib)
+# Grep Tool multi pattern support (Done)
 
-# Tool Result offload missing path (Done)
+Now supports `"pattern": "foo"` (string) or `"pattern": ["foo", "bar"]` (array, OR semantics).
 
-The tool offload results missing the path for the model to read the result again that leads to multiple new full reads because context was missing.
-```
-    {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [
-        {
-          "id": "call_h9xz6ave",
-          "type": "function",
-          "function": {
-            "name": "bash",
-            "arguments": "{\"command\":\"cd /Users/frankittermann/github/zettler \\u0026\\u0026 zig run src/main.zig -- 2\\u003e\\u00261 | head -5\",\"description\":\"Check how to build and run the project\",\"timeoutMs\":30000}"
-          }
-        }
-      ]
-    },
-    {
-      "role": "tool",
-      "tool_call_id": "call_h9xz6ave",
-      "content": "[tool result: call_h9xz6ave — 257B (offloaded)]"
-    }
-```
-
-# lets support find tools with multiple patterns as args (Done)
-
-```
-find error
-pattern	["**/FlagManager.zig","**/types.zig","**/enums.zig","**/SerfState.zig","**/FlagState.zig","**/BuildingState.zig"]
-
-{"pattern":["**/FlagManager.zig","**/types.zig","**/enums.zig","**/SerfState.zig","**/FlagState.zig","**/BuildingState.zig"]}
-
-[invalid_args] pattern must be a string
-```
-
-# Lets support multiple query args in the web_search tool (Done)
-```
-web_search error
-max_results	10
-query	["öffentlicher Dienst IT Stellenangebote Berlin 2025 Senior DevOps SRE","Bund Berlin IT Stellenausschreibung Platform Engineer 2025","German government IT jobs Berlin 2025 DevOps Platform Engineer Bundesamt"]
-
-{"max_results":10,"query":["öffentlicher Dienst IT Stellenangebote Berlin 2025 Senior DevOps SRE","Bund Berlin IT Stellenausschreibung Platform Engineer 2025","German government IT jobs Berlin 2025 DevOps Platform Engineer Bundesamt"]}
-
-[invalid_args] query must be a string
-```
-
-# Disconnected Web UI (Done)
-
-```
-<span id="status" class="status status-idle">disconnected</span>
-```
-
-The command `curl -v http://127.0.0.1:8788/transcript` hangs while the llm loop is working
-what happened earlier the messages where displayed correctly.
-
-# Grep Tool multi pattern support (In Progress)
+Changes:
+- `parameters_json` uses `oneOf` to accept string or array of strings
+- `extractPatterns()` helper (mirrors `find.zig`)
+- `Matcher` now holds a slice of patterns (regex or literal) with OR matching
+- `compileMultiRegex()` / `compileMultiLiteral()` helpers
+- `deinit()` properly frees the slice and all regexes
+- Test helpers updated for new `Matcher` struct layout
 
 ```
 grep error
@@ -300,4 +198,14 @@ grep error
 path	["/Users/frankittermann/github/franky/src/coding/modes/proxy.zig","/Users/frankittermann/github/franky/src/coding/slash.zig"]
 pattern	["commandHandler|POST.*command|/command","pub fn|pub const"]
 [invalid_args] pattern must be a string
+```
+
+# SubAgent Panel empty
+
+The Subagent Panel is empty in the web ui but its working and the agent get's the result so
+the subagent is working its just invisible.
+
+To see the subagent conversation in the panel a full browser page reload is needed.
+```
+<div class="sa-overlay-body" id="sa-overlay-body"></div>
 ```
