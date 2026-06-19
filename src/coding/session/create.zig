@@ -28,6 +28,7 @@ const ai = franky.ai;
 const agent = franky.agent;
 const at = agent.types;
 const cli_mod = franky.coding.cli;
+const config_resolver = franky.coding.config.resolver;
 const session_mod = @import("mod.zig");
 const branching_mod = @import("branching.zig");
 
@@ -223,15 +224,10 @@ pub const SessionState = struct {
 
 // ─── ProviderInfo (provider-lite for persistence headers) ─────────
 
-/// Minimal provider metadata for session persistence headers.
-pub const ProviderInfo = struct {
-    provider_name: []const u8,
-    api_tag: []const u8,
-    model_id: []const u8,
-    api_key: ?[]const u8,
-    auth_token: ?[]const u8,
-    base_url: ?[]const u8,
-    context_window: u32,
-    max_output: u32,
-    capabilities: ai.types.Capabilities = .{ .tool_use = true },
-};
+/// Re-export the canonical `ProviderInfo` from the config resolver
+/// (v1.3.0 dedup). Previously this module defined a byte-identical
+/// struct, which produced two nominally-distinct types and blocked
+/// sharing the `finalize` / `resolveProvider` helpers across modules.
+/// All three names — `config.ProviderInfo`, `session.ProviderInfo`,
+/// `print.ProviderInfo` — now resolve to the same struct.
+pub const ProviderInfo = config_resolver.ProviderInfo;

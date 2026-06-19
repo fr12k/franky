@@ -156,7 +156,7 @@ test "hash: SessionState.id" {
     check("SessionState.id", sdk.SessionState.id, 0xdfaeef31f4c4c4e5);
 }
 test "hash: SessionState.persist" {
-    check("SessionState.persist", sdk.SessionState.persist, 0xbe12d82565c2270e);
+    check("SessionState.persist", sdk.SessionState.persist, 0xc64b12c6fc422cec);
 }
 test "hash: SessionHandle.deinit" {
     check("SessionHandle.deinit", sdk.SessionHandle.deinit, 0xabbf6cbd29447ec);

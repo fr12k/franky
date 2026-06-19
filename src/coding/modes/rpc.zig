@@ -29,6 +29,10 @@ const rpc = franky.coding.rpc;
 const cli_mod = franky.coding.cli;
 const config_mod = franky.coding.config.resolver;
 const print_mode = @import("print.zig");
+const modes_common = @import("common.zig");
+const WorkerArgs = modes_common.WorkerArgs;
+const workerMain = modes_common.workerMain;
+const fauxShim = modes_common.fauxShim;
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
@@ -259,11 +263,6 @@ fn initSession(
     }
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg);
-}
-
-fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
-    const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
-    try fp.runSync(ctx.io, ctx.context, ctx.out);
 }
 
 // ─── §6.6 — sub-agent progress forwarding ────────────────────────
@@ -635,18 +634,6 @@ fn runPrompt(
     }
 
     try writeResultFrame(allocator, io, stdout, req.id, "{\"done\":true}");
-}
-
-const WorkerArgs = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    transcript: *agent.loop.Transcript,
-    config: agent.loop.Config,
-    ch: *agent.loop.AgentChannel,
-};
-
-fn workerMain(args: WorkerArgs) void {
-    agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
 }
 
 fn extractPromptText(params: ?[]const u8) ?[]const u8 {

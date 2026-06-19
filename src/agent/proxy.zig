@@ -24,6 +24,7 @@ const std = @import("std");
 const at = @import("types.zig");
 const ai_types = @import("../ai/types.zig");
 const ai_errors = @import("../ai/errors.zig");
+const ai_utils = @import("../ai/utils.zig");
 
 pub const ProxyError = error{
     WriteFailed,
@@ -191,29 +192,11 @@ fn roleName(r: ai_types.Role) []const u8 {
     };
 }
 
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
-}
+// JSON string/int appenders — re-aliased from `ai.utils` (v1.3.0
+// dedup): the bodies are byte-identical and there's no reason to
+// maintain a private copy here.
+const appendJsonStr = ai_utils.appendJsonStr;
+const appendJsonInt = ai_utils.appendJsonInt;
 
 // ─── tests ────────────────────────────────────────────────────────
 

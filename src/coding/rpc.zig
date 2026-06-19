@@ -20,6 +20,11 @@
 //! glue settles.
 
 const std = @import("std");
+const ai_utils = @import("../ai/utils.zig");
+
+// JSON string/int appenders — re-aliased from `ai.utils` (v1.3.0 dedup).
+const appendJsonStr = ai_utils.appendJsonStr;
+const appendJsonInt = ai_utils.appendJsonInt;
 
 pub const RpcError = error{
     MalformedFrame,
@@ -238,31 +243,7 @@ fn renderJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: std.json
     }
 }
 
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
-}
-
-// ─── tests ────────────────────────────────────────────────────────
+// ─── tests ──────────────────────────────────────────────────
 
 const testing = std.testing;
 

@@ -138,57 +138,15 @@ const gemini_unsupported_schema_keys = [_][]const u8{
 /// re-stringify entirely. This is the common case (only franky's
 /// own tools currently emit `additionalProperties` for strict
 /// mode); avoids ~1KB of allocations × N tools per HTTP request.
+///
+/// Machinery lives in `ai.utils` (v1.3.0 dedup); this file owns
+/// only the `gemini_unsupported_schema_keys` list.
 fn appendSanitizedSchema(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     schema_json: []const u8,
 ) !void {
-    var needs_sanitize = false;
-    for (gemini_unsupported_schema_keys) |key| {
-        if (std.mem.indexOf(u8, schema_json, key) != null) {
-            needs_sanitize = true;
-            break;
-        }
-    }
-    if (!needs_sanitize) {
-        try buf.appendSlice(allocator, schema_json);
-        return;
-    }
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aalloc = arena.allocator();
-
-    const parsed = std.json.parseFromSlice(std.json.Value, aalloc, schema_json, .{}) catch {
-        try buf.appendSlice(allocator, schema_json);
-        return;
-    };
-    var root = parsed.value;
-    sanitizeValue(&root);
-
-    const out = std.json.Stringify.valueAlloc(aalloc, root, .{}) catch {
-        try buf.appendSlice(allocator, schema_json);
-        return;
-    };
-    try buf.appendSlice(allocator, out);
-}
-
-/// Recursively strip Gemini-unsupported keys from `v`'s objects.
-/// Mutates in place. Arrays' elements are walked too so
-/// `additionalProperties` nested inside `items` (e.g. an array of
-/// edit-records) gets removed.
-fn sanitizeValue(v: *std.json.Value) void {
-    switch (v.*) {
-        .object => |*obj| {
-            for (gemini_unsupported_schema_keys) |k| _ = obj.swapRemove(k);
-            var it = obj.iterator();
-            while (it.next()) |entry| sanitizeValue(entry.value_ptr);
-        },
-        .array => |*arr| {
-            for (arr.items) |*item| sanitizeValue(item);
-        },
-        else => {},
-    }
+    return utils.appendSanitizedSchema(buf, allocator, schema_json, &gemini_unsupported_schema_keys);
 }
 
 fn appendContent(
@@ -315,12 +273,8 @@ pub fn runFromSseWithTrace(
                 .thoughts_tokens = driver.thoughts_tokens,
             });
         }
-    } else |e| switch (e) {
-        error.Aborted => out.closeWithFinal(io, .{ .error_ev = .{ .code = .aborted, .message = try allocator.dupe(u8, "cancelled") } }),
-        error.ProtocolViolation => out.closeWithFinal(io, .{ .error_ev = .{ .code = .protocol_violation, .message = try allocator.dupe(u8, "malformed SSE") } }),
-        error.OutOfMemory => out.closeWithFinal(io, .{ .error_ev = .{ .code = .internal, .message = try allocator.dupe(u8, "oom") } }),
-        error.Timeout => out.closeWithFinal(io, .{ .error_ev = .{ .code = .timeout, .message = try allocator.dupe(u8, "event gap timeout") } }),
-        error.Handler => out.closeWithFinal(io, .{ .error_ev = .{ .code = .internal, .message = try allocator.dupe(u8, "handler failure") } }),
+    } else |e| {
+        stream_mod.closeOnSseError(out, io, allocator, e);
     }
 }
 
@@ -567,28 +521,9 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     const cancel = ctx.options.cancel orelse unreachable;
 
-    var local_client: http_mod.Client = undefined;
-    var proxy_arena: ?std.heap.ArenaAllocator = null;
-    const client: *http_mod.Client = if (ctx.http_client) |h|
-        @ptrCast(@alignCast(h))
-    else blk: {
-        local_client = .{ .allocator = ctx.allocator, .io = ctx.io };
-        if (ctx.options.environ_map) |env_map| {
-            proxy_arena = http_mod.setupClientFromEnv(&local_client, ctx.allocator, env_map) catch |e| {
-                try ctx.out.push(ctx.io, .start);
-                ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-                    .code = errors.Code.transport,
-                    .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
-                } });
-                return;
-            };
-        }
-        break :blk &local_client;
-    };
-    defer if (ctx.http_client == null) {
-        local_client.deinit();
-        if (proxy_arena) |*a| a.deinit();
-    };
+    var sc = http_mod.acquireStreamClient(ctx) orelse return;
+    defer sc.deinit();
+    const client = sc.client;
 
     var bw = std.Io.Writer.Allocating.init(ctx.allocator);
     defer bw.deinit();

@@ -51,6 +51,11 @@ const restart_mod = franky.coding.restart;
 const term_mod = @import("../terminal.zig");
 const print_mode = @import("print.zig");
 const review_mod = @import("../review.zig");
+const modes_common = @import("common.zig");
+const WorkerArgs = modes_common.WorkerArgs;
+const workerMain = modes_common.workerMain;
+const fauxShim = modes_common.fauxShim;
+const interactiveStopRequestedFn = modes_common.stopRequestedFromAtomic;
 
 const RunError = error{InteractiveNotSupported} || std.mem.Allocator.Error;
 
@@ -1383,25 +1388,10 @@ fn runOneTurn(
 
 // ─── worker thread shim ────────────────────────────────────────
 
-const WorkerArgs = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    transcript: *agent.loop.Transcript,
-    config: agent.loop.Config,
-    ch: *agent.loop.AgentChannel,
-};
-
-fn workerMain(args: WorkerArgs) void {
-    agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
-}
-
 /// vN — callback for `loop.Config.stop_requested_fn` in interactive
 /// mode. `userdata` is a pointer to the per-turn `stop_requested`
-/// atomic flag set by the Ctrl-G keybinding.
-fn interactiveStopRequestedFn(userdata: ?*anyopaque) bool {
-    const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(userdata.?));
-    return flag.load(.acquire);
-}
+/// atomic flag set by the Ctrl-G keybinding. The generic
+/// implementation lives in `modes/common.zig`.
 
 // ─── transcript search (v1.1.2) ────────────────────────────────
 
@@ -2020,11 +2010,6 @@ const SessionBinding = struct {
         };
     }
 };
-
-fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
-    const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
-    try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
-}
 
 // ─── slash-command integration ──────────────────────────────────
 

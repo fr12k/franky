@@ -74,6 +74,10 @@ const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const review_mod = @import("../review.zig");
 const sse_mod = @import("../sse.zig");
+const modes_common = @import("common.zig");
+const WorkerArgs = modes_common.WorkerArgs;
+const workerMain = modes_common.workerMain;
+const fauxShim = modes_common.fauxShim;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -1658,11 +1662,6 @@ fn computeTitle(transcript: *const agent.loop.Transcript) []const u8 {
     };
 }
 
-fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
-    const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
-    try fp.runSync(ctx.io, ctx.context, ctx.out);
-}
-
 // ─── §6.6 — sub-agent progress forwarding ────────────────────────
 //
 // Called from the sub-agent's worker thread for each forwarded event.
@@ -2342,22 +2341,12 @@ fn nanoSleep(ms: u64) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
-const WorkerArgs = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    transcript: *agent.loop.Transcript,
-    config: agent.loop.Config,
-    ch: *agent.loop.AgentChannel,
-};
-
-fn workerMain(args: WorkerArgs) void {
-    agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
-}
-
 /// vN — callback for `loop.Config.stop_requested_fn` in proxy mode.
 /// Checks whether `POST /interrupt` has set the stop-requested flag.
 /// The `userdata` is `&session.session_gates`; we recover the Session
-/// via `@fieldParentPtr`.
+/// via `@fieldParentPtr`. (The generic atomic-flag variant lives in
+/// `modes/common.zig` as `stopRequestedFromAtomic`; proxy needs the
+/// Session-parent recovery so it keeps a local copy.)
 fn proxyStopRequestedFn(userdata: ?*anyopaque) bool {
     const gates: *permissions_mod.SessionGates = @ptrCast(@alignCast(userdata.?));
     const session: *Session = @fieldParentPtr("session_gates", gates);

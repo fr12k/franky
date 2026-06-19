@@ -95,28 +95,9 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
 
     const cancel = ctx.options.cancel orelse unreachable;
 
-    var local_client: http_mod.Client = undefined;
-    var proxy_arena: ?std.heap.ArenaAllocator = null;
-    const client: *http_mod.Client = if (ctx.http_client) |h|
-        @ptrCast(@alignCast(h))
-    else blk: {
-        local_client = .{ .allocator = ctx.allocator, .io = ctx.io };
-        if (ctx.options.environ_map) |env_map| {
-            proxy_arena = http_mod.setupClientFromEnv(&local_client, ctx.allocator, env_map) catch |e| {
-                try ctx.out.push(ctx.io, .start);
-                ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
-                    .code = errors.Code.transport,
-                    .message = try std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}),
-                } });
-                return;
-            };
-        }
-        break :blk &local_client;
-    };
-    defer if (ctx.http_client == null) {
-        local_client.deinit();
-        if (proxy_arena) |*a| a.deinit();
-    };
+    var sc = http_mod.acquireStreamClient(ctx) orelse return;
+    defer sc.deinit();
+    const client = sc.client;
 
     var bw = std.Io.Writer.Allocating.init(ctx.allocator);
     defer bw.deinit();

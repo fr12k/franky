@@ -44,6 +44,10 @@ const config_mod = franky.coding.config.resolver;
 const session_create = franky.coding.session.create;
 const sse_mod = @import("../sse.zig");
 const orchestrator = franky.coding.orchestrator;
+const modes_common = @import("common.zig");
+const WorkerArgs = modes_common.WorkerArgs;
+const workerMain = modes_common.workerMain;
+const fauxShim = modes_common.fauxShim;
 
 /// Default model when the user didn't pass `--model`. Sonnet 4.6 is
 /// the current cost/latency sweet spot; Opus 4.6 is reachable via
@@ -650,18 +654,6 @@ fn runPrint(
 
 // ─── agent-loop worker thread ─────────────────────────────────────
 
-const WorkerArgs = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    transcript: *agent.loop.Transcript,
-    config: agent.loop.Config,
-    ch: *agent.loop.AgentChannel,
-    /// v2.31 Phase 5 — pointer to the run-scoped compression stats
-    /// the loop writes to as turns proceed. The mode reads it
-    /// after `worker.join()` to emit the session-end summary.
-    stats: *at.CompressionStats,
-};
-
 const SseAcceptArgs = struct {
     ctx: *SseAcceptCtx,
 };
@@ -723,10 +715,6 @@ fn handleSseConn(args: HandleConnArgs) void {
         return;
     }
     sse_mod.respondStatus(&stream, args.io, 404, "Not Found");
-}
-
-fn workerMain(args: WorkerArgs) void {
-    agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
 }
 
 /// v2.31 Phase 5 — emit the session-end compression summary to
@@ -809,42 +797,14 @@ pub fn emitSessionSummary(
 /// extended-thinking-capable model in each tier (Opus 4.6, Sonnet 4.6,
 /// Haiku 4.5). For the newer adaptive-only Opus 4.7, use the explicit
 /// alias or id.
-pub fn resolveAnthropicAlias(input: []const u8) []const u8 {
-    const aliases = [_]struct { []const u8, []const u8 }{
-        .{ "opus", "claude-opus-4-6" },
-        .{ "opus-4-6", "claude-opus-4-6" },
-        .{ "opus-4.6", "claude-opus-4-6" },
-        .{ "opus-4-7", "claude-opus-4-7" },
-        .{ "opus-4.7", "claude-opus-4-7" },
-        .{ "sonnet", "claude-sonnet-4-6" },
-        .{ "sonnet-4-6", "claude-sonnet-4-6" },
-        .{ "sonnet-4.6", "claude-sonnet-4-6" },
-        .{ "haiku", "claude-haiku-4-5" },
-        .{ "haiku-4-5", "claude-haiku-4-5" },
-        .{ "haiku-4.5", "claude-haiku-4-5" },
-    };
-    for (aliases) |kv| {
-        if (std.mem.eql(u8, input, kv[0])) return kv[1];
-    }
-    return input;
-}
+pub const resolveAnthropicAlias = config_mod.resolveAnthropicAlias;
 
 // ─── log level resolution ────────────────────────────────────────
 
 /// v1.19.0 — extract the bare global level from a spec that may
 /// contain comma-separated `scope:level` entries. Returns null when
 /// the input is only scope overrides with no global level.
-fn extractGlobalLevel(s: []const u8) ?ai.log.Level {
-    var it = std.mem.splitScalar(u8, s, ',');
-    var result: ?ai.log.Level = null;
-    while (it.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t");
-        // Skip scope:level entries — they don't set the global level.
-        if (std.mem.indexOfScalar(u8, trimmed, ':')) |_| continue;
-        if (ai.log.Level.fromString(trimmed)) |l| result = l;
-    }
-    return result;
-}
+const extractGlobalLevel = config_mod.extractGlobalLevel;
 
 /// v1.19.0 — register per-scope level overrides from a spec string
 /// in the form `scope:level,scope:level,...`. Non-override entries
@@ -899,113 +859,21 @@ pub fn resolveLogLevelMap(environ_map: *const std.process.Environ.Map) ai.log.Le
     return .warn;
 }
 
-/// Resolve `ai.registry.Timeouts` for this run.
-///
-/// Precedence per field: CLI flag → env var → autodetected default.
-///
-/// The autodetected default is normally `Timeouts{}` (the §G.4
-/// standard), but bumps `first_byte_ms` to 10 minutes when
-/// `cfg.base_url` points at a loopback host (Ollama on
-/// `localhost:11434`, LM-Studio on `localhost:1234`, vLLM on
-/// `localhost:8000`, …). Local LLMs commonly take longer than
-/// 30 s to emit a first token under reasoning workloads, and the
-/// hard cap surfaced as the misleading `transport: http error:
-/// Timeout` the user reported pre-v1.10. An explicit
-/// `--first-byte-timeout-ms` (or env var) still wins.
-///
-/// Map-based so every mode (print stays on the live `Environ`;
-/// interactive/rpc/proxy hold a `Map`) can share the same resolver.
-pub fn resolveTimeoutsFromMap(
-    cfg: *const cli_mod.Config,
-    environ_map: *const std.process.Environ.Map,
-) ai.registry.Timeouts {
-    var t: ai.registry.Timeouts = .{};
-    if (isLoopbackBaseUrl(cfg.base_url)) t.first_byte_ms = 600_000;
+// ─── Map-based resolvers (re-exported from config.zig) ─────────────
+//
+// v1.3.0 dedup — these were diverged wrappers of the `Config`-based
+// resolvers in `coding/config.zig`, but on inspection they have the
+// SAME signature (`cfg + map`) and byte-identical bodies. They are
+// re-exported here under the `*FromMap` names so existing call sites
+// keep compiling. See `DEDUP_PLAN.md` Finding 1.
+pub const resolveTimeoutsFromMap = config_mod.resolveTimeouts;
+pub const resolveMaxTurnsFromMap = config_mod.resolveMaxTurns;
+pub const resolveRetryPolicyFromMap = config_mod.resolveRetryPolicy;
+pub const resolveLogFileFromMap = config_mod.resolveLogFile;
+pub const resolveHttpTraceDirFromMap = config_mod.resolveHttpTraceDir;
+pub const resolveLogPerSessionFromMap = config_mod.resolveLogPerSession;
 
-    if (cfg.connect_timeout_ms) |v| t.connect_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_CONNECT_TIMEOUT_MS")) |v| t.connect_ms = v;
-    if (cfg.upload_timeout_ms) |v| t.upload_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_UPLOAD_TIMEOUT_MS")) |v| t.upload_ms = v;
-    if (cfg.first_byte_timeout_ms) |v| t.first_byte_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_FIRST_BYTE_TIMEOUT_MS")) |v| t.first_byte_ms = v;
-    if (cfg.event_gap_timeout_ms) |v| t.event_gap_ms = v else if (parseEnvMapU32(environ_map, "FRANKY_EVENT_GAP_TIMEOUT_MS")) |v| t.event_gap_ms = v;
-    return t;
-}
-
-fn parseEnvMapU32(map: *const std.process.Environ.Map, key: []const u8) ?u32 {
-    const v = map.get(key) orelse return null;
-    return std.fmt.parseInt(u32, v, 10) catch null;
-}
-
-/// Resolve the agent loop's `max_turns` cap from the CLI flag, env
-/// var, or null (caller falls back to `loop.Config.max_turns`'s
-/// default). Precedence: `--max-turns` > `FRANKY_MAX_TURNS` > unset.
-/// Settings/profile overlay layers in on top of this; see iter 4.
-pub fn resolveMaxTurnsFromMap(
-    cfg: *const cli_mod.Config,
-    environ_map: *const std.process.Environ.Map,
-) ?u32 {
-    if (cfg.max_turns) |v| return v;
-    if (parseEnvMapU32(environ_map, "FRANKY_MAX_TURNS")) |v| return v;
-    return null;
-}
-
-/// v2.13 — resolve retry policy from CLI flags, settings, or defaults.
-/// Callers pass their `cfg` and settings to build a `retry_mod.Policy`
-/// that providers can use instead of the hard-coded defaults.
-pub fn resolveRetryPolicyFromMap(
-    cfg: *const cli_mod.Config,
-    settings: ?*const settings_mod.Settings,
-) ai.retry.Policy {
-    var p: ai.retry.Policy = .{};
-    if (cfg.retry_max_attempts) |v| {
-        p.max_retries = v;
-    } else if (settings) |s| {
-        if (s.retry_max_attempts) |v| p.max_retries = v;
-    }
-    if (cfg.retry_max_total_ms) |v| {
-        p.max_total_delay_ms = v;
-    } else if (settings) |s| {
-        if (s.retry_max_total_ms) |v| p.max_total_delay_ms = v;
-    }
-    if (cfg.retry_base_delay_ms) |v| {
-        p.base_delay_ms = v;
-    }
-    return p;
-}
-
-/// v1.13.0 — resolve the log-file destination for this run.
-/// Precedence: `--log-file` flag → `FRANKY_LOG_FILE` env var → null.
-/// Returned slice is borrowed from `cfg` (CLI arena) or
-/// `environ_map` (process env); both outlive the logger.
-pub fn resolveLogFileFromMap(
-    cfg: *const cli_mod.Config,
-    environ_map: *const std.process.Environ.Map,
-) ?[]const u8 {
-    if (cfg.log_file) |p| if (p.len > 0) return p;
-    if (environ_map.get("FRANKY_LOG_FILE")) |p| if (p.len > 0) return p;
-    return null;
-}
-
-/// v1.16.1 — resolve `--http-trace-dir`.
-/// Precedence: CLI flag → `FRANKY_HTTP_TRACE_DIR` env var → null.
-pub fn resolveHttpTraceDirFromMap(
-    cfg: *const cli_mod.Config,
-    environ_map: *const std.process.Environ.Map,
-) ?[]const u8 {
-    if (cfg.http_trace_dir) |p| if (p.len > 0) return p;
-    if (environ_map.get("FRANKY_HTTP_TRACE_DIR")) |p| if (p.len > 0) return p;
-    return null;
-}
-
-/// v1.18.0 — true when the user wants per-session log files.
-/// Precedence: `--log-per-session` CLI flag → non-empty
-/// `FRANKY_LOG_PER_SESSION` env var → false.
-pub fn resolveLogPerSessionFromMap(
-    cfg: *const cli_mod.Config,
-    environ_map: *const std.process.Environ.Map,
-) bool {
-    if (cfg.log_per_session) return true;
-    if (environ_map.get("FRANKY_LOG_PER_SESSION")) |v| if (v.len > 0) return true;
-    return false;
-}
+const parseEnvMapU32 = config_mod.parseEnvMapU32;
 
 /// v1.18.0 — build the per-session log path from the active
 /// session id. Prefers `$FRANKY_HOME/logs/<id>.log`; falls back
@@ -1075,114 +943,20 @@ pub fn loadSettingsForOverlay(
 /// `bash_state`. Today this is just `tools.bash.timeoutMs`; the
 /// per-call `timeoutMs` arg always wins. Idempotent; safe to call
 /// after `SessionBashState.init`.
-pub fn applyBashSettingsOverlay(
-    bash_state: *tools_mod.bash.SessionBashState,
-    settings: *const settings_mod.Settings,
-) void {
-    if (settings.bash_timeout_ms) |ms| {
-        bash_state.default_timeout_ms_override = ms;
-    }
-}
-
-/// v1.19.0 — copy the relevant settings.json overlay fields onto
-/// `read_ctx`. Today this is just `tools.read.maxBytes`; the
-/// per-call `limit` arg always wins. Idempotent.
-pub fn applyReadSettingsOverlay(
-    read_ctx: *tools_mod.read.ReadCtx,
-    settings: *const settings_mod.Settings,
-) void {
-    if (settings.read_max_bytes) |b| {
-        read_ctx.max_bytes_without_limit_override = b;
-    }
-}
-
-/// v1.19.0 — pre-seed a `permissions.Store` from settings.json's
-/// `permissions.{always_allow,always_deny}.{tools,bash}` arrays
-/// and the `permissions.{ask_all,yes_to_all}` scalars. Call after
-/// `Store.init` and before applying CLI flags so CLI always wins
-/// (CLI just adds entries; deny still beats allow in `Store.check`
-/// regardless of which layer added them).
-pub fn applyPermissionsSettingsOverlay(
-    store: *permissions_mod.Store,
-    settings: *const settings_mod.Settings,
-) !void {
-    if (settings.permissions_ask_all) |b| store.ask_all = b;
-    if (settings.permissions_yes_to_all) |b| store.yes_to_all = b;
-    for (settings.permissions_always_allow_tools) |t| {
-        try store.addBareEntry(t, .allow, false);
-    }
-    for (settings.permissions_always_deny_tools) |t| {
-        try store.addBareEntry(t, .deny, false);
-    }
-    for (settings.permissions_always_allow_bash) |fp| {
-        try store.addBareEntry(fp, .allow, true);
-    }
-    for (settings.permissions_always_deny_bash) |fp| {
-        try store.addBareEntry(fp, .deny, true);
-    }
-}
-
-/// v1.19.0 — settings-layer default for `--prompts`. CLI flag
-/// always wins. Returns `true` when prompts should be enabled
-/// at this layer (settings says so AND CLI didn't set it).
-pub fn resolvePromptsDefault(
-    cfg: *const cli_mod.Config,
-    settings: *const settings_mod.Settings,
-) bool {
-    if (cfg.prompts) return true; // CLI wins.
-    return settings.prompts_default orelse false;
-}
-
-/// Backfill `cfg.max_turns` from `settings.max_turns` when the CLI
-/// (or profile, via `applyToCfg` which already ran) didn't set it.
-/// Preserves the precedence chain CLI > profile > settings > env >
-/// default — `resolveMaxTurnsFromMap` then sees a populated `cfg`
-/// before it falls through to the env-var lookup.
-pub fn applyMaxTurnsSettingsOverlay(
-    cfg: *cli_mod.Config,
-    settings: *const settings_mod.Settings,
-) void {
-    if (cfg.max_turns != null) return; // CLI / profile already set it.
-    if (settings.max_turns) |v| cfg.max_turns = v;
-}
-
-/// v2.13 — apply `settings.retry_max_attempts` and
-/// `settings.retry_max_total_ms` to `cfg` when the CLI didn't
-/// set them (or a profile didn't). Follows the same pattern as
-/// `applyMaxTurnsSettingsOverlay`.
-pub fn applyRetrySettingsOverlay(
-    cfg: *cli_mod.Config,
-    settings: *const settings_mod.Settings,
-) void {
-    if (cfg.retry_max_attempts == null) {
-        cfg.retry_max_attempts = settings.retry_max_attempts;
-    }
-    if (cfg.retry_max_total_ms == null) {
-        cfg.retry_max_total_ms = settings.retry_max_total_ms;
-    }
-}
-
-/// True when `base_url` parses to a loopback host. Whole-host
-/// match (not substring) so we don't false-positive on
-/// `https://localhost-prod.example.com/`.
-pub fn isLoopbackBaseUrl(maybe_url: ?[]const u8) bool {
-    const url = maybe_url orelse return false;
-    const after_scheme = blk: {
-        if (std.mem.indexOf(u8, url, "://")) |i| break :blk url[i + 3 ..];
-        break :blk url;
-    };
-    // Bracketed IPv6 host: `[::1]` (port follows after `]`).
-    if (after_scheme.len > 0 and after_scheme[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, after_scheme, ']') orelse return false;
-        const inner = after_scheme[1..close];
-        return std.mem.eql(u8, inner, "::1");
-    }
-    const host_end = std.mem.indexOfAny(u8, after_scheme, ":/?#") orelse after_scheme.len;
-    const host = after_scheme[0..host_end];
-    return std.mem.eql(u8, host, "localhost") or
-        std.mem.eql(u8, host, "127.0.0.1") or
-        std.mem.eql(u8, host, "::1");
-}
+// ─── settings.json overlays + loopback check ──────────────────────
+//
+// v1.3.0 dedup — these were byte-identical copies of the functions
+// in `coding/config.zig` (the `config_mod` resolver). They are
+// re-exported here so existing call sites in this file and in
+// `interactive.zig` (which reaches them as `print_mode.X`) keep
+// compiling. See `DEDUP_PLAN.md` Finding 1.
+pub const applyBashSettingsOverlay = config_mod.applyBashSettingsOverlay;
+pub const applyReadSettingsOverlay = config_mod.applyReadSettingsOverlay;
+pub const applyPermissionsSettingsOverlay = config_mod.applyPermissionsSettingsOverlay;
+pub const resolvePromptsDefault = config_mod.resolvePromptsDefault;
+pub const applyMaxTurnsSettingsOverlay = config_mod.applyMaxTurnsSettingsOverlay;
+pub const applyRetrySettingsOverlay = config_mod.applyRetrySettingsOverlay;
+pub const isLoopbackBaseUrl = config_mod.isLoopbackBaseUrl;
 
 // ─── provider selection ──────────────────────────────────────────
 
@@ -1439,37 +1213,18 @@ fn buildPrintGeminiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, cred
 /// the chosen model id, and if a match exists, upgrade the
 /// context_window/max_output/capabilities from the Entry. Callers
 /// can still override by passing `--context-window` (TODO) etc.
+///
+/// v1.3.0 dedup — the canonical implementation lives in
+/// `config_mod.finalize` (byte-identical body); this wrapper keeps
+/// the `!ProviderInfo` return type so the `buildPrint*Config`
+/// callers (which are error-unions) stay unchanged.
 fn finalize(
     arena_alloc: std.mem.Allocator,
     info_in: ProviderInfo,
     cfg: *const cli_mod.Config,
     extras: []const models_mod.Entry,
 ) !ProviderInfo {
-    _ = arena_alloc;
-    var info = info_in;
-    if (models_mod.lookup(extras, info.model_id)) |entry| {
-        info.context_window = entry.context_window;
-        info.max_output = entry.max_output;
-        info.capabilities = .{
-            .vision = entry.capabilities.vision,
-            .tool_use = entry.capabilities.tool_use,
-            // Thinking stays user-controlled: if the user passed
-            // `--thinking <level>` explicitly, light it up even if
-            // the catalog says the model doesn't support reasoning
-            // (the provider layer will reject gracefully).
-            .reasoning = if (cfg.thinking != .off) true else entry.capabilities.reasoning,
-            .cache = entry.capabilities.cache,
-            .streaming = entry.capabilities.streaming,
-        };
-    } else {
-        // Unknown model id — keep the hardcoded defaults but still
-        // honor `--thinking`.
-        info.capabilities = .{
-            .tool_use = true,
-            .reasoning = cfg.thinking != .off,
-        };
-    }
-    return info;
+    return config_mod.finalize(arena_alloc, info_in, cfg, extras);
 }
 
 /// Compute the path to `auth.json` from `FRANKY_HOME` or `HOME`.
@@ -1503,19 +1258,7 @@ pub fn authJsonPathFrom(
 /// Pure-logic variant for `models.json`. Same precedence as
 /// `authJsonPathFrom`: `$FRANKY_HOME/models.json` >
 /// `$HOME/.franky/models.json` > null (§H.3, v1.5.2).
-pub fn modelsJsonPathFrom(
-    arena_alloc: std.mem.Allocator,
-    franky_home: ?[]const u8,
-    home: ?[]const u8,
-) !?[]const u8 {
-    if (franky_home) |h| {
-        return try std.fs.path.join(arena_alloc, &.{ h, "models.json" });
-    }
-    if (home) |h| {
-        return try std.fs.path.join(arena_alloc, &.{ h, ".franky", "models.json" });
-    }
-    return null;
-}
+pub const modelsJsonPathFrom = config_mod.modelsJsonPathFrom;
 
 /// Pure-logic variant for `system.md`. Same precedence as
 /// `authJsonPathFrom`: `$FRANKY_HOME/system.md` >
@@ -1809,11 +1552,6 @@ fn buildSubagentHint(
 }
 
 // ─── helpers ────────────────────────────────────────────────────
-
-fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
-    const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
-    try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
-}
 
 fn writeOut(io: std.Io, s: []const u8) !void {
     var buf: [4096]u8 = undefined;
@@ -2389,22 +2127,7 @@ fn exitWithMessageErr(allocator: std.mem.Allocator, msg: []const u8, code: u8) n
 /// missing or unreadable. Used for optional disk overlays like
 /// `models.json` and `system.md` where "file doesn't exist" is the
 /// normal fallback — not an error.
-fn readWholeFileOpt(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    path: []const u8,
-) ?[]u8 {
-    const cwd = std.Io.Dir.cwd();
-    var f = cwd.openFile(io, path, .{}) catch return null;
-    defer f.close(io);
-    const len = f.length(io) catch return null;
-    const buf = allocator.alloc(u8, @intCast(len)) catch return null;
-    const n = f.readPositionalAll(io, buf, 0) catch {
-        allocator.free(buf);
-        return null;
-    };
-    return buf[0..n];
-}
+const readWholeFileOpt = config_mod.readWholeFileOpt;
 
 // ─── tests ───────────────────────────────────────────────────────
 

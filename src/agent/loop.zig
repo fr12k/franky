@@ -1101,7 +1101,7 @@ fn runTurn(
     };
 
     // Push a duplicate into the event and keep the original for transcript.
-    try out.push(io, .{ .message_end = try dupeMessage(allocator, assistant_msg) });
+    try out.push(io, .{ .message_end = try assistant_msg.dupe(allocator) });
     if (ai.log.enabledForScope(.trace, "message")) logMessageTrace("recv", 0, assistant_msg);
     try transcript.append(assistant_msg);
 
@@ -1231,7 +1231,7 @@ fn runTurn(
         if (!r.terminate) all_terminate = false;
         const tr_msg = try makeToolResultMessage(allocator, r, config);
         try out.push(io, .{ .message_start = .{ .role = .tool_result } });
-        try out.push(io, .{ .message_end = try dupeMessage(allocator, tr_msg) });
+        try out.push(io, .{ .message_end = try tr_msg.dupe(allocator) });
         if (ai.log.enabledForScope(.trace, "message")) logMessageTrace("result", 0, tr_msg);
         try transcript.append(tr_msg);
     }
@@ -1697,7 +1697,7 @@ fn offloadToolResults(
             for (out[0..messages.len]) |*m| m.deinit(allocator);
             allocator.free(out);
         }
-        for (messages, 0..) |m, i| out[i] = try dupeMessage(allocator, m);
+        for (messages, 0..) |m, i| out[i] = try m.dupe(allocator);
         return out;
     }
 
@@ -1800,7 +1800,7 @@ fn offloadToolResults(
                 .is_error = false,
             };
         } else {
-            out[i] = try dupeMessage(allocator, m);
+            out[i] = try m.dupe(allocator);
         }
     }
     return out;
@@ -2369,37 +2369,6 @@ fn cloneTools(
         cloned = i + 1;
     }
     return out;
-}
-
-fn dupeMessage(allocator: std.mem.Allocator, m: ai.types.Message) !ai.types.Message {
-    var content: std.ArrayList(ai.types.ContentBlock) = .empty;
-    errdefer {
-        for (content.items) |cb| cb.deinit(allocator);
-        content.deinit(allocator);
-    }
-    for (m.content) |cb| try content.append(allocator, try cb.dupe(allocator));
-    const content_slice = try content.toOwnedSlice(allocator);
-    errdefer {
-        for (content_slice) |cb| cb.deinit(allocator);
-        allocator.free(content_slice);
-    }
-    var msg: ai.types.Message = .{
-        .role = m.role,
-        .content = content_slice,
-        .timestamp = m.timestamp,
-        .stop_reason = m.stop_reason,
-        .usage = m.usage,
-        .error_message = if (m.error_message) |s| try allocator.dupe(u8, s) else null,
-        .provider = if (m.provider) |s| try allocator.dupe(u8, s) else null,
-        .model = if (m.model) |s| try allocator.dupe(u8, s) else null,
-        .api = if (m.api) |s| try allocator.dupe(u8, s) else null,
-        .tool_call_id = if (m.tool_call_id) |s| try allocator.dupe(u8, s) else null,
-        .is_error = m.is_error,
-        .custom_role = if (m.custom_role) |s| try allocator.dupe(u8, s) else null,
-        .meta_json = if (m.meta_json) |s| try allocator.dupe(u8, s) else null,
-    };
-    errdefer msg.deinit(allocator);
-    return msg;
 }
 
 // ─── tests ──────────────────────────────────────────────────────

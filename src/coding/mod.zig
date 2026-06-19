@@ -22,6 +22,7 @@ pub const tools = struct {
 };
 
 pub const modes = struct {
+    pub const common = @import("modes/common.zig");
     pub const print = @import("modes/print.zig");
     pub const interactive = @import("modes/interactive.zig");
     pub const rpc = @import("modes/rpc.zig");
@@ -104,6 +105,7 @@ test {
     _ = tools.workspace;
     _ = tools.common;
     _ = tools.truncate;
+    _ = modes.common;
     _ = modes.print;
     _ = modes.interactive;
     _ = modes.rpc;

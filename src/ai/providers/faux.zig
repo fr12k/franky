@@ -17,6 +17,7 @@ const types = @import("../types.zig");
 const errors = @import("../errors.zig");
 const stream_mod = @import("../stream.zig");
 const channel_mod = @import("../channel.zig");
+const registry_mod = @import("../registry.zig");
 
 pub const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
@@ -258,6 +259,16 @@ pub const FauxProvider = struct {
             return i;
         }
         return null;
+    }
+
+    /// `registry.StreamFn` trampoline that forwards to `runSync`.
+    /// `ctx.userdata` must be a `*FauxProvider`. This is the canonical
+    /// shim; the per-mode `fauxShim` copies and `compaction.zig`'s
+    /// `fauxStreamShim` were replaced by this in the v1.3.0 dedup
+    /// (see `DEDUP_PLAN.md` Finding 6).
+    pub fn shim(ctx: registry_mod.StreamCtx) anyerror!void {
+        const self: *FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
+        try self.runSync(ctx.io, ctx.context, ctx.out);
     }
 };
 

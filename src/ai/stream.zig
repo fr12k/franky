@@ -715,6 +715,61 @@ pub fn pushTraceId(
     };
 }
 
+/// v1.3.0 dedup — close the channel with a canonical error event for
+/// the `EventHandlerError` set returned by `http.driveSseFromBytes`.
+/// Every provider's `runFromSseWithTrace` carried the same
+/// `switch (e) { .Aborted, .ProtocolViolation, .OutOfMemory,
+/// .Timeout, .Handler => … }` block (only the message text differed
+/// cosmetically); this is the single canonical version. See
+/// `DEDUP_PLAN.md` Finding 3.
+///
+/// Messages use the most-descriptive variant (openai-chat's).
+/// `error.Timeout`'s message mentions `timeouts.event_gap_ms` to
+/// match the v1.10 diagnostic.
+///
+/// **Review fix (multi-model v1.3.1):** the original per-provider
+/// `try allocator.dupe(...)` propagated OOM to the caller; the dedup'd
+/// `catch return` variant silently left the channel **open**, which
+/// blocks consumers indefinitely (`Channel.next` waits on
+/// `not_empty` forever). We must *always* close. The `ErrorDetails.message`
+/// field is a borrowed slice the channel drop-hook frees, so it must
+/// be allocator-owned (a string literal would crash on free). On
+/// `dupe` failure we fall back to a zero-length owned allocation
+/// (`alloc(u8, 0)`) so the channel still closes with a valid, freeable
+/// (empty) message rather than hanging the consumer.
+pub fn closeOnSseError(
+    out: *Channel,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    e: anyerror,
+) void {
+    // Resolve the canonical (code, text) for the error, then build an
+    // owned message — falling back to an empty owned slice on OOM so
+    // the channel is *always* closed.
+    const code: errors.Code = switch (e) {
+        error.Aborted => .aborted,
+        error.ProtocolViolation => .protocol_violation,
+        error.OutOfMemory => .internal,
+        error.Timeout => .timeout,
+        error.Handler => .internal,
+        else => .internal,
+    };
+    const text: []const u8 = switch (e) {
+        error.Aborted => "cancelled",
+        error.ProtocolViolation => "malformed SSE stream",
+        error.OutOfMemory => "out of memory",
+        error.Timeout => "event gap exceeded timeouts.event_gap_ms",
+        error.Handler => "handler failure",
+        else => "unexpected stream error",
+    };
+    const msg = allocator.dupe(u8, text) catch
+        (allocator.alloc(u8, 0) catch return);
+    out.closeWithFinal(io, .{ .error_ev = .{
+        .code = code,
+        .message = msg,
+    } });
+}
+
 // ─── v1.29.0 helpers shared by Reducer.snapshotJson ────────────────
 
 fn appendJsonStrLocal(

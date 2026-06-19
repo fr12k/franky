@@ -119,6 +119,79 @@ pub fn setupClientFromEnv(
     return proxy_arena;
 }
 
+// ─── v1.3.0 dedup — stream client acquire/release ──────────────────
+//
+// Every provider's `streamFn` carried the same
+// `var local_client / var proxy_arena / if (ctx.http_client) |h| …
+// else blk: { setupClientFromEnv … } / defer cleanup` block
+// (byte-identical across openai_chat, openai_responses, anthropic,
+// google_gemini, google_vertex). See `DEDUP_PLAN.md` Finding 4.
+
+/// Owned HTTP client resources for one streaming request.
+/// `acquireStreamClient` returns `null` when env-proxy setup failed —
+/// in that case it has already pushed a `start` + `transport` error
+/// event onto `ctx.out` and the caller should just `return`.
+pub const StreamClient = struct {
+    client: *Client,
+    local_client: Client,
+    proxy_arena: ?std.heap.ArenaAllocator,
+    /// True when we own `local_client` (i.e. `ctx.http_client` was
+    /// null). False when the caller passed a persistent client.
+    owns: bool,
+
+    pub fn deinit(self: *StreamClient) void {
+        if (self.owns) {
+            self.local_client.deinit();
+            if (self.proxy_arena) |*a| a.deinit();
+        }
+    }
+};
+
+/// Resolve the HTTP client for a streaming request. When
+/// `ctx.http_client` is non-null it is reused as-is (caller-owned);
+/// otherwise a per-request `local_client` is constructed and, if
+/// `ctx.options.environ_map` is set, wired up with env proxies via
+/// `setupClientFromEnv`.
+///
+/// On `setupClientFromEnv` failure this pushes a `start` event plus a
+/// `transport` error event onto `ctx.out` and returns `null` — the
+/// caller should `return` immediately.
+///
+/// **Review fix (multi-model v1.3.1):** if `std.fmt.allocPrint` fails
+/// while building the transport-error message (OOM), the original
+/// `catch return null` left the channel with only a `.start` event and
+/// no terminal event, so consumers blocked on `next` forever. Now the
+/// OOM arm still closes the channel with a zero-length owned message
+/// before returning `null`.
+pub fn acquireStreamClient(ctx: registry_mod.StreamCtx) ?StreamClient {
+    var local_client: Client = undefined;
+    var proxy_arena: ?std.heap.ArenaAllocator = null;
+    const client: *Client = if (ctx.http_client) |h|
+        @ptrCast(@alignCast(h))
+    else blk: {
+        local_client = .{ .allocator = ctx.allocator, .io = ctx.io };
+        if (ctx.options.environ_map) |env_map| {
+            proxy_arena = setupClientFromEnv(&local_client, ctx.allocator, env_map) catch |e| {
+                ctx.out.push(ctx.io, .start) catch {};
+                const msg = std.fmt.allocPrint(ctx.allocator, "client setup failed: {s}", .{@errorName(e)}) catch
+                    (ctx.allocator.alloc(u8, 0) catch return null);
+                ctx.out.closeWithFinal(ctx.io, .{ .error_ev = .{
+                    .code = errors_mod.Code.transport,
+                    .message = msg,
+                } });
+                return null;
+            };
+        }
+        break :blk &local_client;
+    };
+    return .{
+        .client = client,
+        .local_client = local_client,
+        .proxy_arena = proxy_arena,
+        .owns = ctx.http_client == null,
+    };
+}
+
 // ─── §G.4 per-phase timeout primitives (v1.8.0) ──────────────────
 
 /// On-success this is `none`; on `error.Timeout` it identifies which

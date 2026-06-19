@@ -17,6 +17,25 @@ const at = @import("../../agent/types.zig");
 const gitignore = @import("../gitignore.zig");
 const workspace_mod = @import("workspace.zig");
 
+/// v1.3.0 dedup — the standard tool-arg parse prologue. Every built-in
+/// tool's `execute` opened with the same three lines: arena-init +
+/// `repairConcatJson` + `parseFromSlice`. This folds them into one call
+/// while leaving the arena in the caller (several tools re-use
+/// `arena.allocator()` for downstream extraction like `resolvePaths`).
+///
+/// Usage:
+///   var arena = std.heap.ArenaAllocator.init(allocator);
+///   defer arena.deinit();
+///   const parsed = try common.parseToolArgs(arena.allocator(), args_json);
+///   const root = parsed.value;
+pub fn parseToolArgs(
+    arena_allocator: std.mem.Allocator,
+    args_json: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    const json_to_parse = repairConcatJson(arena_allocator, args_json) orelse args_json;
+    return try std.json.parseFromSlice(std.json.Value, arena_allocator, json_to_parse, .{});
+}
+
 /// §6.9 — tool_code emitted when a single-path tool refuses a path
 /// covered by `.contextignore`. Single literal so call sites and
 /// test assertions stay in sync.

@@ -280,7 +280,7 @@ fn applyEnvOverrides(cfg: *cli_mod.Config, map: *const std.process.Environ.Map) 
 /// Extract the bare global level from a spec that may contain
 /// comma-separated `scope:level` entries. Returns null when the
 /// input is only scope overrides with no global level.
-fn extractGlobalLevel(s: []const u8) ?ai.log.Level {
+pub fn extractGlobalLevel(s: []const u8) ?ai.log.Level {
     var it = std.mem.splitScalar(u8, s, ',');
     var result: ?ai.log.Level = null;
     while (it.next()) |part| {
@@ -355,7 +355,7 @@ pub fn resolveTimeouts(
     return t;
 }
 
-fn parseEnvMapU32(map: *const std.process.Environ.Map, key: []const u8) ?u32 {
+pub fn parseEnvMapU32(map: *const std.process.Environ.Map, key: []const u8) ?u32 {
     const v = map.get(key) orelse return null;
     return std.fmt.parseInt(u32, v, 10) catch null;
 }
@@ -584,7 +584,13 @@ pub fn resolveRetryPolicy(
 
 // ─── Provider resolution ────────────────────────────────────────
 
-/// Resolved provider info (mirrors print.zig's ProviderInfo).
+/// Canonical resolved provider info.
+///
+/// v1.3.0 dedup — this is the single source of truth for the
+/// `ProviderInfo` shape. `session/create.zig` re-exports it (as
+/// `session.ProviderInfo`) and `print.zig` aliases that re-export,
+/// so all three names refer to the same nominal type and can be
+/// passed interchangeably to `finalize` / `resolveProvider`.
 pub const ProviderInfo = struct {
     provider_name: []const u8,
     api_tag: []const u8,
@@ -594,7 +600,7 @@ pub const ProviderInfo = struct {
     base_url: ?[]const u8,
     context_window: u32,
     max_output: u32,
-    capabilities: ai.types.Capabilities,
+    capabilities: ai.types.Capabilities = .{ .tool_use = true },
 };
 
 /// Resolve provider from CLI config, env, auth.json, and settings.
@@ -628,7 +634,7 @@ pub fn resolveProvider(
     return error.UnknownProvider;
 }
 
-const ResolvedCredentials = struct {
+pub const ResolvedCredentials = struct {
     api_key: ?[]const u8 = null,
     auth_token: ?[]const u8 = null,
     openai_api_key: ?[]const u8 = null,
@@ -639,7 +645,7 @@ const ResolvedCredentials = struct {
     has_gemini: bool = false,
 };
 
-fn applyThinkingOverride(cfg: *cli_mod.Config, settings: *const settings_mod.Settings) void {
+pub fn applyThinkingOverride(cfg: *cli_mod.Config, settings: *const settings_mod.Settings) void {
     if (!cfg.thinking_explicit) {
         if (ai.types.ThinkingLevel.fromString(settings.thinking)) |lvl| {
             cfg.thinking = lvl;
@@ -719,7 +725,7 @@ fn resolveAllCredentials(a: std.mem.Allocator, cfg: *const cli_mod.Config, map: 
     };
 }
 
-fn chooseProvider(cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings) []const u8 {
+pub fn chooseProvider(cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings) []const u8 {
     if (cfg.offline) return "faux";
     if (cfg.provider) |p| return p;
     if (creds.has_anthropic) return "anthropic";
@@ -729,7 +735,7 @@ fn chooseProvider(cfg: *const cli_mod.Config, creds: *const ResolvedCredentials,
     return "faux";
 }
 
-fn buildFauxConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, models_extras: []const models_mod.Entry) ProviderInfo {
+pub fn buildFauxConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, models_extras: []const models_mod.Entry) ProviderInfo {
     const model = cfg.model orelse "faux-1";
     return finalize(a, .{
         .provider_name = "faux",
@@ -744,7 +750,7 @@ fn buildFauxConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, models_extr
     }, cfg, models_extras);
 }
 
-fn buildAnthropicConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
+pub fn buildAnthropicConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
     if (creds.api_key == null and creds.auth_token == null) return error.MissingApiKey;
     const model = cfg.model orelse try a.dupe(u8, resolveAnthropicAlias(settings.default_model_anthropic));
     const resolved_model = resolveAnthropicAlias(model);
@@ -761,7 +767,7 @@ fn buildAnthropicConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds:
     }, cfg, models_extras);
 }
 
-fn buildOpenaiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
+pub fn buildOpenaiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, settings: *const settings_mod.Settings, models_extras: []const models_mod.Entry) !ProviderInfo {
     if (creds.openai_api_key == null and creds.api_key == null) return error.MissingApiKey;
     const actual_key = creds.openai_api_key orelse creds.api_key;
     const model = cfg.model orelse try a.dupe(u8, settings.default_model_openai);
@@ -778,7 +784,7 @@ fn buildOpenaiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *c
     }, cfg, models_extras);
 }
 
-fn buildGatewayConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, map: *const std.process.Environ.Map, creds: *const ResolvedCredentials, auth_state: ?auth_mod.Auth, models_extras: []const models_mod.Entry) !ProviderInfo {
+pub fn buildGatewayConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, map: *const std.process.Environ.Map, creds: *const ResolvedCredentials, auth_state: ?auth_mod.Auth, models_extras: []const models_mod.Entry) !ProviderInfo {
     const gateway_file = if (auth_state) |as| as.get("gateway") else null;
     const base_url_str: ?[]const u8 = cfg.base_url orelse blk: {
         if (map.get("FRANKY_GATEWAY_URL")) |u| break :blk try a.dupe(u8, u);
@@ -804,7 +810,7 @@ fn buildGatewayConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, map: *co
     }, cfg, models_extras);
 }
 
-fn buildGeminiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, models_extras: []const models_mod.Entry) !ProviderInfo {
+pub fn buildGeminiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *const ResolvedCredentials, models_extras: []const models_mod.Entry) !ProviderInfo {
     const model = cfg.model orelse try a.dupe(u8, "gemini-2.0-flash");
     const actual_key = creds.gemini_api_key orelse
         if (cfg.api_key) |k| k else null;
@@ -821,7 +827,7 @@ fn buildGeminiConfig(a: std.mem.Allocator, cfg: *const cli_mod.Config, creds: *c
     }, cfg, models_extras);
 }
 
-fn finalize(
+pub fn finalize(
     arena_alloc: std.mem.Allocator,
     info_in: ProviderInfo,
     cfg: *const cli_mod.Config,
@@ -885,7 +891,7 @@ fn authJsonPathFrom(
     return null;
 }
 
-fn modelsJsonPathFrom(
+pub fn modelsJsonPathFrom(
     arena_alloc: std.mem.Allocator,
     franky_home: ?[]const u8,
     home: ?[]const u8,
@@ -899,7 +905,7 @@ fn modelsJsonPathFrom(
     return null;
 }
 
-fn readWholeFileOpt(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+pub fn readWholeFileOpt(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
     const cwd = std.Io.Dir.cwd();
     var f = cwd.openFile(io, path, .{}) catch return null;
     defer f.close(io);
@@ -1333,10 +1339,10 @@ pub fn resolve(
 
 // ─── Shim for faux provider ─────────────────────────────────────
 
-fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
-    const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
-    try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
-}
+/// v1.3.0 dedup — the canonical shim lives on `FauxProvider` itself
+/// (`ai.providers.faux.FauxProvider.shim`); this is a re-export so
+/// the local call site stays unchanged.
+const fauxShim = ai.providers.faux.FauxProvider.shim;
 
 // ─── Tests ─────────────────────────────────────────────────────
 

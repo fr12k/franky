@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ai = struct {
     pub const types = @import("../../ai/types.zig");
+    pub const utils = @import("../../ai/utils.zig");
 };
 const agent_mod = @import("../../agent/mod.zig");
 const object_store = @import("object_store.zig");
@@ -701,23 +702,10 @@ fn writeJsonStrField(
     try buf.append(allocator, '\n');
 }
 
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            const hex = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
-            defer allocator.free(hex);
-            try buf.appendSlice(allocator, hex);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
+// JSON string appender — re-aliased from `ai.utils` (v1.3.0 dedup).
+// The previous private copy used `allocPrint`+free per control char;
+// the shared version uses `bufPrint` into a stack tmp (no allocation).
+const appendJsonStr = ai.utils.appendJsonStr;
 
 fn appendJsonNumField(
     buf: *std.ArrayList(u8),

@@ -117,9 +117,122 @@ fn isHexDigit(c: u8) bool {
         (c >= 'A' and c <= 'F');
 }
 
+// ─── JSON-schema sanitization ────────────────────────────────────
+//
+// Some providers reject keys the standard JSON-Schema spec allows
+// (`additionalProperties`, `$schema`, `$defs`, …). Each provider
+// keeps its own vendor-specific key list; the walk/strip/re-stringify
+// machinery is identical and lives here so it isn't forked per
+// provider. See `DEDUP_PLAN.md` Finding 2.
+
+/// Recursively strip `unsupported_keys` from `v`'s objects, in place.
+/// Array elements are walked too so unsupported keywords nested inside
+/// `items` (e.g. an array of edit-records) are removed.
+pub fn sanitizeSchemaValue(v: *std.json.Value, unsupported_keys: []const []const u8) void {
+    switch (v.*) {
+        .object => |*obj| {
+            for (unsupported_keys) |k| _ = obj.swapRemove(k);
+            var it = obj.iterator();
+            while (it.next()) |entry| sanitizeSchemaValue(entry.value_ptr, unsupported_keys);
+        },
+        .array => |*arr| {
+            for (arr.items) |*item| sanitizeSchemaValue(item, unsupported_keys);
+        },
+        else => {},
+    }
+}
+
+/// Parse `schema_json`, walk it recursively dropping `unsupported_keys`,
+/// then serialize the result back into `buf`.
+///
+/// Fast path (most schemas): a substring scan. If none of the
+/// unsupported keywords appear, the schema is already valid for the
+/// provider and we inline it verbatim — skipping the parse / walk /
+/// re-stringify entirely. This is the common case and avoids ~1KB of
+/// allocations × N tools per HTTP request.
+///
+/// Falls back to inlining the original (unsanitized) schema if parsing
+/// fails — better to attempt a request with the original than to fail
+/// closed; the provider will return its own error which the user can
+/// act on.
+pub fn appendSanitizedSchema(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    schema_json: []const u8,
+    unsupported_keys: []const []const u8,
+) !void {
+    var needs_sanitize = false;
+    for (unsupported_keys) |key| {
+        if (std.mem.indexOf(u8, schema_json, key) != null) {
+            needs_sanitize = true;
+            break;
+        }
+    }
+    if (!needs_sanitize) {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, aalloc, schema_json, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    var root = parsed.value;
+    sanitizeSchemaValue(&root, unsupported_keys);
+
+    const out = std.json.Stringify.valueAlloc(aalloc, root, .{}) catch {
+        try buf.appendSlice(allocator, schema_json);
+        return;
+    };
+    try buf.appendSlice(allocator, out);
+}
+
 // ─── tests ──────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "appendSanitizedSchema: fast-path inlines when no unsupported keys present" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const keys = [_][]const u8{ "additionalProperties", "$schema" };
+    const schema = "{\"type\":\"object\"}";
+    try appendSanitizedSchema(&buf, gpa, schema, &keys);
+    try testing.expectEqualStrings(schema, buf.items);
+}
+
+test "appendSanitizedSchema: strips unsupported keys recursively" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const keys = [_][]const u8{ "additionalProperties", "$schema" };
+    const schema =
+        \\{"type":"object","additionalProperties":false,"$schema":"x","properties":{"p":{"type":"string","additionalProperties":true}}}
+    ;
+    try appendSanitizedSchema(&buf, gpa, schema, &keys);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, buf.items, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expect(root.get("type") != null);
+    try testing.expect(root.get("additionalProperties") == null);
+    try testing.expect(root.get("$schema") == null);
+    const p = root.get("properties").?.object.get("p").?.object;
+    try testing.expect(p.get("additionalProperties") == null);
+}
+
+test "appendSanitizedSchema: malformed JSON falls back to verbatim" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const keys = [_][]const u8{"additionalProperties"};
+    const bad = "{not json but has additionalProperties";
+    try appendSanitizedSchema(&buf, gpa, bad, &keys);
+    try testing.expectEqualStrings(bad, buf.items);
+}
 
 test "sanitizeJsonString: valid JSON passes through unchanged" {
     const gpa = testing.allocator;

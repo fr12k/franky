@@ -129,8 +129,7 @@ fn execute(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const json_to_parse = common.repairConcatJson(arena.allocator(), args_json) orelse args_json;
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json_to_parse, .{});
+    const parsed = try common.parseToolArgs(arena.allocator(), args_json);
     const root = parsed.value;
     const path_val = root.object.get("path") orelse
         return common.toolError(allocator, "invalid_args", "missing path");
@@ -254,8 +253,7 @@ fn executeWithCtx(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const json_to_parse = common.repairConcatJson(arena.allocator(), args_json) orelse args_json;
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json_to_parse, .{});
+    const parsed = try common.parseToolArgs(arena.allocator(), args_json);
     const root = parsed.value;
     const path_val = root.object.get("path") orelse
         return common.toolError(allocator, "invalid_args", "missing path");

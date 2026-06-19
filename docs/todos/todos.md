@@ -160,7 +160,7 @@ Let me search for the skill file.
 Since I'm not in interactive mode with the /review slash command available, I'll run the code review directly using sub-agents per the configured review profiles. Let me review the changes I just made to proxy.zig.
 ```
 
-# Auto Continue (DONE)
+# Auto Continue (DONE | )
 
 When --autocontinue is enabled, after the model stops (any stop_reason except
 error/aborted/refusal) without calling finish_task, inject a user message:
@@ -173,32 +173,6 @@ Implementation:
   fires after tool-call turns too, checks for `finish_task` tool_call
 - Wired in print, interactive, proxy, and rpc modes
 - Caps at 2 nudges per session
-
-
-# Grep Tool multi pattern support (Done)
-
-Now supports `"pattern": "foo"` (string) or `"pattern": ["foo", "bar"]` (array, OR semantics).
-
-Changes:
-- `parameters_json` uses `oneOf` to accept string or array of strings
-- `extractPatterns()` helper (mirrors `find.zig`)
-- `Matcher` now holds a slice of patterns (regex or literal) with OR matching
-- `compileMultiRegex()` / `compileMultiLiteral()` helpers
-- `deinit()` properly frees the slice and all regexes
-- Test helpers updated for new `Matcher` struct layout
-
-```
-grep error
-path	["/Users/frankittermann/github/franky/src/coding/modes/print.zig","/Users/frankittermann/github/franky/src/coding/modes/proxy.zig"]
-pattern	["emitSessionSummary","fn slashHandler|POST /command|/command|slash_mod"]
-[invalid_args] pattern must be a string
-```
-```
-grep error
-path	["/Users/frankittermann/github/franky/src/coding/modes/proxy.zig","/Users/frankittermann/github/franky/src/coding/slash.zig"]
-pattern	["commandHandler|POST.*command|/command","pub fn|pub const"]
-[invalid_args] pattern must be a string
-```
 
 # SubAgent Panel empty
 

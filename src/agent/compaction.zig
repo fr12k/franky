@@ -73,7 +73,7 @@ pub fn compactConversation(
         }
         try out_dup.appendSlice(allocator, messages[0..0]); // no-op; kept for clarity
         for (messages) |msg| {
-            try out_dup.append(allocator, try dupeMessage(allocator, msg));
+            try out_dup.append(allocator, try msg.dupe(allocator));
         }
         return out_dup.toOwnedSlice(allocator);
     }
@@ -171,35 +171,9 @@ pub fn compactConversation(
         .timestamp = ai.stream.nowMillis(),
     });
     for (messages[compact_end..]) |msg| {
-        try out.append(allocator, try dupeMessage(allocator, msg));
+        try out.append(allocator, try msg.dupe(allocator));
     }
     return out.toOwnedSlice(allocator);
-}
-
-/// Deep-copy an `AgentMessage` onto `allocator`. Used by
-/// `compactConversation` to duplicate the protected tail of the
-/// transcript so the returned slice is independent of the input.
-fn dupeMessage(allocator: std.mem.Allocator, msg: at.AgentMessage) !at.AgentMessage {
-    const content = try allocator.alloc(ai.types.ContentBlock, msg.content.len);
-    for (msg.content, 0..) |cb, i| {
-        content[i] = try cb.dupe(allocator);
-    }
-    var out: at.AgentMessage = .{
-        .role = msg.role,
-        .content = content,
-        .timestamp = msg.timestamp,
-    };
-    // Copy the optional string fields. Each `dupe` failure must
-    // free the partial copy before propagating.
-    errdefer out.deinit(allocator);
-    if (msg.error_message) |s| out.error_message = try allocator.dupe(u8, s);
-    if (msg.provider) |s| out.provider = try allocator.dupe(u8, s);
-    if (msg.model) |s| out.model = try allocator.dupe(u8, s);
-    if (msg.api) |s| out.api = try allocator.dupe(u8, s);
-    if (msg.tool_call_id) |s| out.tool_call_id = try allocator.dupe(u8, s);
-    if (msg.custom_role) |s| out.custom_role = try allocator.dupe(u8, s);
-    if (msg.meta_json) |s| out.meta_json = try allocator.dupe(u8, s);
-    return out;
 }
 
 test "compactConversation: too-small input returns a dupe" {

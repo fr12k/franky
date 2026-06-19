@@ -887,10 +887,7 @@ test "run: proceed=false when the span is too short, no mutation" {
     try testing.expectEqual(orig_len, transcript.messages.items.len);
 }
 
-fn fauxStreamShim(ctx: registry_mod.StreamCtx) anyerror!void {
-    const fp: *faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
-    try fp.runSync(ctx.io, ctx.context, ctx.out);
-}
+const fauxStreamShim = faux.FauxProvider.shim;
 
 // ─── v1.6.1 — coverage gap fills ─────────────────────────────────
 
