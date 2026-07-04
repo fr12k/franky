@@ -336,6 +336,8 @@ const Session = struct {
     /// init; 0 disables offloading.
     max_full_tool_results: u32 = 0,
 
+    /// Token display mode for the web UI status line.
+
     // ── v1.7.0 — session persistence on disk ──────────────────
     //
     // When `parent_dir` is non-null we mirror what print mode's
@@ -2619,8 +2621,9 @@ fn respondRole(
     sse_mod.respondJson(stream, io, 200, body);
 }
 
-/// `GET /usage` — per-tool call counters and guardrail firings.
-/// Returns JSON like `{"guardrails":2,"tools":{"bash":4,"read":5,"edit":6}}`.
+/// `GET /usage` — per-tool call counters, guardrail firings, and
+/// cumulative token sums across the session transcript.
+/// Returns JSON like `{"guardrails":2,"tools":{"bash":4,"read":5,"edit":6},"inputTokens":1234,"outputTokens":567}`.
 fn respondUsage(
     session: *Session,
     stream: *std.Io.net.Stream,
@@ -2628,6 +2631,20 @@ fn respondUsage(
     allocator: std.mem.Allocator,
 ) void {
     const gcount = session.guardrail_state.guardrail_fire_count;
+    // Compute cumulative token sums across all messages.
+    // NOTE: API `input_tokens`/`prompt_tokens` is the total context for
+    // that turn (includes all previous messages), so summing across
+    // messages would double-count. We take the last message's input.
+    // API `output_tokens`/`completion_tokens` is per-turn, so summing
+    // across messages gives the correct cumulative output.
+    var cum_input: u64 = 0;
+    var cum_output: u64 = 0;
+    for (session.transcript.messages.items) |m| {
+        if (m.usage) |u| {
+            cum_input = u.input;  // last wins — API reports total context
+            cum_output += u.output;
+        }
+    }
     // Build the tools JSON fragment via simple string concatenation
     // with bufPrint for the numeric values, matching proxy.zig patterns.
     var body = std.ArrayList(u8).empty;
@@ -2679,6 +2696,26 @@ fn respondUsage(
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
+    // Append cumulative token sums.
+    {
+        var num: [32]u8 = undefined;
+        body.appendSlice(allocator, ",\"inputTokens\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cum_input}) catch unreachable) catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        body.appendSlice(allocator, ",\"outputTokens\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cum_output}) catch unreachable) catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+    }
     body.append(allocator, '}') catch {
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;

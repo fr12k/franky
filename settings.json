@@ -7,7 +7,7 @@
         "maxFullToolResults": 0
     },
     "review": {
-        "profiles": ["ollama-deepseek-flash", "ollama-kimi-k", "ollama-deepseek-pro", "ollama-gemma4-cloud"],
+        "profiles": ["ollama-deepseek-flash", "ollama-kimi-k", "ollama-deepseek-pro", "ollama-gemma4-cloud", "ollama-minimax-m3", "ollama-glm-5.2"],
         "min_models": 2,
         "max_models": 4,
         "timeout_ms": 180000
@@ -179,6 +179,21 @@
             "provider": "gateway",
             "base-url": "https://ollama.com/v1/chat/completions",
             "model": "deepseek-v4-flash:cloud",
+            "api-key-env": "OLLAMA_API_KEY",
+            "role": "full",
+            "ask-tools": "all",
+            "prompts": true,
+            "log-level": "trace",
+            "http-trace-dir": "${HOME}/.franky/log-trace",
+            "thinking": "xhigh",
+            "env": {
+                "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
+            }
+        },
+        "ollama-minimax-m3": {
+            "provider": "gateway",
+            "base-url": "https://ollama.com/v1/chat/completions",
+            "model": "minimax-m3:cloud",
             "api-key-env": "OLLAMA_API_KEY",
             "role": "full",
             "ask-tools": "all",

@@ -2799,25 +2799,28 @@ function highlightCodeBlocks(container) {
                 row.innerHTML = '<span class="st-label">Guards</span><span class="st-value">' + guardrails + '</span>';
                 body.appendChild(row);
             }
-        }
 
-        if (cachedTranscriptUsage) {
-            const u = cachedTranscriptUsage;
-            const sep = document.createElement('span');
-            sep.className = 'st-popover-heading';
-            sep.style.marginTop = '6px';
-            sep.textContent = 'Tokens';
-            body.appendChild(sep);
+            // vN — cumulative token sums from /usage endpoint.
+            const u = cachedUsageData;
+            const cumIn = u.inputTokens || 0;
+            const cumOut = u.outputTokens || 0;
+            if (cumIn > 0 || cumOut > 0) {
+                const sep = document.createElement('span');
+                sep.className = 'st-popover-heading';
+                sep.style.marginTop = '6px';
+                sep.textContent = 'Tokens (cumulative)';
+                body.appendChild(sep);
 
-            const inRow = document.createElement('div');
-            inRow.className = 'st-popover-row';
-            inRow.innerHTML = '<span class="st-label">Input</span><span class="st-value">' + formatTokenCount(u.input || 0) + '</span>';
-            body.appendChild(inRow);
+                const inRow = document.createElement('div');
+                inRow.className = 'st-popover-row';
+                inRow.innerHTML = '<span class="st-label">Input</span><span class="st-value">' + formatTokenCount(cumIn) + '</span>';
+                body.appendChild(inRow);
 
-            const outRow = document.createElement('div');
-            outRow.className = 'st-popover-row';
-            outRow.innerHTML = '<span class="st-label">Output</span><span class="st-value">' + formatTokenCount(u.output || 0) + '</span>';
-            body.appendChild(outRow);
+                const outRow = document.createElement('div');
+                outRow.className = 'st-popover-row';
+                outRow.innerHTML = '<span class="st-label">Output</span><span class="st-value">' + formatTokenCount(cumOut) + '</span>';
+                body.appendChild(outRow);
+            }
         }
 
         if (!cachedUsageData && !cachedTranscriptUsage) {
@@ -2863,22 +2866,10 @@ function highlightCodeBlocks(container) {
                     if (udata.guardrails && udata.guardrails > 0) {
                         parts.push('guards: ' + udata.guardrails);
                     }
-                }
-            }
-        } catch (_) {}
-
-        try {
-            const r = await fetch('/transcript');
-            if (r.ok) {
-                const data = await r.json();
-                const msgs = (data && Array.isArray(data.messages)) ? data.messages : [];
-                for (let i = msgs.length - 1; i >= 0; i--) {
-                    if (msgs[i].role === 'assistant' && msgs[i].usage) {
-                        const u = msgs[i].usage;
-                        cachedTranscriptUsage = u;
-                        parts.push('in ' + formatTokenCount(u.input || 0) + ' / out ' + formatTokenCount(u.output || 0));
-                        break;
-                    }
+                    // vN — cumulative token sums from the server.
+                    const cumIn = udata.inputTokens || 0;
+                    const cumOut = udata.outputTokens || 0;
+                    parts.push('in ' + formatTokenCount(cumIn) + ' / out ' + formatTokenCount(cumOut));
                 }
             }
         } catch (_) {}
