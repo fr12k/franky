@@ -11,7 +11,7 @@ pub fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: [
         '\n' => try buf.appendSlice(allocator, "\\n"),
         '\r' => try buf.appendSlice(allocator, "\\r"),
         '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
+        0...0x07, 0x08, 0x0b, 0x0c, 0x0e...0x1f => {
             var tmp: [8]u8 = undefined;
             const written = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
             try buf.appendSlice(allocator, written);
