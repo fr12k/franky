@@ -24,16 +24,13 @@ pub const CcrSessionStore = struct {
     max_entries: usize,
     /// LRU tracking: ordered list of keys, most-recently-used at the end.
     lru_keys: std.ArrayList([]const u8),
-    /// Quick lookup: key -> index in lru_keys.
-    lru_index: std.StringHashMap(usize),
 
     pub fn init(allocator: std.mem.Allocator) CcrSessionStore {
         return .{
             .allocator = allocator,
             .map = std.StringHashMap([]const u8).init(allocator),
             .max_entries = default_max_entries,
-            .lru_keys = std.ArrayList([]const u8).init(allocator),
-            .lru_index = std.StringHashMap(usize).init(allocator),
+            .lru_keys = .empty,
         };
     }
 
@@ -45,11 +42,11 @@ pub const CcrSessionStore = struct {
         }
         self.map.deinit();
         for (self.lru_keys.items) |k| self.allocator.free(k);
-        self.lru_keys.deinit();
-        self.lru_index.deinit();
+        self.lru_keys.deinit(self.allocator);
     }
 
     /// Store original content and return a hash key.
+    /// The returned key is owned by the store and valid until the entry is evicted.
     /// Uses SHA-256 truncated to 12 hex characters for the key.
     pub fn store(self: *CcrSessionStore, original: []const u8) ![]const u8 {
         const key = try computeKey(self.allocator, original);
@@ -58,42 +55,34 @@ pub const CcrSessionStore = struct {
         const val = try self.allocator.dupe(u8, original);
         errdefer self.allocator.free(val);
 
-        // Check if key already exists
-        if (self.map.get(key)) |existing| {
-            // Update value
-            self.allocator.free(existing);
-            try self.map.put(key, val);
-        } else {
-            try self.map.put(key, val);
+        // Remove old value if key already exists
+        if (self.map.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value);
         }
 
-        // Update LRU tracking
-        if (self.lru_index.get(key)) |idx| {
-            // Already exists — move to end (most recently used)
-            _ = self.lru_keys.orderedRemove(idx);
-            const duped_key = try self.allocator.dupe(u8, key);
-            try self.lru_keys.append(duped_key);
-            // Update indices for shifted entries
-            var i: usize = idx;
-            while (i < self.lru_keys.items.len) : (i += 1) {
-                try self.lru_index.put(self.lru_keys.items[i], i);
-            }
-        } else {
-            // New entry
-            const duped_key = try self.allocator.dupe(u8, key);
-            try self.lru_keys.append(duped_key);
-            try self.lru_index.put(duped_key, self.lru_keys.items.len - 1);
+        try self.map.put(key, val);
 
-            // Evict if over cap
-            if (self.lru_keys.items.len > self.max_entries) {
-                const oldest_key = self.lru_keys.orderedRemove(0);
-                if (self.map.get(oldest_key)) |old_val| {
-                    self.allocator.free(old_val);
-                }
-                _ = self.map.remove(oldest_key);
-                _ = self.lru_index.remove(oldest_key);
-                self.allocator.free(oldest_key);
+        // Update LRU: remove old position if exists, then append
+        for (self.lru_keys.items, 0..) |lk, i| {
+            if (std.mem.eql(u8, lk, key)) {
+                const removed = self.lru_keys.orderedRemove(i);
+                self.allocator.free(removed);
+                break;
             }
+        }
+
+        const duped_key = try self.allocator.dupe(u8, key);
+        try self.lru_keys.append(self.allocator, duped_key);
+
+        // Evict if over cap
+        if (self.lru_keys.items.len > self.max_entries) {
+            const oldest_key = self.lru_keys.orderedRemove(0);
+            if (self.map.fetchRemove(oldest_key)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
+            self.allocator.free(oldest_key);
         }
 
         return key;
@@ -104,19 +93,19 @@ pub const CcrSessionStore = struct {
         const value = self.map.get(key) orelse return null;
 
         // Update LRU: move to end
-        if (self.lru_index.get(key)) |idx| {
-            _ = self.lru_keys.orderedRemove(idx);
-            const duped_key = self.allocator.dupe(u8, key) catch return value;
-            self.lru_keys.append(duped_key) catch {
-                self.allocator.free(duped_key);
-                return value;
-            };
-            self.lru_index.put(duped_key, self.lru_keys.items.len - 1) catch {};
-            var i: usize = idx;
-            while (i < self.lru_keys.items.len - 1) : (i += 1) {
-                self.lru_index.put(self.lru_keys.items[i], i) catch {};
+        for (self.lru_keys.items, 0..) |lk, i| {
+            if (std.mem.eql(u8, lk, key)) {
+                const removed = self.lru_keys.orderedRemove(i);
+                self.allocator.free(removed);
+                break;
             }
         }
+
+        const duped_key = self.allocator.dupe(u8, key) catch return value;
+        self.lru_keys.append(self.allocator, duped_key) catch {
+            self.allocator.free(duped_key);
+            return value;
+        };
 
         return value;
     }

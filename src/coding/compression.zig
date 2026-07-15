@@ -13,9 +13,9 @@
 
 const std = @import("std");
 const zompress = @import("zompress");
-const at = @import("../../agent/types.zig");
-const ai = @import("../../ai/types.zig");
-const ccr_store = @import("../session/ccr_store.zig");
+const at = @import("../agent/types.zig");
+const ai = @import("../ai/types.zig");
+const ccr_store = @import("./session/ccr_store.zig");
 
 pub const CcrSessionStore = ccr_store.CcrSessionStore;
 
@@ -73,7 +73,7 @@ pub fn compressToolResult(
     };
 
     // Compress each text content block
-    var new_content: std.ArrayList(ai.ContentBlock) = std.ArrayList(ai.ContentBlock).init(allocator);
+    var new_content: std.ArrayList(ai.ContentBlock) = .empty;
     errdefer {
         for (new_content.items) |*cb| cb.deinit(allocator);
         new_content.deinit(allocator);
@@ -86,7 +86,7 @@ pub fn compressToolResult(
                 if (input.len < config.min_bytes_to_compress) {
                     // Too small to compress — pass through
                     const duped = block.dupe(allocator) catch continue;
-                    new_content.append(duped) catch continue;
+                    new_content.append(allocator, duped) catch continue;
                     continue;
                 }
 
@@ -95,7 +95,7 @@ pub fn compressToolResult(
                     // Compression failed — log warning and pass through
                     std.log.warn("zompress compression failed: {}", .{err});
                     const duped = block.dupe(allocator) catch continue;
-                    new_content.append(duped) catch continue;
+                    new_content.append(allocator, duped) catch continue;
                     continue;
                 };
 
@@ -103,12 +103,11 @@ pub fn compressToolResult(
                 var ccr_marker: ?[]const u8 = null;
                 if (config.ccr_enabled) {
                     if (maybe_ccr_store) |store| {
-                        const key = store.store(input) catch {
-                            ccr_marker = null;
-                        };
-                        if (key) |k| {
+                        if (store.store(input)) |k| {
                             const original_lines = countLines(input);
                             ccr_marker = CcrSessionStore.formatMarker(k, original_lines, allocator) catch null;
+                        } else |_| {
+                            ccr_marker = null;
                         }
                     }
                 }
@@ -119,7 +118,7 @@ pub fn compressToolResult(
                     // Append marker to compressed output
                     const combined = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ compressed_text, marker }) catch {
                         // If formatting fails, just use compressed text
-                        new_content.append(.{ .text = .{
+                        new_content.append(allocator, .{ .text = .{
                             .text = compressed_text,
                             .text_signature = null,
                         } }) catch {
@@ -131,7 +130,7 @@ pub fn compressToolResult(
                     compressed_text = combined;
                 }
 
-                new_content.append(.{ .text = .{
+                new_content.append(allocator, .{ .text = .{
                     .text = compressed_text,
                     .text_signature = null,
                 } }) catch {
@@ -146,7 +145,7 @@ pub fn compressToolResult(
             else => {
                 // Non-text blocks (images, etc.) — pass through unchanged
                 const duped = block.dupe(allocator) catch continue;
-                new_content.append(duped) catch continue;
+                new_content.append(allocator, duped) catch continue;
             },
         }
     }
@@ -182,10 +181,10 @@ fn countLines(s: []const u8) usize {
 test "compressToolResult passes through small content" {
     const allocator = std.testing.allocator;
 
-    const result = at.ToolResult{
-        .content = &.{
-            .{ .text = .{ .text = "small", .text_signature = null } },
-        },
+    const content = try allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "small"), .text_signature = null } };
+    var result = at.ToolResult{
+        .content = content,
         .is_error = false,
         .tool_code = null,
         .terminate = false,
@@ -197,7 +196,7 @@ test "compressToolResult passes through small content" {
         .min_bytes_to_compress = 100, // larger than "small"
     };
 
-    const compressed = compressToolResult(allocator, &result, config, null);
+    var compressed = compressToolResult(allocator, &result, config, null);
     defer compressed.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), compressed.content.len);
@@ -207,10 +206,10 @@ test "compressToolResult passes through small content" {
 test "compressToolResult passes through non-text blocks" {
     const allocator = std.testing.allocator;
 
-    const result = at.ToolResult{
-        .content = &.{
-            .{ .image = .{ .data = &.{}, .media_type = "image/png" } },
-        },
+    const content = try allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{ .image = .{ .data = try allocator.dupe(u8, ""), .mime_type = try allocator.dupe(u8, "image/png") } };
+    var result = at.ToolResult{
+        .content = content,
         .is_error = false,
         .tool_code = null,
         .terminate = false,
@@ -222,7 +221,7 @@ test "compressToolResult passes through non-text blocks" {
         .min_bytes_to_compress = 1,
     };
 
-    const compressed = compressToolResult(allocator, &result, config, null);
+    var compressed = compressToolResult(allocator, &result, config, null);
     defer compressed.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), compressed.content.len);
@@ -232,8 +231,9 @@ test "compressToolResult passes through non-text blocks" {
 test "compressToolResult is infallible on empty input" {
     const allocator = std.testing.allocator;
 
-    const result = at.ToolResult{
-        .content = &.{},
+    const content = try allocator.alloc(ai.ContentBlock, 0);
+    var result = at.ToolResult{
+        .content = content,
         .is_error = false,
         .tool_code = null,
         .terminate = false,
@@ -242,7 +242,7 @@ test "compressToolResult is infallible on empty input" {
 
     const config = CompressionConfig{ .enabled = true };
 
-    const compressed = compressToolResult(allocator, &result, config, null);
+    var compressed = compressToolResult(allocator, &result, config, null);
     defer compressed.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), compressed.content.len);

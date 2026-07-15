@@ -33,6 +33,7 @@ pub const AgentMessage = at.AgentMessage;
 const guardrails_mod = @import("guardrails/guardrails.zig");
 const truncate = @import("../coding/tools/truncate.zig");
 const tool_common = @import("../coding/tools/common.zig");
+const compression_mod = @import("../coding/compression.zig");
 
 pub const ConvertToLlmFn = *const fn (
     allocator: std.mem.Allocator,
@@ -325,6 +326,13 @@ pub const Config = struct {
     /// nowhere). Mode drivers populate this with
     /// `<session_dir>/offloaded-tool-results` or similar.
     offload_dir: ?[]const u8 = null,
+    /// v3.0 — optional compression config. When non-null, tool results
+    /// are compressed through zompress before entering the transcript.
+    /// Embedded by value to avoid lifetime issues.
+    compression: ?compression_mod.CompressionConfig = null,
+    /// CCR store for reversible compression. Must outlive the loop.
+    /// Passed in from the session — never created per turn.
+    ccr_store: ?*compression_mod.CcrSessionStore = null,
 };
 
 pub const Transcript = at.Transcript;
@@ -1046,6 +1054,15 @@ fn runTurn(
 
         if (config.guardrails) |gr| gr.afterToolCall(&tool_def, tc.id, &call_res);
 
+        // v3.0 — compress tool result before emitting to transcript
+        if (config.compression) |cc| {
+            if (cc.enabled and call_res.content.len > 0) {
+                var old = call_res;
+                call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store);
+                old.deinit(allocator);
+            }
+        }
+
         try pushToolEnd(out, io, allocator, tc.id, tool_def, call_res);
         try results.append(allocator, .{
             .call_id = tc.id,
@@ -1218,6 +1235,16 @@ fn runToolsParallel(
                 hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
             }
             if (config.guardrails) |gr| gr.afterToolCall(&w.tool_def, w.tc.id, &call_res);
+
+            // v3.0 — compress tool result before emitting to transcript
+            if (config.compression) |cc| {
+                if (cc.enabled and call_res.content.len > 0) {
+                    var old = call_res;
+                    call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store);
+                    old.deinit(allocator);
+                }
+            }
+
             try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, call_res);
             slot_results[i] = call_res;
             emitted[i] = true;
