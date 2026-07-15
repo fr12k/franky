@@ -30,6 +30,7 @@ const at = agent.types;
 const cli_mod = franky.coding.cli;
 const session_mod = @import("mod.zig");
 const branching_mod = @import("branching.zig");
+const ccr_store_mod = @import("ccr_store.zig");
 
 // ─── SessionState ──────────────────────────────────────────────────
 
@@ -46,6 +47,8 @@ pub const SessionState = struct {
     /// otherwise. Saved alongside `session.json`/`transcript.json`
     /// in `persist`.
     tree: branching_mod.Tree,
+    /// v3.0 — session-scoped CCR store for reversible compression.
+    ccr_store: ccr_store_mod.CcrSessionStore,
 
     /// Initialise a `SessionState` from a parsed CLI config.
     ///
@@ -121,6 +124,7 @@ pub const SessionState = struct {
                 .transcript = transcript,
                 .created_at_ms = created_ms,
                 .tree = tree,
+                .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator),
             };
         }
 
@@ -148,6 +152,7 @@ pub const SessionState = struct {
             .transcript = agent.loop.Transcript.init(allocator),
             .created_at_ms = ai.stream.nowMillis(),
             .tree = tree,
+            .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator),
         };
     }
 
@@ -155,6 +160,7 @@ pub const SessionState = struct {
         _ = allocator;
         self.transcript.deinit();
         self.tree.deinit();
+        self.ccr_store.deinit();
         self.arena.deinit();
     }
 

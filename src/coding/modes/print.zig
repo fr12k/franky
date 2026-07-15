@@ -351,6 +351,8 @@ fn runPrint(
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
         .text_tool_call_fallback = cfg.text_tool_call_fallback,
         .reducer_dump_dir = events_dir_path,
+        .compression = if (resolved.compression.enabled) resolved.compression else null,
+        .ccr_store = &session_state.ccr_store,
         .stream_options = .{
             .api_key = resolved.api_key,
             .auth_token = resolved.auth_token,
