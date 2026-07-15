@@ -73,6 +73,7 @@ const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const review_mod = @import("../review.zig");
 const sse_mod = @import("../sse.zig");
+const compression_mod = franky.coding.compression;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -364,6 +365,8 @@ const Session = struct {
     bash_state: tools_mod.bash.SessionBashState,
     web_search_ctx: tools_mod.web_search.WebSearchCtx = .{},
     guardrail_state: agent.guardrails.GuardrailState = undefined,
+    /// v3.0 — session-scoped CCR store for reversible compression.
+    ccr_store: compression_mod.CcrSessionStore = undefined,
 
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
@@ -428,6 +431,7 @@ const Session = struct {
             self.tool_usage.deinit();
         }
         self.guardrail_state.deinit();
+        self.ccr_store.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -710,6 +714,7 @@ fn initSession(
         .prompts_enabled = prompts_enabled,
         .max_full_tool_results = max_full_tool_results,
         .tool_usage = std.StringHashMap(u32).init(allocator),
+        .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(
@@ -844,7 +849,7 @@ fn initSession(
             // §6.7 — enable full text/thinking deltas for the panel.
             .verbose_progress = true,
         };
-        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + @as(u32, @intCast(ext_tools.len)) + 3);
+        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + @as(u32, @intCast(ext_tools.len)) + 4);
         @memcpy(final_tools[0..session.tools.len], session.tools);
         if (ext_tools.len > 0) {
             @memcpy(final_tools[session.tools.len..][0..ext_tools.len], ext_tools);
@@ -853,6 +858,8 @@ fn initSession(
         final_tools[off] = tools_mod.subagent.toolWithCtx(subagent_ctx);
         final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
         final_tools[off + 2] = session.guardrail_state.finishTaskTool();
+        // v3.0 — ccr_retrieve tool for reversible compression
+        final_tools[off + 3] = tools_mod.ccr_retrieve.toolWithCtx(@ptrCast(&session.ccr_store));
         session.tools = final_tools;
     }
 
@@ -2230,39 +2237,56 @@ fn runOneTurnInternal(
         .allocator = allocator,
         .io = io,
         .transcript = &session.transcript,
-        .config = .{
-            .model = .{
-                .id = session.provider.model_id,
-                .provider = session.provider.provider_name,
-                .api = session.provider.api_tag,
-                .context_window = session.provider.context_window,
-                .max_output = session.provider.max_output,
-                .capabilities = session.provider.capabilities,
-            },
-            .system_prompt = session.system_prompt,
-            .tools = session.tools,
-            .registry = &session.registry,
-            .cancel = &session.cancel,
-            .guardrails = &session.guardrail_state,
-            .hook_userdata = @ptrCast(&session.session_gates),
-            .role_denied = permissions_mod.SessionGates.roleDenied,
-            .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
-            .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
-            .nudge_on_autocontinue = session.cfg.autocontinue,
-            .max_full_tool_results = session.max_full_tool_results,
-            .offload_dir = offload_dir,
-            .stop_requested_fn = proxyStopRequestedFn,
-            .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
-            .stream_options = .{
-                .api_key = session.provider.api_key,
-                .auth_token = session.provider.auth_token,
-                .base_url = session.provider.base_url,
-                .environ_map = session.environ_map,
-                .thinking = session.cfg.thinking,
-                .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
-                .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
-                .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
-            },
+        .config = blk: {
+            var lc: agent.loop.Config = .{
+                .model = .{
+                    .id = session.provider.model_id,
+                    .provider = session.provider.provider_name,
+                    .api = session.provider.api_tag,
+                    .context_window = session.provider.context_window,
+                    .max_output = session.provider.max_output,
+                    .capabilities = session.provider.capabilities,
+                },
+                .system_prompt = session.system_prompt,
+                .tools = session.tools,
+                .registry = &session.registry,
+                .cancel = &session.cancel,
+                .guardrails = &session.guardrail_state,
+                .hook_userdata = @ptrCast(&session.session_gates),
+                .role_denied = permissions_mod.SessionGates.roleDenied,
+                .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
+                .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+                .nudge_on_autocontinue = session.cfg.autocontinue,
+                .max_full_tool_results = session.max_full_tool_results,
+                .offload_dir = offload_dir,
+                .stop_requested_fn = proxyStopRequestedFn,
+                .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
+                .stream_options = .{
+                    .api_key = session.provider.api_key,
+                    .auth_token = session.provider.auth_token,
+                    .base_url = session.provider.base_url,
+                    .environ_map = session.environ_map,
+                    .thinking = session.cfg.thinking,
+                    .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+                    .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
+                    .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
+                },
+            };
+            // v3.0 — wire compression into the agent loop
+            if (session.cfg.compress) {
+                lc.compression = compression_mod.CompressionConfig{
+                    .enabled = true,
+                    .min_bytes_to_compress = session.cfg.compress_min_bytes,
+                    .smart_crusher_enabled = session.cfg.compress_json,
+                    .log_compressor_enabled = session.cfg.compress_logs,
+                    .search_compressor_enabled = session.cfg.compress_search,
+                    .diff_compressor_enabled = session.cfg.compress_diff,
+                    .code_compressor_enabled = session.cfg.compress_code,
+                    .ccr_enabled = session.cfg.compress_ccr,
+                };
+                lc.ccr_store = &session.ccr_store;
+            }
+            break :blk lc;
         },
         .ch = &ch,
     };
@@ -3568,6 +3592,7 @@ fn initSessionForTestWithDir(
         .created_at_ms = ai.stream.nowMillis(),
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .tool_usage = std.StringHashMap(u32).init(allocator),
+        .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(allocator, .{ .workspace_dir = "." }, io);

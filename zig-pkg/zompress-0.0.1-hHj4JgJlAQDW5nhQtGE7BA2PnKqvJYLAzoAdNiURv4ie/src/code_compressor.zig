@@ -216,7 +216,8 @@ test "compile and parse zig source with arena" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const source = try a.dupeZ(u8, "const std = @import(\"std\");\n\npub fn main() !void {\n    const x: i32 = 42;\n}\n");
+    const source = try a.allocSentinel(u8, "const std = @import(\"std\");\n\npub fn main() !void {\n    const x: i32 = 42;\n}".len, 0);
+    @memcpy(source[0.."const std = @import(\"std\");\n\npub fn main() !void {\n    const x: i32 = 42;\n}".len], "const std = @import(\"std\");\n\npub fn main() !void {\n    const x: i32 = 42;\n}");
     var tree = try Ast.parse(a, source, .zig);
     defer tree.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
@@ -226,8 +227,26 @@ test "compress function body removes lines" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const source = try a.dupeZ(u8,
-        \\pub fn process() !void {
+    const source = try a.allocSentinel(u8, \\pub fn process() !void {
+        \\    var x: i32 = 0;
+        \\    x += 1;
+        \\    x += 2;
+        \\    x += 3;
+        \\    x += 4;
+        \\    x += 5;
+        \\    return x;
+        \\}
+    .len, 0);
+    @memcpy(source[0..\\pub fn process() !void {
+        \\    var x: i32 = 0;
+        \\    x += 1;
+        \\    x += 2;
+        \\    x += 3;
+        \\    x += 4;
+        \\    x += 5;
+        \\    return x;
+        \\}
+    .len], \\pub fn process() !void {
         \\    var x: i32 = 0;
         \\    x += 1;
         \\    x += 2;
@@ -250,8 +269,16 @@ test "compress struct declaration preserved fully" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const source = try a.dupeZ(u8,
-        \\pub const Config = struct {
+    const source = try a.allocSentinel(u8, \\pub const Config = struct {
+        \\    timeout: u64 = 1000,
+        \\    retries: u8 = 3,
+        \\};
+    .len, 0);
+    @memcpy(source[0..\\pub const Config = struct {
+        \\    timeout: u64 = 1000,
+        \\    retries: u8 = 3,
+        \\};
+    .len], \\pub const Config = struct {
         \\    timeout: u64 = 1000,
         \\    retries: u8 = 3,
         \\};
@@ -268,7 +295,8 @@ test "compress invalid zig passthrough" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const source = try a.dupeZ(u8, "not valid zig @@@\n");
+    const source = try a.allocSentinel(u8, "not valid zig @@@\n".len, 0);
+    @memcpy(source[0.."not valid zig @@@\n".len], "not valid zig @@@\n");
     const config = CompressConfig{};
     const result = try compress(std.testing.allocator, source, config);
     defer std.testing.allocator.free(result.compressed);

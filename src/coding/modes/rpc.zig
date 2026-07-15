@@ -31,6 +31,7 @@ const print_mode = @import("print.zig");
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
+const compression_mod = franky.coding.compression;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -131,12 +132,15 @@ const Session = struct {
     /// §6.10 — harness-enforced guardrails (stuck detection, compilation guard,
     /// finish_task). Wired at session init; passed to loop.Config in runPrompt.
     guardrail_state: agent.guardrails.GuardrailState = undefined,
+    /// v3.0 — session-scoped CCR store for reversible compression.
+    ccr_store: compression_mod.CcrSessionStore = undefined,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
         self.bash_state.deinit();
         self.guardrail_state.deinit();
+        self.ccr_store.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -244,6 +248,7 @@ fn initSession(
         .environ_map = environ_map,
         .prompts_enabled = prompts_enabled,
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
+        .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.session_gates = .{
@@ -386,10 +391,12 @@ fn initSession(
         .progress_fn = subagentProgressForward,
         .progress_userdata = session,
     };
-    const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 2);
+    const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 3);
     @memcpy(final_tools[0..session.tools.len], session.tools);
     final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
     final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
+    // v3.0 — ccr_retrieve tool for reversible compression
+    final_tools[session.tools.len + 2] = tools_mod.ccr_retrieve.toolWithCtx(@ptrCast(&session.ccr_store));
     session.tools = final_tools;
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
@@ -674,36 +681,53 @@ fn runPrompt(
         .allocator = allocator,
         .io = io,
         .transcript = &session.transcript,
-        .config = .{
-            .model = .{
-                .id = session.provider.model_id,
-                .provider = session.provider.provider_name,
-                .api = session.provider.api_tag,
-                .context_window = session.provider.context_window,
-                .max_output = session.provider.max_output,
-                .capabilities = session.provider.capabilities,
-            },
-            .system_prompt = session.system_prompt,
-            .tools = session.tools,
-            .registry = &session.registry,
-            .cancel = &session.cancel,
-            .hook_userdata = @ptrCast(&session.session_gates),
-            .guardrails = &session.guardrail_state,
-            .role_denied = permissions_mod.SessionGates.roleDenied,
-            .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
-            .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
-            .nudge_on_autocontinue = session.cfg.autocontinue,
-            .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
-            .stream_options = .{
-                .api_key = session.provider.api_key,
-                .auth_token = session.provider.auth_token,
-                .base_url = session.provider.base_url,
-                .environ_map = session.environ_map,
-                .thinking = session.cfg.thinking,
-                .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
-                .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
-                .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
-            },
+        .config = blk: {
+            var lc: agent.loop.Config = .{
+                .model = .{
+                    .id = session.provider.model_id,
+                    .provider = session.provider.provider_name,
+                    .api = session.provider.api_tag,
+                    .context_window = session.provider.context_window,
+                    .max_output = session.provider.max_output,
+                    .capabilities = session.provider.capabilities,
+                },
+                .system_prompt = session.system_prompt,
+                .tools = session.tools,
+                .registry = &session.registry,
+                .cancel = &session.cancel,
+                .hook_userdata = @ptrCast(&session.session_gates),
+                .guardrails = &session.guardrail_state,
+                .role_denied = permissions_mod.SessionGates.roleDenied,
+                .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
+                .text_tool_call_fallback = session.cfg.text_tool_call_fallback,
+                .nudge_on_autocontinue = session.cfg.autocontinue,
+                .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
+                .stream_options = .{
+                    .api_key = session.provider.api_key,
+                    .auth_token = session.provider.auth_token,
+                    .base_url = session.provider.base_url,
+                    .environ_map = session.environ_map,
+                    .thinking = session.cfg.thinking,
+                    .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
+                    .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
+                    .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
+                },
+            };
+            // v3.0 — wire compression into the agent loop
+            if (session.cfg.compress) {
+                lc.compression = compression_mod.CompressionConfig{
+                    .enabled = true,
+                    .min_bytes_to_compress = session.cfg.compress_min_bytes,
+                    .smart_crusher_enabled = session.cfg.compress_json,
+                    .log_compressor_enabled = session.cfg.compress_logs,
+                    .search_compressor_enabled = session.cfg.compress_search,
+                    .diff_compressor_enabled = session.cfg.compress_diff,
+                    .code_compressor_enabled = session.cfg.compress_code,
+                    .ccr_enabled = session.cfg.compress_ccr,
+                };
+                lc.ccr_store = &session.ccr_store;
+            }
+            break :blk lc;
         },
         .ch = &ch,
     };

@@ -43,6 +43,7 @@ const templates_mod = franky.coding.templates;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compaction_mod = franky.coding.compaction;
+const compression_mod = franky.coding.compression;
 const branching_mod = franky.coding.branching;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
@@ -1148,6 +1149,20 @@ fn runOneTurn(
             };
             if (print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map)) |v| lc.max_turns = v;
             lc.nudge_on_autocontinue = session.cfg.autocontinue;
+            // v3.0 — wire compression into the agent loop
+            if (session.cfg.compress) {
+                lc.compression = compression_mod.CompressionConfig{
+                    .enabled = true,
+                    .min_bytes_to_compress = session.cfg.compress_min_bytes,
+                    .smart_crusher_enabled = session.cfg.compress_json,
+                    .log_compressor_enabled = session.cfg.compress_logs,
+                    .search_compressor_enabled = session.cfg.compress_search,
+                    .diff_compressor_enabled = session.cfg.compress_diff,
+                    .code_compressor_enabled = session.cfg.compress_code,
+                    .ccr_enabled = session.cfg.compress_ccr,
+                };
+                lc.ccr_store = &session.ccr_store;
+            }
             break :blk lc;
         },
         .ch = &ch,
@@ -1720,6 +1735,8 @@ const SessionBinding = struct {
     /// spawn-and-exit restart sequence.
     restart_requested: std.atomic.Value(bool) = .init(false),
     guardrail_state: agent.guardrails.GuardrailState = undefined,
+    /// v3.0 — session-scoped CCR store for reversible compression.
+    ccr_store: compression_mod.CcrSessionStore = undefined,
 
     /// Fills `binding` in place. Taking the destination pointer is
     /// required: the `FauxProvider`'s address gets registered with
@@ -1754,6 +1771,7 @@ const SessionBinding = struct {
             else
                 null,
             .startup_ms = ai.stream.nowMillis(),
+            .ccr_store = compression_mod.CcrSessionStore.init(allocator),
         };
         binding.read_ctx = .{
             .workspace = if (binding.workspace) |*ws| ws else null,
@@ -1957,11 +1975,13 @@ const SessionBinding = struct {
                 .permission_prompter_slot = null,
                 .parent_session_dir = null,
             };
-            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 3);
+            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 4);
             @memcpy(final_tools[0..binding.tools.len], binding.tools);
             final_tools[binding.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
             final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
             final_tools[binding.tools.len + 2] = binding.guardrail_state.finishTaskTool();
+            // v3.0 — ccr_retrieve tool for reversible compression
+            final_tools[binding.tools.len + 3] = tools_mod.ccr_retrieve.toolWithCtx(@ptrCast(&binding.ccr_store));
             binding.tools = final_tools;
         }
 
@@ -1977,6 +1997,7 @@ const SessionBinding = struct {
         self.permission_store.deinit();
         self.bash_state.deinit();
         self.guardrail_state.deinit();
+        self.ccr_store.deinit();
         self.arena.deinit();
     }
 
