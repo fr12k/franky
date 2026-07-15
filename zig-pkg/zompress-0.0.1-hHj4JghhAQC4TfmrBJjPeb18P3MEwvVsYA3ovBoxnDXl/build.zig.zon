@@ -1,0 +1,12 @@
+.{
+    .name = .zompress,
+    .version = "0.0.1",
+    .fingerprint = 0x2ac0f91926f87884,
+    .minimum_zig_version = "0.17.0-dev",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+    },
+}

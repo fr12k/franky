@@ -247,6 +247,23 @@ pub const Config = struct {
     /// nudges per session. Useful for running with no user in the loop.
     autocontinue: bool = false,
 
+    /// `--compress` — enable content-aware tool output compression.
+    compress: bool = false,
+    /// `--compress-min-bytes N` — minimum output size to trigger compression.
+    compress_min_bytes: usize = 1024,
+    /// `--compress-ccr` — enable Compress-Cache-Retrieve (default on).
+    compress_ccr: bool = true,
+    /// `--compress-json` — enable JSON array compression (default on).
+    compress_json: bool = true,
+    /// `--compress-logs` — enable log output compression (default on).
+    compress_logs: bool = true,
+    /// `--compress-search` — enable search result compression (default on).
+    compress_search: bool = true,
+    /// `--compress-diff` — enable diff compression (default on).
+    compress_diff: bool = true,
+    /// `--compress-code` — enable source code compression (default on).
+    compress_code: bool = true,
+
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
 
@@ -402,6 +419,58 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
         cfg.autocontinue = true;
         return true;
     }
+    if (std.mem.eql(u8, name, "--compress")) {
+        cfg.compress = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-ccr")) {
+        cfg.compress_ccr = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress-ccr")) {
+        cfg.compress_ccr = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-json")) {
+        cfg.compress_json = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress-json")) {
+        cfg.compress_json = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-logs")) {
+        cfg.compress_logs = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress-logs")) {
+        cfg.compress_logs = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-search")) {
+        cfg.compress_search = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress-search")) {
+        cfg.compress_search = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-diff")) {
+        cfg.compress_diff = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress-diff")) {
+        cfg.compress_diff = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-code")) {
+        cfg.compress_code = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress-code")) {
+        cfg.compress_code = false;
+        return true;
+    }
     return false;
 }
 
@@ -500,6 +569,9 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
     } else if (std.mem.eql(u8, name, "--max-turns")) {
         const v = try takeValue(argv, i, inline_value);
         cfg.max_turns = std.fmt.parseInt(u32, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--compress-min-bytes")) {
+        const v = try takeValue(argv, i, inline_value);
+        cfg.compress_min_bytes = std.fmt.parseInt(usize, v, 10) catch return error.UnknownMode;
     } else if (std.mem.eql(u8, name, "--allow-tools")) {
         cfg.allow_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--deny-tools")) {

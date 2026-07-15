@@ -33,6 +33,7 @@ const permissions_mod = franky.coding.permissions;
 const skills_mod = franky.coding.skills;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
+const compression_mod = franky.coding.compression;
 
 /// Error set for config resolution.
 pub const ResolveError = error{
@@ -128,6 +129,9 @@ pub const ResolvedConfig = struct {
 
     // ── Pre-rendered review config block ─────────────────────────
     review_config_block: ?[]const u8,
+
+    // ── Compression config ────────────────────────────────────────
+    compression: compression_mod.CompressionConfig,
 
     // ── Arena ────────────────────────────────────────────────────
     /// Everything that outlives `resolve()` is allocated on this arena.
@@ -1188,6 +1192,16 @@ pub fn resolve(
         .role_gate = role_gate,
         .active_role = active_role,
         .review_config_block = review_block,
+        .compression = .{
+            .enabled = cfg.compress,
+            .min_bytes_to_compress = cfg.compress_min_bytes,
+            .smart_crusher_enabled = cfg.compress_json,
+            .log_compressor_enabled = cfg.compress_logs,
+            .search_compressor_enabled = cfg.compress_search,
+            .diff_compressor_enabled = cfg.compress_diff,
+            .code_compressor_enabled = cfg.compress_code,
+            .ccr_enabled = cfg.compress_ccr,
+        },
         .arena = arena,
     };
 }
