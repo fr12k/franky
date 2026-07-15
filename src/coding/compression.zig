@@ -1,0 +1,249 @@
+//! Compression integration module.
+//!
+//! Wraps the zompress compression library and integrates it with franky's
+//! tool result pipeline. Provides:
+//!
+//! - `compressToolResult()` — compress a tool result's text content blocks
+//! - `CompressionConfig` — configuration struct with sensible defaults
+//! - `CcrSessionStore` — re-exported from session/ccr_store.zig
+//!
+//! The API is **infallible** — if zompress returns an error, the original
+//! content is passed through unchanged and a warning is logged. This ensures
+//! the agent loop never crashes due to compression failure.
+
+const std = @import("std");
+const zompress = @import("zompress");
+const at = @import("../../agent/types.zig");
+const ai = @import("../../ai/types.zig");
+const ccr_store = @import("../session/ccr_store.zig");
+
+pub const CcrSessionStore = ccr_store.CcrSessionStore;
+
+/// Compression configuration with sensible defaults.
+/// All per-compressor toggles default to `true` so that enabling
+/// compression activates all available compressors.
+pub const CompressionConfig = struct {
+    /// Master switch — compression is opt-in.
+    enabled: bool = false,
+    /// Skip outputs smaller than this (bytes). Avoids overhead on tiny results.
+    min_bytes_to_compress: usize = 1024,
+    /// Enable SmartCrusher for JSON arrays.
+    smart_crusher_enabled: bool = true,
+    /// Enable LogCompressor for build/test output.
+    log_compressor_enabled: bool = true,
+    /// Enable SearchCompressor for grep/ripgrep results.
+    search_compressor_enabled: bool = true,
+    /// Enable DiffCompressor for git diffs.
+    diff_compressor_enabled: bool = true,
+    /// Enable CodeCompressor for source code.
+    code_compressor_enabled: bool = true,
+    /// Enable Compress-Cache-Retrieve (stores originals for retrieval).
+    ccr_enabled: bool = true,
+    // Per-compressor overrides
+    max_items_after_crush: usize = 15,
+    log_max_errors: usize = 10,
+    search_max_matches_per_file: usize = 5,
+    diff_max_context_lines: usize = 2,
+};
+
+/// Compress a tool result's text content blocks.
+///
+/// Returns a NEW ToolResult with compressed text + CCR markers.
+/// The caller MUST free the original ToolResult after calling this.
+///
+/// Non-text content blocks (images, binary) are passed through unchanged.
+/// On compression failure, returns a passthrough copy (never throws).
+pub fn compressToolResult(
+    allocator: std.mem.Allocator,
+    result: *const at.ToolResult,
+    config: CompressionConfig,
+    maybe_ccr_store: ?*CcrSessionStore,
+) at.ToolResult {
+    // Build the zompress config from our CompressionConfig
+    const zompress_config = zompress.CompressConfig{
+        .smart_crusher_enabled = config.smart_crusher_enabled,
+        .log_compressor_enabled = config.log_compressor_enabled,
+        .search_compressor_enabled = config.search_compressor_enabled,
+        .diff_compressor_enabled = config.diff_compressor_enabled,
+        .ccr_enabled = config.ccr_enabled,
+        .max_items_after_crush = config.max_items_after_crush,
+        .log_max_errors = config.log_max_errors,
+        .search_max_matches_per_file = config.search_max_matches_per_file,
+        .diff_max_context_lines = config.diff_max_context_lines,
+    };
+
+    // Compress each text content block
+    var new_content: std.ArrayList(ai.ContentBlock) = std.ArrayList(ai.ContentBlock).init(allocator);
+    errdefer {
+        for (new_content.items) |*cb| cb.deinit(allocator);
+        new_content.deinit(allocator);
+    }
+
+    for (result.content) |block| {
+        switch (block) {
+            .text => |text_block| {
+                const input = text_block.text;
+                if (input.len < config.min_bytes_to_compress) {
+                    // Too small to compress — pass through
+                    const duped = block.dupe(allocator) catch continue;
+                    new_content.append(duped) catch continue;
+                    continue;
+                }
+
+                // Try to compress with zompress
+                const compress_result = zompress.compress(allocator, input, zompress_config) catch |err| {
+                    // Compression failed — log warning and pass through
+                    std.log.warn("zompress compression failed: {}", .{err});
+                    const duped = block.dupe(allocator) catch continue;
+                    new_content.append(duped) catch continue;
+                    continue;
+                };
+
+                // Store original in CCR if enabled
+                var ccr_marker: ?[]const u8 = null;
+                if (config.ccr_enabled) {
+                    if (maybe_ccr_store) |store| {
+                        const key = store.store(input) catch {
+                            ccr_marker = null;
+                        };
+                        if (key) |k| {
+                            const original_lines = countLines(input);
+                            ccr_marker = CcrSessionStore.formatMarker(k, original_lines, allocator) catch null;
+                        }
+                    }
+                }
+
+                // Build the compressed text with optional CCR marker
+                var compressed_text = compress_result.compressed;
+                if (ccr_marker) |marker| {
+                    // Append marker to compressed output
+                    const combined = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ compressed_text, marker }) catch {
+                        // If formatting fails, just use compressed text
+                        new_content.append(.{ .text = .{
+                            .text = compressed_text,
+                            .text_signature = null,
+                        } }) catch {
+                            allocator.free(compressed_text);
+                        };
+                        continue;
+                    };
+                    allocator.free(compressed_text);
+                    compressed_text = combined;
+                }
+
+                new_content.append(.{ .text = .{
+                    .text = compressed_text,
+                    .text_signature = null,
+                } }) catch {
+                    allocator.free(compressed_text);
+                    continue;
+                };
+
+                // Free zompress result fields
+                allocator.free(compress_result.transforms_applied);
+                allocator.free(compress_result.ccr_keys);
+            },
+            else => {
+                // Non-text blocks (images, etc.) — pass through unchanged
+                const duped = block.dupe(allocator) catch continue;
+                new_content.append(duped) catch continue;
+            },
+        }
+    }
+
+    const content_slice = new_content.toOwnedSlice(allocator) catch {
+        // If we can't finalize, return a minimal passthrough
+        return at.ToolResult{
+            .content = allocator.dupe(ai.ContentBlock, result.content) catch
+                @panic("OOM in compressToolResult fallback"),
+            .is_error = result.is_error,
+            .tool_code = if (result.tool_code) |tc| allocator.dupe(u8, tc) catch null else null,
+            .terminate = result.terminate,
+        };
+    };
+
+    return at.ToolResult{
+        .content = content_slice,
+        .is_error = result.is_error,
+        .tool_code = if (result.tool_code) |tc| allocator.dupe(u8, tc) catch null else null,
+        .terminate = result.terminate,
+    };
+}
+
+/// Count newlines in a byte slice.
+fn countLines(s: []const u8) usize {
+    var count: usize = 0;
+    for (s) |b| {
+        if (b == '\n') count += 1;
+    }
+    return count;
+}
+
+test "compressToolResult passes through small content" {
+    const allocator = std.testing.allocator;
+
+    const result = at.ToolResult{
+        .content = &.{
+            .{ .text = .{ .text = "small", .text_signature = null } },
+        },
+        .is_error = false,
+        .tool_code = null,
+        .terminate = false,
+    };
+    defer result.deinit(allocator);
+
+    const config = CompressionConfig{
+        .enabled = true,
+        .min_bytes_to_compress = 100, // larger than "small"
+    };
+
+    const compressed = compressToolResult(allocator, &result, config, null);
+    defer compressed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), compressed.content.len);
+    try std.testing.expectEqualStrings("small", compressed.content[0].text.text);
+}
+
+test "compressToolResult passes through non-text blocks" {
+    const allocator = std.testing.allocator;
+
+    const result = at.ToolResult{
+        .content = &.{
+            .{ .image = .{ .data = &.{}, .media_type = "image/png" } },
+        },
+        .is_error = false,
+        .tool_code = null,
+        .terminate = false,
+    };
+    defer result.deinit(allocator);
+
+    const config = CompressionConfig{
+        .enabled = true,
+        .min_bytes_to_compress = 1,
+    };
+
+    const compressed = compressToolResult(allocator, &result, config, null);
+    defer compressed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), compressed.content.len);
+    try std.testing.expect(compressed.content[0] == .image);
+}
+
+test "compressToolResult is infallible on empty input" {
+    const allocator = std.testing.allocator;
+
+    const result = at.ToolResult{
+        .content = &.{},
+        .is_error = false,
+        .tool_code = null,
+        .terminate = false,
+    };
+    defer result.deinit(allocator);
+
+    const config = CompressionConfig{ .enabled = true };
+
+    const compressed = compressToolResult(allocator, &result, config, null);
+    defer compressed.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), compressed.content.len);
+}
