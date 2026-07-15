@@ -21,7 +21,7 @@ pub const parameters_json: []const u8 =
     \\  "properties": {
     \\    "key": {
     \\      "type": "string",
-    \\      "description": "The CCR hash key from a <<ccr:<hash> N_rows_offloaded>> marker"
+    \\      "description": "The CCR hash key from a <<<ccr:<hash> N_rows_offloaded>>> marker"
     \\    }
     \\  },
     \\  "additionalProperties": false
@@ -33,7 +33,7 @@ pub fn tool(store: *ccr_store.CcrSessionStore) at.AgentTool {
     return .{
         .name = "ccr_retrieve",
         .description = "Retrieve original content that was compressed during tool execution. " ++
-            "Pass the hash key from a `<<ccr:<hash> N_rows_offloaded>>` marker.",
+            "Pass the hash key from a `<<<ccr:<hash> N_rows_offloaded>>>` marker.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @ptrCast(store),
@@ -46,7 +46,7 @@ pub fn toolWithCtx(ctx: ?*anyopaque) at.AgentTool {
     return .{
         .name = "ccr_retrieve",
         .description = "Retrieve original content that was compressed during tool execution. " ++
-            "Pass the hash key from a `<<ccr:<hash> N_rows_offloaded>>` marker.",
+            "Pass the hash key from a `<<<ccr:<hash> N_rows_offloaded>>>` marker.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = ctx,

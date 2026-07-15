@@ -27,6 +27,10 @@ pub const CompressionConfig = struct {
     enabled: bool = false,
     /// Skip outputs smaller than this (bytes). Avoids overhead on tiny results.
     min_bytes_to_compress: usize = 1024,
+    /// Minimum compression ratio to accept (compressed/original).
+    /// If compression doesn't reduce size by at least this factor,
+    /// the original is passed through unchanged.
+    min_compression_ratio: f64 = 0.9,
     /// Enable SmartCrusher for JSON arrays.
     smart_crusher_enabled: bool = true,
     /// Enable LogCompressor for build/test output.
@@ -92,12 +96,50 @@ pub fn compressToolResult(
 
                 // Try to compress with zompress
                 const compress_result = zompress.compress(allocator, input, zompress_config) catch |err| {
-                    // Compression failed — log warning and pass through
+                    // Compression failed — log warning.
+                    // Still store original in CCR so the LLM can retrieve it.
                     std.log.warn("zompress compression failed: {}", .{err});
+                    var fallback_marker: ?[]const u8 = null;
+                    if (config.ccr_enabled) {
+                        if (maybe_ccr_store) |store| {
+                            if (store.store(input)) |k| {
+                                const original_lines = countLines(input);
+                                fallback_marker = CcrSessionStore.formatMarker(k, original_lines, allocator) catch null;
+                            } else |_| {}
+                        }
+                    }
+                    if (fallback_marker) |marker| {
+                        const combined = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ input, marker }) catch {
+                            const duped = block.dupe(allocator) catch continue;
+                            new_content.append(allocator, duped) catch continue;
+                            continue;
+                        };
+                        new_content.append(allocator, .{ .text = .{
+                            .text = combined,
+                            .text_signature = null,
+                        } }) catch {
+                            allocator.free(combined);
+                            continue;
+                        };
+                    } else {
+                        const duped = block.dupe(allocator) catch continue;
+                        new_content.append(allocator, duped) catch continue;
+                    }
+                    continue;
+                };
+
+                // Minimum-ratio gate: if compression didn't reduce size
+                // enough, pass through the original unchanged.
+                if (@as(f64, @floatFromInt(compress_result.compressed.len)) >=
+                    @as(f64, @floatFromInt(input.len)) * config.min_compression_ratio)
+                {
+                    allocator.free(compress_result.compressed);
+                    allocator.free(compress_result.transforms_applied);
+                    allocator.free(compress_result.ccr_keys);
                     const duped = block.dupe(allocator) catch continue;
                     new_content.append(allocator, duped) catch continue;
                     continue;
-                };
+                }
 
                 // Store original in CCR if enabled
                 var ccr_marker: ?[]const u8 = null;

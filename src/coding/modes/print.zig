@@ -1605,7 +1605,7 @@ pub fn buildSystemPromptIo(
         with_compression = try std.fmt.allocPrint(
             allocator,
             "{s}\n\n## Compression\n\n" ++
-            "When tool output contains `<<ccr:<hash> N_rows_offloaded>>` markers, " ++
+            "When tool output contains `<<<ccr:<hash> N_rows_offloaded>>>` markers, " ++
             "the original content was compressed to save context. You can retrieve " ++
             "the full original content by calling the `ccr_retrieve` tool with the " ++
             "hash key. Do NOT guess or hallucinate the content behind a marker — " ++

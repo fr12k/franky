@@ -13,15 +13,21 @@ const std = @import("std");
 /// Maximum number of entries in the CCR store before LRU eviction kicks in.
 pub const default_max_entries: usize = 1000;
 
+/// Maximum total bytes of stored content before LRU eviction kicks in.
+pub const default_max_bytes: usize = 64 * 1024 * 1024; // 64 MB
+
 /// Session-scoped CCR store.
 ///
-/// Stores original content blobs keyed by a truncated SHA-256 hash.
+/// Stores original content blobs keyed by a full SHA-256 hex hash.
 /// Old entries are evicted via LRU when the cap is reached.
 pub const CcrSessionStore = struct {
     allocator: std.mem.Allocator,
     /// key -> original content (both owned)
     map: std.StringHashMap([]const u8),
     max_entries: usize,
+    max_bytes: usize,
+    /// Current total bytes of stored content.
+    total_bytes: usize,
     /// LRU tracking: ordered list of keys, most-recently-used at the end.
     lru_keys: std.ArrayList([]const u8),
 
@@ -30,6 +36,8 @@ pub const CcrSessionStore = struct {
             .allocator = allocator,
             .map = std.StringHashMap([]const u8).init(allocator),
             .max_entries = default_max_entries,
+            .max_bytes = default_max_bytes,
+            .total_bytes = 0,
             .lru_keys = .empty,
         };
     }
@@ -47,7 +55,7 @@ pub const CcrSessionStore = struct {
 
     /// Store original content and return a hash key.
     /// The returned key is owned by the store and valid until the entry is evicted.
-    /// Uses SHA-256 truncated to 12 hex characters for the key.
+    /// Uses full SHA-256 hex (64 characters) for the key.
     pub fn store(self: *CcrSessionStore, original: []const u8) ![]const u8 {
         const key = try computeKey(self.allocator, original);
         errdefer self.allocator.free(key);
@@ -55,13 +63,30 @@ pub const CcrSessionStore = struct {
         const val = try self.allocator.dupe(u8, original);
         errdefer self.allocator.free(val);
 
-        // Remove old value if key already exists
+        // Remove old value if key already exists (content collision)
         if (self.map.fetchRemove(key)) |kv| {
+            self.total_bytes -|= kv.value.len;
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
         }
 
+        // Evict LRU entries until we have room for the new value.
+        // Check both entry count and byte budget.
+        const needed_bytes = val.len;
+        while (self.lru_keys.items.len >= self.max_entries or
+            (self.total_bytes + needed_bytes > self.max_bytes and self.lru_keys.items.len > 0))
+        {
+            const oldest_key = self.lru_keys.orderedRemove(0);
+            if (self.map.fetchRemove(oldest_key)) |kv| {
+                self.total_bytes -|= kv.value.len;
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
+            self.allocator.free(oldest_key);
+        }
+
         try self.map.put(key, val);
+        self.total_bytes += val.len;
 
         // Update LRU: remove old position if exists, then append
         for (self.lru_keys.items, 0..) |lk, i| {
@@ -74,16 +99,6 @@ pub const CcrSessionStore = struct {
 
         const duped_key = try self.allocator.dupe(u8, key);
         try self.lru_keys.append(self.allocator, duped_key);
-
-        // Evict if over cap
-        if (self.lru_keys.items.len > self.max_entries) {
-            const oldest_key = self.lru_keys.orderedRemove(0);
-            if (self.map.fetchRemove(oldest_key)) |kv| {
-                self.allocator.free(kv.key);
-                self.allocator.free(kv.value);
-            }
-            self.allocator.free(oldest_key);
-        }
 
         return key;
     }
@@ -111,28 +126,35 @@ pub const CcrSessionStore = struct {
     }
 
     /// Format a CCR marker for embedding in compressed output.
+    /// Uses a distinctive prefix to avoid collision with tool output.
+    /// The marker uses a 12-char truncated hash for readability;
+    /// the full 64-char hash is used internally for lookups.
     pub fn formatMarker(key: []const u8, count: usize, allocator: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "<<ccr:{s} {d}_rows_offloaded>>", .{ key, count });
+        // Use first 12 hex chars of the full SHA-256 for the display marker.
+        const display_key = if (key.len > 12) key[0..12] else key;
+        return std.fmt.allocPrint(allocator, "<<<ccr:{s} {d}_rows_offloaded>>>", .{ display_key, count });
     }
 
     /// Parse a CCR marker to extract the hash key and count.
     pub fn parseMarker(text: []const u8) ?struct { key: []const u8, count: usize } {
-        const prefix = "<<ccr:";
+        const prefix = "<<<ccr:";
         if (!std.mem.startsWith(u8, text, prefix)) return null;
         const rest = text[prefix.len..];
-        const space = std.mem.indexOf(u8, rest, " ") orelse return null;
-        const key = rest[0..space];
-        const suffix = rest[space + 1 ..];
-        const underscore = std.mem.indexOf(u8, suffix, "_") orelse return null;
-        const count_str = suffix[0..underscore];
+        const suffix = ">>>";
+        const suffix_start = std.mem.lastIndexOf(u8, rest, suffix) orelse return null;
+        const inner = rest[0..suffix_start];
+        const space = std.mem.indexOf(u8, inner, " ") orelse return null;
+        const key = inner[0..space];
+        const count_part = inner[space + 1 ..];
+        const underscore = std.mem.indexOf(u8, count_part, "_") orelse return null;
+        const count_str = count_part[0..underscore];
         const count = std.fmt.parseInt(usize, count_str, 10) catch return null;
         return .{ .key = key, .count = count };
     }
 };
 
-/// Compute a truncated SHA-256 hex key for content.
-/// Returns 12 hex characters (48 bits) — sufficient for collision
-/// resistance at the scale of a single session.
+/// Compute a full SHA-256 hex key for content.
+/// Returns 64 hex characters (256 bits) — collision-free at session scale.
 fn computeKey(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
     var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
     sha256.update(content);
@@ -140,10 +162,10 @@ fn computeKey(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
     sha256.final(&digest);
 
     const hex_chars = "0123456789abcdef";
-    const key_len = 12;
-    var key_buf: [key_len]u8 = undefined;
-    for (0..key_len) |i| {
-        key_buf[i] = hex_chars[digest[i] & 0x0f];
+    var key_buf: [64]u8 = undefined;
+    for (0..32) |i| {
+        key_buf[i * 2] = hex_chars[digest[i] >> 4];
+        key_buf[i * 2 + 1] = hex_chars[digest[i] & 0x0f];
     }
     return try allocator.dupe(u8, &key_buf);
 }

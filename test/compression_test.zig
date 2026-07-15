@@ -152,7 +152,7 @@ test "compression: large JSON array is compressed in tool result" {
     try testing.expect(compressed_text.len < 1000);
 
     // Should contain a CCR marker.
-    try testing.expect(std.mem.indexOf(u8, compressed_text, "<<ccr:") != null);
+    try testing.expect(std.mem.indexOf(u8, compressed_text, "<<<ccr:") != null);
 }
 
 test "compression: small result passes through unchanged" {
@@ -259,7 +259,7 @@ test "compression: disabled config skips compression" {
     const text = tr_msg.content[0].text.text;
     // Original is ~2000+ bytes; without compression it stays large.
     try testing.expect(text.len > 1000);
-    try testing.expect(std.mem.indexOf(u8, text, "<<ccr:") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "<<<ccr:") == null);
 }
 
 test "compression: ccr_store retains original content for retrieval" {
@@ -316,7 +316,7 @@ test "compression: ccr_store retains original content for retrieval" {
     // The compressed text should contain a CCR marker.
     const compressed = transcript.messages.items[1].content[0].text.text;
     try testing.expect(compressed.len < 1000);
-    try testing.expect(std.mem.indexOf(u8, compressed, "<<ccr:") != null);
+    try testing.expect(std.mem.indexOf(u8, compressed, "<<<ccr:") != null);
 
     // The CCR store should have entries we can retrieve.
     // Iterate store keys and verify we can get the original back.
