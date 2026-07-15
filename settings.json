@@ -4,7 +4,17 @@
             "maxAttempts": 3,
             "maxTotalMs": 180000
         },
-        "maxFullToolResults": 0
+        "maxFullToolResults": 0,
+        "compress": {
+            "enabled": true,
+            "minBytes": 1024,
+            "ccr": true,
+            "json": true,
+            "logs": true,
+            "search": true,
+            "diff": true,
+            "code": true
+        }
     },
     "review": {
         "profiles": ["ollama-cloud/deepseek-v4-flash:cloud", "ollama-cloud/kimi-k2.6:cloud", "ollama-cloud/deepseek-v4-pro:cloud", "ollama-cloud/gemma4:31b-cloud", "ollama-cloud/minimax-m3:cloud", "ollama-cloud/glm-5.1:cloud"],

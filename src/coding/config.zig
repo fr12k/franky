@@ -425,6 +425,22 @@ pub fn applyRetrySettingsOverlay(
     }
 }
 
+/// v3.0 — apply `tools.compress.*` settings.json overlay onto `cfg`.
+/// Settings fill in when CLI didn't set them (CLI always wins).
+pub fn applyCompressionSettingsOverlay(
+    cfg: *cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) void {
+    if (settings.compress_enabled) |v| cfg.compress = v;
+    if (settings.compress_min_bytes) |v| cfg.compress_min_bytes = v;
+    if (settings.compress_ccr) |v| cfg.compress_ccr = v;
+    if (settings.compress_json) |v| cfg.compress_json = v;
+    if (settings.compress_logs) |v| cfg.compress_logs = v;
+    if (settings.compress_search) |v| cfg.compress_search = v;
+    if (settings.compress_diff) |v| cfg.compress_diff = v;
+    if (settings.compress_code) |v| cfg.compress_code = v;
+}
+
 /// Apply permissions settings overlay onto permission store.
 pub fn applyPermissionsSettingsOverlay(
     store: *permissions_mod.Store,
@@ -897,6 +913,7 @@ pub fn resolve(
     // ── Step 4: Apply settings overlays to cfg ──────────────────
     applyMaxTurnsSettingsOverlay(cfg, &settings);
     applyRetrySettingsOverlay(cfg, &settings);
+    applyCompressionSettingsOverlay(cfg, &settings);
 
     // ── Step 5: Resolve provider ──────────────────────────────────
     const provider = try resolveProvider(allocator, io, cfg, environ_map);

@@ -71,6 +71,24 @@ pub const Settings = struct {
     /// the LLM. 0 (default) disables offloading — send everything.
     max_full_tool_results: ?u32 = null,
 
+    /// v3.0 — `tools.compress.enabled` — settings-layer default for
+    /// content-aware tool output compression.
+    compress_enabled: ?bool = null,
+    /// `tools.compress.minBytes` — minimum output size to trigger compression.
+    compress_min_bytes: ?usize = null,
+    /// `tools.compress.ccr` — enable Compress-Cache-Retrieve.
+    compress_ccr: ?bool = null,
+    /// `tools.compress.json` — enable JSON array compression.
+    compress_json: ?bool = null,
+    /// `tools.compress.logs` — enable log output compression.
+    compress_logs: ?bool = null,
+    /// `tools.compress.search` — enable search result compression.
+    compress_search: ?bool = null,
+    /// `tools.compress.diff` — enable diff compression.
+    compress_diff: ?bool = null,
+    /// `tools.compress.code` — enable source code compression.
+    compress_code: ?bool = null,
+
     /// `permissions.ask_all` — settings-layer default for the
     /// "ask before every tool call" toggle. CLI `--ask-tools all`
     /// still wins.
@@ -273,6 +291,32 @@ fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
             };
             if (retry_v.object.get("maxTotalMs")) |t| if (t == .integer and t.integer >= 0) {
                 settings.retry_max_total_ms = @intCast(t.integer);
+            };
+        };
+        if (tools_v.object.get("compress")) |compress_v| if (compress_v == .object) {
+            if (compress_v.object.get("enabled")) |v| if (v == .bool) {
+                settings.compress_enabled = v.bool;
+            };
+            if (compress_v.object.get("minBytes")) |v| if (v == .integer and v.integer >= 1) {
+                settings.compress_min_bytes = @intCast(v.integer);
+            };
+            if (compress_v.object.get("ccr")) |v| if (v == .bool) {
+                settings.compress_ccr = v.bool;
+            };
+            if (compress_v.object.get("json")) |v| if (v == .bool) {
+                settings.compress_json = v.bool;
+            };
+            if (compress_v.object.get("logs")) |v| if (v == .bool) {
+                settings.compress_logs = v.bool;
+            };
+            if (compress_v.object.get("search")) |v| if (v == .bool) {
+                settings.compress_search = v.bool;
+            };
+            if (compress_v.object.get("diff")) |v| if (v == .bool) {
+                settings.compress_diff = v.bool;
+            };
+            if (compress_v.object.get("code")) |v| if (v == .bool) {
+                settings.compress_code = v.bool;
             };
         };
     };

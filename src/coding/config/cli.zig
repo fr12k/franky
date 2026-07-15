@@ -247,8 +247,9 @@ pub const Config = struct {
     /// nudges per session. Useful for running with no user in the loop.
     autocontinue: bool = false,
 
-    /// `--compress` — enable content-aware tool output compression.
-    compress: bool = false,
+    /// `--compress` — enable content-aware tool output compression (default on).
+    /// Use `--no-compress` to disable.
+    compress: bool = true,
     /// `--compress-min-bytes N` — minimum output size to trigger compression.
     compress_min_bytes: usize = 1024,
     /// `--compress-ccr` — enable Compress-Cache-Retrieve (default on).
@@ -421,6 +422,10 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--compress")) {
         cfg.compress = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress")) {
+        cfg.compress = false;
         return true;
     }
     if (std.mem.eql(u8, name, "--compress-ccr")) {
