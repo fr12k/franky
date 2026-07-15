@@ -267,6 +267,14 @@ fn runPrint(
     var session_state = try SessionState.init(allocator, io, environ, cfg);
     defer session_state.deinit(allocator);
 
+    // v3.0 — wire the session's CCR store into the ccr_retrieve tool
+    for (resolved.tools, 0..) |t, i| {
+        if (std.mem.eql(u8, t.name, "ccr_retrieve")) {
+            const tools_slice: []at.AgentTool = @constCast(resolved.tools);
+            tools_slice[i].ctx = @ptrCast(&session_state.ccr_store);
+        }
+    }
+
     if (!cfg.no_session) {
         ai.log.log(.info, "session", "init", "id={s} dir={s}", .{
             session_state.id(),

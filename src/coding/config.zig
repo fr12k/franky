@@ -984,7 +984,7 @@ pub fn resolve(
 
     var startup_warnings: std.ArrayList([]const u8) = .empty;
     const base_tool_count: usize = 9;
-    var all_tools: [10]at.AgentTool = undefined;
+    var all_tools: [11]at.AgentTool = undefined;
     {
         var i: usize = 0;
         // Common tools (always present)
@@ -1120,7 +1120,7 @@ pub fn resolve(
     };
     const all_final_tools = blk: {
         const base_len = role_filtered_tools.len + ext_tools.len;
-        const slice = try a.alloc(at.AgentTool, base_len + 3);
+        const slice = try a.alloc(at.AgentTool, base_len + 4);
         @memcpy(slice[0..role_filtered_tools.len], role_filtered_tools);
         if (ext_tools.len > 0) {
             @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
@@ -1128,6 +1128,8 @@ pub fn resolve(
         slice[base_len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
         slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
         slice[base_len + 2] = guardrail_state.finishTaskTool();
+        // ccr_retrieve tool — ctx is set by the mode driver after session creation
+        slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithCtx(null);
         break :blk slice;
     };
 

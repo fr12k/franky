@@ -14,6 +14,7 @@ pub const tools = struct {
     pub const workspace = @import("tools/workspace.zig");
     pub const common = @import("tools/common.zig");
     pub const truncate = @import("tools/truncate.zig");
+    pub const ccr_retrieve = @import("tools/ccr_retrieve.zig");
 };
 
 pub const modes = struct {
