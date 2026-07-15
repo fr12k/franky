@@ -12,8 +12,8 @@
     },
     .dependencies = .{
         .zompress = .{
-            .url = "https://github.com/franky-agent/zompress/archive/3733bae44f34068f26b9edaf4d6faffb01eb6e40.tar.gz",
-            .hash = "zompress-0.0.1-hHj4JghhAQC4TfmrBJjPeb18P3MEwvVsYA3ovBoxnDXl",
+            .url = "https://github.com/fr12k/zompress/archive/refs/tags/v0.0.3.tar.gz",
+            .hash = "zompress-0.0.1-hHj4JgJlAQDW5nhQtGE7BA2PnKqvJYLAzoAdNiURv4ie",
         },
     },
 }
