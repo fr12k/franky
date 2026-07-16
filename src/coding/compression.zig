@@ -19,6 +19,36 @@ const ccr_store = @import("./session/ccr_store.zig");
 
 pub const CcrSessionStore = ccr_store.CcrSessionStore;
 
+/// Compression statistics tracked per-session for the status line.
+/// Updated by `compressToolResult` when a non-null pointer is provided.
+pub const CompressionStats = struct {
+    /// Total bytes of tool output text before compression.
+    bytes_before: u64 = 0,
+    /// Total bytes of tool output text after compression.
+    bytes_after: u64 = 0,
+    /// Number of text blocks that were compressed.
+    items_compressed: u64 = 0,
+    /// Number of text blocks that passed through (too small, incompressible, etc).
+    items_passthrough: u64 = 0,
+    /// Number of text blocks that failed compression (fell back to passthrough).
+    items_failed: u64 = 0,
+
+    /// Bytes saved (before - after). Saturating subtraction.
+    pub fn bytesSaved(self: *const CompressionStats) u64 {
+        return if (self.bytes_before > self.bytes_after)
+            self.bytes_before - self.bytes_after
+        else
+            0;
+    }
+
+    /// Compression ratio as a float 0..1 (1 = 100% saved).
+    pub fn ratio(self: *const CompressionStats) f64 {
+        if (self.bytes_before == 0) return 0;
+        return @as(f64, @floatFromInt(self.bytesSaved())) /
+            @as(f64, @floatFromInt(self.bytes_before));
+    }
+};
+
 /// Compression configuration with sensible defaults.
 /// All per-compressor toggles default to `true` so that enabling
 /// compression activates all available compressors.
@@ -62,6 +92,7 @@ pub fn compressToolResult(
     result: *const at.ToolResult,
     config: CompressionConfig,
     maybe_ccr_store: ?*CcrSessionStore,
+    maybe_stats: ?*CompressionStats,
 ) at.ToolResult {
     // Build the zompress config from our CompressionConfig
     const zompress_config = zompress.CompressConfig{
@@ -89,6 +120,7 @@ pub fn compressToolResult(
                 const input = text_block.text;
                 if (input.len < config.min_bytes_to_compress) {
                     // Too small to compress — pass through
+                    if (maybe_stats) |s| s.items_passthrough += 1;
                     const duped = block.dupe(allocator) catch continue;
                     new_content.append(allocator, duped) catch continue;
                     continue;
@@ -98,6 +130,10 @@ pub fn compressToolResult(
                 const compress_result = zompress.compress(allocator, input, zompress_config) catch |err| {
                     // Compression failed — log warning.
                     // Still store original in CCR so the LLM can retrieve it.
+                    if (maybe_stats) |s| {
+                        s.items_failed += 1;
+                        s.items_passthrough += 1;
+                    }
                     std.log.warn("zompress compression failed: {}", .{err});
                     var fallback_marker: ?[]const u8 = null;
                     if (config.ccr_enabled) {
@@ -133,6 +169,7 @@ pub fn compressToolResult(
                 if (@as(f64, @floatFromInt(compress_result.compressed.len)) >=
                     @as(f64, @floatFromInt(input.len)) * config.min_compression_ratio)
                 {
+                    if (maybe_stats) |s| s.items_passthrough += 1;
                     allocator.free(compress_result.compressed);
                     allocator.free(compress_result.transforms_applied);
                     allocator.free(compress_result.ccr_keys);
@@ -156,6 +193,11 @@ pub fn compressToolResult(
 
                 // Build the compressed text with optional CCR marker
                 var compressed_text = compress_result.compressed;
+                if (maybe_stats) |s| {
+                    s.bytes_before += input.len;
+                    s.bytes_after += compressed_text.len;
+                    s.items_compressed += 1;
+                }
                 if (ccr_marker) |marker| {
                     // Append marker to compressed output
                     const combined = std.fmt.allocPrint(allocator, "{s}\n{s}", .{ compressed_text, marker }) catch {
@@ -238,7 +280,7 @@ test "compressToolResult passes through small content" {
         .min_bytes_to_compress = 100, // larger than "small"
     };
 
-    var compressed = compressToolResult(allocator, &result, config, null);
+    var compressed = compressToolResult(allocator, &result, config, null, null);
     defer compressed.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), compressed.content.len);
@@ -263,7 +305,7 @@ test "compressToolResult passes through non-text blocks" {
         .min_bytes_to_compress = 1,
     };
 
-    var compressed = compressToolResult(allocator, &result, config, null);
+    var compressed = compressToolResult(allocator, &result, config, null, null);
     defer compressed.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), compressed.content.len);
@@ -284,8 +326,32 @@ test "compressToolResult is infallible on empty input" {
 
     const config = CompressionConfig{ .enabled = true };
 
-    var compressed = compressToolResult(allocator, &result, config, null);
+    var compressed = compressToolResult(allocator, &result, config, null, null);
     defer compressed.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), compressed.content.len);
+}
+
+test "CompressionStats accumulates correctly" {
+    var stats = CompressionStats{};
+
+    // Simulate a compressed block
+    stats.bytes_before += 1000;
+    stats.bytes_after += 200;
+    stats.items_compressed += 1;
+
+    // Simulate a passthrough
+    stats.items_passthrough += 1;
+
+    // Simulate a failure
+    stats.items_failed += 1;
+    stats.items_passthrough += 1;
+
+    try std.testing.expectEqual(@as(u64, 1000), stats.bytes_before);
+    try std.testing.expectEqual(@as(u64, 200), stats.bytes_after);
+    try std.testing.expectEqual(@as(u64, 800), stats.bytesSaved());
+    try std.testing.expect(stats.ratio() > 0.79 and stats.ratio() < 0.81);
+    try std.testing.expectEqual(@as(u64, 1), stats.items_compressed);
+    try std.testing.expectEqual(@as(u64, 2), stats.items_passthrough);
+    try std.testing.expectEqual(@as(u64, 1), stats.items_failed);
 }

@@ -367,6 +367,8 @@ const Session = struct {
     guardrail_state: agent.guardrails.GuardrailState = undefined,
     /// v3.0 — session-scoped CCR store for reversible compression.
     ccr_store: compression_mod.CcrSessionStore = undefined,
+    /// v3.0 — compression statistics for the status line.
+    compression_stats: compression_mod.CompressionStats = .{},
 
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
@@ -2285,6 +2287,7 @@ fn runOneTurnInternal(
                     .ccr_enabled = session.cfg.compress_ccr,
                 };
                 lc.ccr_store = &session.ccr_store;
+                lc.compression_stats = &session.compression_stats;
             }
             break :blk lc;
         },
@@ -2736,6 +2739,95 @@ fn respondUsage(
             return;
         };
         body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cum_output}) catch unreachable) catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+    }
+    // v3.0 — append compression stats
+    {
+        const cs = &session.compression_stats;
+        body.appendSlice(allocator, ",\"compression\":{") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        body.appendSlice(allocator, "\"bytesBefore\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.bytes_before}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"bytesAfter\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.bytes_after}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"saved\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.bytesSaved()}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"ratio\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [64]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d:.3}", .{cs.ratio()}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"itemsCompressed\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.items_compressed}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"itemsPassthrough\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.items_passthrough}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"itemsFailed\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.items_failed}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.append(allocator, '}') catch {
             sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
             return;
         };

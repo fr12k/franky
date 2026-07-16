@@ -333,6 +333,9 @@ pub const Config = struct {
     /// CCR store for reversible compression. Must outlive the loop.
     /// Passed in from the session — never created per turn.
     ccr_store: ?*compression_mod.CcrSessionStore = null,
+    /// v3.0 — optional stats collector for compression metrics.
+    /// Updated by `compressToolResult` when non-null.
+    compression_stats: ?*compression_mod.CompressionStats = null,
 };
 
 pub const Transcript = at.Transcript;
@@ -1058,7 +1061,7 @@ fn runTurn(
         if (config.compression) |cc| {
             if (cc.enabled and call_res.content.len > 0) {
                 var old = call_res;
-                call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store);
+                call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
                 old.deinit(allocator);
             }
         }
@@ -1240,7 +1243,7 @@ fn runToolsParallel(
             if (config.compression) |cc| {
                 if (cc.enabled and call_res.content.len > 0) {
                     var old = call_res;
-                    call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store);
+                    call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
                     old.deinit(allocator);
                 }
             }

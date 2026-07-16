@@ -2821,6 +2821,41 @@ function highlightCodeBlocks(container) {
                 outRow.innerHTML = '<span class="st-label">Output</span><span class="st-value">' + formatTokenCount(cumOut) + '</span>';
                 body.appendChild(outRow);
             }
+
+            // v3.0 — compression stats from /usage endpoint.
+            const comp = u.compression;
+            if (comp && (comp.itemsCompressed > 0 || comp.saved > 0)) {
+                const sep = document.createElement('span');
+                sep.className = 'st-popover-heading';
+                sep.style.marginTop = '6px';
+                sep.textContent = 'Compression';
+                body.appendChild(sep);
+
+                const savedRow = document.createElement('div');
+                savedRow.className = 'st-popover-row';
+                const pct = Math.round(comp.ratio * 100);
+                savedRow.innerHTML = '<span class="st-label">Saved</span><span class="st-value">' + formatTokenCount(comp.saved) + ' (' + pct + '%)</span>';
+                body.appendChild(savedRow);
+
+                const compressedRow = document.createElement('div');
+                compressedRow.className = 'st-popover-row';
+                compressedRow.innerHTML = '<span class="st-label">Compressed</span><span class="st-value">' + comp.itemsCompressed + ' blocks</span>';
+                body.appendChild(compressedRow);
+
+                if (comp.itemsPassthrough > 0) {
+                    const passRow = document.createElement('div');
+                    passRow.className = 'st-popover-row';
+                    passRow.innerHTML = '<span class="st-label">Passthrough</span><span class="st-value">' + comp.itemsPassthrough + ' blocks</span>';
+                    body.appendChild(passRow);
+                }
+
+                if (comp.itemsFailed > 0) {
+                    const failRow = document.createElement('div');
+                    failRow.className = 'st-popover-row';
+                    failRow.innerHTML = '<span class="st-label">Failed</span><span class="st-value">' + comp.itemsFailed + ' blocks</span>';
+                    body.appendChild(failRow);
+                }
+            }
         }
 
         if (!cachedUsageData && !cachedTranscriptUsage) {
@@ -2870,6 +2905,13 @@ function highlightCodeBlocks(container) {
                     const cumIn = udata.inputTokens || 0;
                     const cumOut = udata.outputTokens || 0;
                     parts.push('in ' + formatTokenCount(cumIn) + ' / out ' + formatTokenCount(cumOut));
+
+                    // v3.0 — compression savings from the server.
+                    const comp = udata.compression;
+                    if (comp && comp.saved > 0) {
+                        const pct = Math.round(comp.ratio * 100);
+                        parts.push('saved ' + formatTokenCount(comp.saved) + ' (' + pct + '%)');
+                    }
                 }
             }
         } catch (_) {}
