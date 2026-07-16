@@ -2743,9 +2743,10 @@ fn respondUsage(
             return;
         };
     }
-    // v3.0 — append compression stats
+    // v3.0 — append compression stats (thread-safe snapshot)
     {
-        const cs = &session.compression_stats;
+        const cs_snapshot = session.compression_stats.snapshot(io);
+        const cs = &cs_snapshot;
         body.appendSlice(allocator, ",\"compression\":{") catch {
             sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
             return;

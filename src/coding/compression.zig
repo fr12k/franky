@@ -21,17 +21,25 @@ pub const CcrSessionStore = ccr_store.CcrSessionStore;
 
 /// Compression statistics tracked per-session for the status line.
 /// Updated by `compressToolResult` when a non-null pointer is provided.
+///
+/// Thread safety: the agent loop writes from a single thread (parallel
+/// tool paths join before stats access). The HTTP `/usage` handler reads
+/// from a different thread — use the mutex for atomic snapshot access.
 pub const CompressionStats = struct {
-    /// Total bytes of tool output text before compression.
+    /// Total bytes of tool output text before compression (all text blocks).
     bytes_before: u64 = 0,
-    /// Total bytes of tool output text after compression.
+    /// Total bytes of tool output text after compression (compressed blocks only).
     bytes_after: u64 = 0,
-    /// Number of text blocks that were compressed.
+    /// Number of text blocks that were successfully compressed.
     items_compressed: u64 = 0,
     /// Number of text blocks that passed through (too small, incompressible, etc).
+    /// Does NOT include failed blocks (those are in items_failed).
     items_passthrough: u64 = 0,
     /// Number of text blocks that failed compression (fell back to passthrough).
     items_failed: u64 = 0,
+
+    /// Mutex for thread-safe reads from the HTTP handler.
+    mutex: std.Io.Mutex = .init,
 
     /// Bytes saved (before - after). Saturating subtraction.
     pub fn bytesSaved(self: *const CompressionStats) u64 {
@@ -42,10 +50,34 @@ pub const CompressionStats = struct {
     }
 
     /// Compression ratio as a float 0..1 (1 = 100% saved).
+    /// Returns 0 when bytes_before is 0 (no data processed).
     pub fn ratio(self: *const CompressionStats) f64 {
         if (self.bytes_before == 0) return 0;
         return @as(f64, @floatFromInt(self.bytesSaved())) /
             @as(f64, @floatFromInt(self.bytes_before));
+    }
+
+    /// Take a snapshot of the stats under the mutex for safe cross-thread reads.
+    pub fn snapshot(self: *CompressionStats, io: std.Io) CompressionStats {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return .{
+            .bytes_before = self.bytes_before,
+            .bytes_after = self.bytes_after,
+            .items_compressed = self.items_compressed,
+            .items_passthrough = self.items_passthrough,
+            .items_failed = self.items_failed,
+        };
+    }
+
+    /// Lock the mutex for a batch of writes.
+    pub fn lock(self: *CompressionStats, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+    }
+
+    /// Unlock the mutex after a batch of writes.
+    pub fn unlock(self: *CompressionStats, io: std.Io) void {
+        self.mutex.unlock(io);
     }
 };
 
@@ -120,7 +152,10 @@ pub fn compressToolResult(
                 const input = text_block.text;
                 if (input.len < config.min_bytes_to_compress) {
                     // Too small to compress — pass through
-                    if (maybe_stats) |s| s.items_passthrough += 1;
+                    if (maybe_stats) |s| {
+                        s.bytes_before += input.len;
+                        s.items_passthrough += 1;
+                    }
                     const duped = block.dupe(allocator) catch continue;
                     new_content.append(allocator, duped) catch continue;
                     continue;
@@ -131,8 +166,8 @@ pub fn compressToolResult(
                     // Compression failed — log warning.
                     // Still store original in CCR so the LLM can retrieve it.
                     if (maybe_stats) |s| {
+                        s.bytes_before += input.len;
                         s.items_failed += 1;
-                        s.items_passthrough += 1;
                     }
                     std.log.warn("zompress compression failed: {}", .{err});
                     var fallback_marker: ?[]const u8 = null;
@@ -169,7 +204,10 @@ pub fn compressToolResult(
                 if (@as(f64, @floatFromInt(compress_result.compressed.len)) >=
                     @as(f64, @floatFromInt(input.len)) * config.min_compression_ratio)
                 {
-                    if (maybe_stats) |s| s.items_passthrough += 1;
+                    if (maybe_stats) |s| {
+                        s.bytes_before += input.len;
+                        s.items_passthrough += 1;
+                    }
                     allocator.free(compress_result.compressed);
                     allocator.free(compress_result.transforms_applied);
                     allocator.free(compress_result.ccr_keys);
@@ -343,15 +381,17 @@ test "CompressionStats accumulates correctly" {
     // Simulate a passthrough
     stats.items_passthrough += 1;
 
-    // Simulate a failure
+    // Simulate a failure (mutually exclusive from passthrough)
     stats.items_failed += 1;
-    stats.items_passthrough += 1;
 
     try std.testing.expectEqual(@as(u64, 1000), stats.bytes_before);
     try std.testing.expectEqual(@as(u64, 200), stats.bytes_after);
     try std.testing.expectEqual(@as(u64, 800), stats.bytesSaved());
     try std.testing.expect(stats.ratio() > 0.79 and stats.ratio() < 0.81);
     try std.testing.expectEqual(@as(u64, 1), stats.items_compressed);
-    try std.testing.expectEqual(@as(u64, 2), stats.items_passthrough);
+    try std.testing.expectEqual(@as(u64, 1), stats.items_passthrough);
     try std.testing.expectEqual(@as(u64, 1), stats.items_failed);
+
+    // Verify total = compressed + passthrough + failed
+    try std.testing.expectEqual(@as(u64, 3), stats.items_compressed + stats.items_passthrough + stats.items_failed);
 }
