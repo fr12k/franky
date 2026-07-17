@@ -30,6 +30,10 @@ pub const CcrSessionStore = struct {
     total_bytes: usize,
     /// LRU tracking: ordered list of keys, most-recently-used at the end.
     lru_keys: std.ArrayList([]const u8),
+    /// Reverse map from short (12-char) display keys to full 64-char keys.
+    /// Needed because `formatMarker` truncates keys for readability, but
+    /// `retrieve` must resolve the short key back to the full key for lookup.
+    short_to_full: std.StringHashMap([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) CcrSessionStore {
         return .{
@@ -37,6 +41,7 @@ pub const CcrSessionStore = struct {
             .map = std.StringHashMap([]const u8).init(allocator),
             .max_entries = default_max_entries,
             .max_bytes = default_max_bytes,
+            .short_to_full = std.StringHashMap([]const u8).init(allocator),
             .total_bytes = 0,
             .lru_keys = .empty,
         };
@@ -49,6 +54,12 @@ pub const CcrSessionStore = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.map.deinit();
+        // Free short_to_full keys (values are pointers into map keys, not owned)
+        var sit = self.short_to_full.iterator();
+        while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.short_to_full.deinit();
         for (self.lru_keys.items) |k| self.allocator.free(k);
         self.lru_keys.deinit(self.allocator);
     }
@@ -66,6 +77,11 @@ pub const CcrSessionStore = struct {
         // Remove old value if key already exists (content collision)
         if (self.map.fetchRemove(key)) |kv| {
             self.total_bytes -|= kv.value.len;
+            // Also remove from short_to_full reverse map
+            const old_short = kv.key[0..@min(kv.key.len, 12)];
+            if (self.short_to_full.fetchRemove(old_short)) |sfkv| {
+                self.allocator.free(sfkv.key);
+            }
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
         }
@@ -79,6 +95,11 @@ pub const CcrSessionStore = struct {
             const oldest_key = self.lru_keys.orderedRemove(0);
             if (self.map.fetchRemove(oldest_key)) |kv| {
                 self.total_bytes -|= kv.value.len;
+                // Also remove from short_to_full reverse map
+                const old_short = kv.key[0..@min(kv.key.len, 12)];
+                if (self.short_to_full.fetchRemove(old_short)) |sfkv| {
+                    self.allocator.free(sfkv.key);
+                }
                 self.allocator.free(kv.key);
                 self.allocator.free(kv.value);
             }
@@ -87,6 +108,14 @@ pub const CcrSessionStore = struct {
 
         try self.map.put(key, val);
         self.total_bytes += val.len;
+
+        // Also insert into short_to_full reverse map
+        const short_key = key[0..@min(key.len, 12)];
+        const short_duped = try self.allocator.dupe(u8, short_key);
+        // If a short key entry already exists (extremely unlikely — 12 hex chars = 48 bits),
+        // fetchPut returns the old entry whose key we must free.
+        const old_short = try self.short_to_full.fetchPut(short_duped, key);
+        if (old_short) |os| self.allocator.free(os.key);
 
         // Update LRU: remove old position if exists, then append
         for (self.lru_keys.items, 0..) |lk, i| {
@@ -104,19 +133,28 @@ pub const CcrSessionStore = struct {
     }
 
     /// Retrieve original content by hash key.
+    /// Accepts either a full 64-char SHA-256 key or a short 12-char display key.
+    /// Short keys are resolved via the short_to_full reverse map.
     pub fn retrieve(self: *CcrSessionStore, key: []const u8) ?[]const u8 {
-        const value = self.map.get(key) orelse return null;
+        // First try a direct lookup (full key)
+        var lookup_key: []const u8 = key;
+        if (self.map.get(key) == null) {
+            // Not found as full key — try resolving short key to full key
+            const full_key = self.short_to_full.get(key) orelse return null;
+            lookup_key = full_key;
+        }
+        const value = self.map.get(lookup_key) orelse return null;
 
         // Update LRU: move to end
         for (self.lru_keys.items, 0..) |lk, i| {
-            if (std.mem.eql(u8, lk, key)) {
+            if (std.mem.eql(u8, lk, lookup_key)) {
                 const removed = self.lru_keys.orderedRemove(i);
                 self.allocator.free(removed);
                 break;
             }
         }
 
-        const duped_key = self.allocator.dupe(u8, key) catch return value;
+        const duped_key = self.allocator.dupe(u8, lookup_key) catch return value;
         self.lru_keys.append(self.allocator, duped_key) catch {
             self.allocator.free(duped_key);
             return value;
@@ -242,4 +280,25 @@ test "CCR store LRU eviction" {
     try std.testing.expect(store.retrieve(a) == null); // evicted
     try std.testing.expect(store.retrieve(b) != null);
     try std.testing.expect(store.retrieve(c) != null);
+}
+
+test "CCR store retrieve by short key (truncated display key)" {
+    var store = CcrSessionStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const full_key = try store.store("some important content");
+    // full_key is 64 chars (SHA-256 hex)
+    try std.testing.expectEqual(@as(usize, 64), full_key.len);
+
+    // Retrieving with the full key should work
+    try std.testing.expectEqualStrings("some important content", store.retrieve(full_key).?);
+
+    // Retrieving with the truncated 12-char display key should also work
+    const short_key = full_key[0..12];
+    const short_duped = try std.testing.allocator.dupe(u8, short_key);
+    defer std.testing.allocator.free(short_duped);
+    try std.testing.expectEqualStrings("some important content", store.retrieve(short_duped).?);
+
+    // A non-existent short key should return null
+    try std.testing.expect(store.retrieve("nonexistent12") == null);
 }
