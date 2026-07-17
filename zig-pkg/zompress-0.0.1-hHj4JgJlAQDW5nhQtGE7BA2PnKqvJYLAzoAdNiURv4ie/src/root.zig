@@ -10,6 +10,7 @@ pub const smart_crusher = @import("smart_crusher/main.zig");
 pub const log_compressor = @import("log_compressor.zig");
 pub const search_compressor = @import("search_compressor.zig");
 pub const diff_compressor = @import("diff_compressor.zig");
+pub const plain_text_compressor = @import("plain_text_compressor.zig");
 pub const ccr = @import("ccr/main.zig");
 
 pub const util = struct {
@@ -38,6 +39,7 @@ test "all modules compile" {
     _ = @import("log_compressor.zig");
     _ = @import("search_compressor.zig");
     _ = @import("diff_compressor.zig");
+    _ = @import("plain_text_compressor.zig");
     _ = @import("ccr/main.zig");
     _ = @import("util/hash.zig");
     _ = @import("util/math.zig");

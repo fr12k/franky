@@ -88,6 +88,8 @@ pub const Settings = struct {
     compress_diff: ?bool = null,
     /// `tools.compress.code` — enable source code compression.
     compress_code: ?bool = null,
+    /// `tools.compress.plainText` — enable plain text compression for bash output, file contents, etc.
+    compress_plain_text: ?bool = null,
 
     /// `permissions.ask_all` — settings-layer default for the
     /// "ask before every tool call" toggle. CLI `--ask-tools all`
@@ -317,6 +319,9 @@ fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
             };
             if (compress_v.object.get("code")) |v| if (v == .bool) {
                 settings.compress_code = v.bool;
+            };
+            if (compress_v.object.get("plainText")) |v| if (v == .bool) {
+                settings.compress_plain_text = v.bool;
             };
         };
     };

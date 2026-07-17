@@ -103,6 +103,8 @@ pub const CompressionConfig = struct {
     diff_compressor_enabled: bool = true,
     /// Enable CodeCompressor for source code.
     code_compressor_enabled: bool = true,
+    /// Enable PlainTextCompressor for generic text (bash output, file contents, etc.).
+    plain_text_compressor_enabled: bool = true,
     /// Enable Compress-Cache-Retrieve (stores originals for retrieval).
     ccr_enabled: bool = true,
     // Per-compressor overrides
@@ -132,6 +134,7 @@ pub fn compressToolResult(
         .log_compressor_enabled = config.log_compressor_enabled,
         .search_compressor_enabled = config.search_compressor_enabled,
         .diff_compressor_enabled = config.diff_compressor_enabled,
+        .plain_text_compressor_enabled = config.plain_text_compressor_enabled,
         .ccr_enabled = config.ccr_enabled,
         .max_items_after_crush = config.max_items_after_crush,
         .log_max_errors = config.log_max_errors,
@@ -154,6 +157,7 @@ pub fn compressToolResult(
                     // Too small to compress — pass through
                     if (maybe_stats) |s| {
                         s.bytes_before += input.len;
+                        s.bytes_after += input.len;
                         s.items_passthrough += 1;
                     }
                     const duped = block.dupe(allocator) catch continue;
@@ -167,6 +171,7 @@ pub fn compressToolResult(
                     // Still store original in CCR so the LLM can retrieve it.
                     if (maybe_stats) |s| {
                         s.bytes_before += input.len;
+                        s.bytes_after += input.len;
                         s.items_failed += 1;
                     }
                     std.log.warn("zompress compression failed: {}", .{err});
@@ -206,6 +211,7 @@ pub fn compressToolResult(
                 {
                     if (maybe_stats) |s| {
                         s.bytes_before += input.len;
+                        s.bytes_after += input.len;
                         s.items_passthrough += 1;
                     }
                     allocator.free(compress_result.compressed);
@@ -378,16 +384,20 @@ test "CompressionStats accumulates correctly" {
     stats.bytes_after += 200;
     stats.items_compressed += 1;
 
-    // Simulate a passthrough
+    // Simulate a passthrough (content passes through unchanged)
+    stats.bytes_before += 500;
+    stats.bytes_after += 500; // passthrough: after == before
     stats.items_passthrough += 1;
 
     // Simulate a failure (mutually exclusive from passthrough)
+    stats.bytes_before += 300;
+    stats.bytes_after += 300; // failure: original passed through unchanged
     stats.items_failed += 1;
 
-    try std.testing.expectEqual(@as(u64, 1000), stats.bytes_before);
-    try std.testing.expectEqual(@as(u64, 200), stats.bytes_after);
-    try std.testing.expectEqual(@as(u64, 800), stats.bytesSaved());
-    try std.testing.expect(stats.ratio() > 0.79 and stats.ratio() < 0.81);
+    try std.testing.expectEqual(@as(u64, 1800), stats.bytes_before);
+    try std.testing.expectEqual(@as(u64, 1000), stats.bytes_after);
+    try std.testing.expectEqual(@as(u64, 800), stats.bytesSaved()); // 1800 - 1000
+    try std.testing.expect(stats.ratio() > 0.43 and stats.ratio() < 0.46);
     try std.testing.expectEqual(@as(u64, 1), stats.items_compressed);
     try std.testing.expectEqual(@as(u64, 1), stats.items_passthrough);
     try std.testing.expectEqual(@as(u64, 1), stats.items_failed);

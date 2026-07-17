@@ -439,6 +439,7 @@ pub fn applyCompressionSettingsOverlay(
     if (settings.compress_search) |v| cfg.compress_search = v;
     if (settings.compress_diff) |v| cfg.compress_diff = v;
     if (settings.compress_code) |v| cfg.compress_code = v;
+    if (settings.compress_plain_text) |v| cfg.compress_plain_text = v;
 }
 
 /// Apply permissions settings overlay onto permission store.

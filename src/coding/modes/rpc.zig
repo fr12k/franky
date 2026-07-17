@@ -723,6 +723,7 @@ fn runPrompt(
                     .search_compressor_enabled = session.cfg.compress_search,
                     .diff_compressor_enabled = session.cfg.compress_diff,
                     .code_compressor_enabled = session.cfg.compress_code,
+                    .plain_text_compressor_enabled = session.cfg.compress_plain_text,
                     .ccr_enabled = session.cfg.compress_ccr,
                 };
                 lc.ccr_store = &session.ccr_store;

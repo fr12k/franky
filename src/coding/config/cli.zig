@@ -264,6 +264,8 @@ pub const Config = struct {
     compress_diff: bool = true,
     /// `--compress-code` — enable source code compression (default on).
     compress_code: bool = true,
+    /// `--compress-plain-text` — enable plain text compression for bash output, file contents, etc. (default on).
+    compress_plain_text: bool = true,
 
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
@@ -474,6 +476,14 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--no-compress-code")) {
         cfg.compress_code = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--compress-plain-text")) {
+        cfg.compress_plain_text = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-compress-plain-text")) {
+        cfg.compress_plain_text = false;
         return true;
     }
     return false;

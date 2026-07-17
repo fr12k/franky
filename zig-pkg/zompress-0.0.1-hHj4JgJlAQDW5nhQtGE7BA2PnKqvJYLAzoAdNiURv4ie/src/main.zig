@@ -40,6 +40,9 @@ pub const CompressConfig = struct {
     diff_max_context_lines: usize = 2,
     diff_max_hunks_per_file: usize = 10,
 
+    /// Plain text compression (bash output, file contents, etc.)
+    plain_text_compressor_enabled: bool = true,
+
     /// CCR
     ccr_enabled: bool = true,
 };
@@ -106,6 +109,14 @@ pub fn compressDiff(allocator: std.mem.Allocator, diff_text: []const u8, config:
 
     const dc = @import("diff_compressor.zig");
     return dc.compress(allocator, diff_text, config);
+}
+
+/// Convenience: compress plain text specifically.
+pub fn compressPlainText(allocator: std.mem.Allocator, text: []const u8, config: CompressConfig) !CompressResult {
+    if (text.len == 0) return CompressionError.EmptyInput;
+
+    const ptc = @import("plain_text_compressor.zig");
+    return ptc.compress(allocator, text, config);
 }
 
 /// Retrieve original content from the CCR store.
