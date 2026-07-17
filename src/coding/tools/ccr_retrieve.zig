@@ -49,6 +49,7 @@ pub fn toolWithCtx(ctx: ?*anyopaque) at.AgentTool {
             "Pass the hash key from a `<<<ccr:<hash> N_rows_offloaded>>>` marker.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
+        .skip_compression = true,
         .ctx = ctx,
         .execute = execute,
     };
