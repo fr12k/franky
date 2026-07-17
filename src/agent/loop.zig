@@ -1059,7 +1059,7 @@ fn runTurn(
 
         // v3.0 — compress tool result before emitting to transcript
         if (config.compression) |cc| {
-            if (cc.enabled and call_res.content.len > 0) {
+            if (cc.enabled and call_res.content.len > 0 and !tool_def.skip_compression) {
                 var old = call_res;
                 call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
                 old.deinit(allocator);
@@ -1241,7 +1241,7 @@ fn runToolsParallel(
 
             // v3.0 — compress tool result before emitting to transcript
             if (config.compression) |cc| {
-                if (cc.enabled and call_res.content.len > 0) {
+                if (cc.enabled and call_res.content.len > 0 and !w.tool_def.skip_compression) {
                     var old = call_res;
                     call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
                     old.deinit(allocator);

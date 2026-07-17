@@ -88,6 +88,10 @@ pub const AgentTool = struct {
     parameters_json: []const u8,
     execution_mode: ExecutionMode = .parallel,
     ctx: ?*anyopaque = null,
+    /// When true, the tool's result is never compressed even if compression
+    /// is enabled. Use this for tools whose output must remain intact for
+    /// the LLM to verify its own actions (e.g. edit/write confirmations).
+    skip_compression: bool = false,
     /// Runs the tool. Arguments arrive as a JSON string (authoritative).
     /// `on_update` may be invoked any number of times to stream progress.
     /// Returns a `ToolResult`; throwing is allowed — the loop will catch

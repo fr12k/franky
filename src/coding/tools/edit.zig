@@ -63,6 +63,7 @@ pub fn tool() at.AgentTool {
         .description = edit_description,
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
+        .skip_compression = true,
         .execute = execute,
     };
 }
@@ -73,6 +74,7 @@ pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
         .description = edit_description_workspace,
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
+        .skip_compression = true,
         .ctx = @ptrCast(@constCast(ws)),
         .execute = execute,
     };
