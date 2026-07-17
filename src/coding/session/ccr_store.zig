@@ -7,6 +7,9 @@
 //!
 //! The store is in-memory for the session lifetime. Persistence across
 //! sessions is a future enhancement.
+//!
+//! Keys are 12 hex characters (48 bits) — a truncated SHA-256.
+//! Collision probability at 1000 entries is ~10⁻⁹, negligible.
 
 const std = @import("std");
 
@@ -16,9 +19,12 @@ pub const default_max_entries: usize = 1000;
 /// Maximum total bytes of stored content before LRU eviction kicks in.
 pub const default_max_bytes: usize = 64 * 1024 * 1024; // 64 MB
 
+/// Length of CCR keys in hex characters (48 bits of SHA-256).
+pub const key_len: usize = 12;
+
 /// Session-scoped CCR store.
 ///
-/// Stores original content blobs keyed by a full SHA-256 hex hash.
+/// Stores original content blobs keyed by a 12-char truncated SHA-256 hex hash.
 /// Old entries are evicted via LRU when the cap is reached.
 pub const CcrSessionStore = struct {
     allocator: std.mem.Allocator,
@@ -30,10 +36,6 @@ pub const CcrSessionStore = struct {
     total_bytes: usize,
     /// LRU tracking: ordered list of keys, most-recently-used at the end.
     lru_keys: std.ArrayList([]const u8),
-    /// Reverse map from short (12-char) display keys to full 64-char keys.
-    /// Needed because `formatMarker` truncates keys for readability, but
-    /// `retrieve` must resolve the short key back to the full key for lookup.
-    short_to_full: std.StringHashMap([]const u8),
 
     pub fn init(allocator: std.mem.Allocator) CcrSessionStore {
         return .{
@@ -41,7 +43,6 @@ pub const CcrSessionStore = struct {
             .map = std.StringHashMap([]const u8).init(allocator),
             .max_entries = default_max_entries,
             .max_bytes = default_max_bytes,
-            .short_to_full = std.StringHashMap([]const u8).init(allocator),
             .total_bytes = 0,
             .lru_keys = .empty,
         };
@@ -54,19 +55,13 @@ pub const CcrSessionStore = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.map.deinit();
-        // Free short_to_full keys (values are pointers into map keys, not owned)
-        var sit = self.short_to_full.iterator();
-        while (sit.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.short_to_full.deinit();
         for (self.lru_keys.items) |k| self.allocator.free(k);
         self.lru_keys.deinit(self.allocator);
     }
 
     /// Store original content and return a hash key.
     /// The returned key is owned by the store and valid until the entry is evicted.
-    /// Uses full SHA-256 hex (64 characters) for the key.
+    /// Uses 12 hex chars (48 bits of SHA-256) — collision-free at session scale.
     pub fn store(self: *CcrSessionStore, original: []const u8) ![]const u8 {
         const key = try computeKey(self.allocator, original);
         errdefer self.allocator.free(key);
@@ -77,11 +72,6 @@ pub const CcrSessionStore = struct {
         // Remove old value if key already exists (content collision)
         if (self.map.fetchRemove(key)) |kv| {
             self.total_bytes -|= kv.value.len;
-            // Also remove from short_to_full reverse map
-            const old_short = kv.key[0..@min(kv.key.len, 12)];
-            if (self.short_to_full.fetchRemove(old_short)) |sfkv| {
-                self.allocator.free(sfkv.key);
-            }
             self.allocator.free(kv.key);
             self.allocator.free(kv.value);
         }
@@ -95,11 +85,6 @@ pub const CcrSessionStore = struct {
             const oldest_key = self.lru_keys.orderedRemove(0);
             if (self.map.fetchRemove(oldest_key)) |kv| {
                 self.total_bytes -|= kv.value.len;
-                // Also remove from short_to_full reverse map
-                const old_short = kv.key[0..@min(kv.key.len, 12)];
-                if (self.short_to_full.fetchRemove(old_short)) |sfkv| {
-                    self.allocator.free(sfkv.key);
-                }
                 self.allocator.free(kv.key);
                 self.allocator.free(kv.value);
             }
@@ -108,14 +93,6 @@ pub const CcrSessionStore = struct {
 
         try self.map.put(key, val);
         self.total_bytes += val.len;
-
-        // Also insert into short_to_full reverse map
-        const short_key = key[0..@min(key.len, 12)];
-        const short_duped = try self.allocator.dupe(u8, short_key);
-        // If a short key entry already exists (extremely unlikely — 12 hex chars = 48 bits),
-        // fetchPut returns the old entry whose key we must free.
-        const old_short = try self.short_to_full.fetchPut(short_duped, key);
-        if (old_short) |os| self.allocator.free(os.key);
 
         // Update LRU: remove old position if exists, then append
         for (self.lru_keys.items, 0..) |lk, i| {
@@ -133,28 +110,19 @@ pub const CcrSessionStore = struct {
     }
 
     /// Retrieve original content by hash key.
-    /// Accepts either a full 64-char SHA-256 key or a short 12-char display key.
-    /// Short keys are resolved via the short_to_full reverse map.
     pub fn retrieve(self: *CcrSessionStore, key: []const u8) ?[]const u8 {
-        // First try a direct lookup (full key)
-        var lookup_key: []const u8 = key;
-        if (self.map.get(key) == null) {
-            // Not found as full key — try resolving short key to full key
-            const full_key = self.short_to_full.get(key) orelse return null;
-            lookup_key = full_key;
-        }
-        const value = self.map.get(lookup_key) orelse return null;
+        const value = self.map.get(key) orelse return null;
 
         // Update LRU: move to end
         for (self.lru_keys.items, 0..) |lk, i| {
-            if (std.mem.eql(u8, lk, lookup_key)) {
+            if (std.mem.eql(u8, lk, key)) {
                 const removed = self.lru_keys.orderedRemove(i);
                 self.allocator.free(removed);
                 break;
             }
         }
 
-        const duped_key = self.allocator.dupe(u8, lookup_key) catch return value;
+        const duped_key = self.allocator.dupe(u8, key) catch return value;
         self.lru_keys.append(self.allocator, duped_key) catch {
             self.allocator.free(duped_key);
             return value;
@@ -165,12 +133,9 @@ pub const CcrSessionStore = struct {
 
     /// Format a CCR marker for embedding in compressed output.
     /// Uses a distinctive prefix to avoid collision with tool output.
-    /// The marker uses a 12-char truncated hash for readability;
-    /// the full 64-char hash is used internally for lookups.
+    /// The key is already 12 chars — no truncation needed.
     pub fn formatMarker(key: []const u8, count: usize, allocator: std.mem.Allocator) ![]const u8 {
-        // Use first 12 hex chars of the full SHA-256 for the display marker.
-        const display_key = if (key.len > 12) key[0..12] else key;
-        return std.fmt.allocPrint(allocator, "<<<ccr:{s} {d}_rows_offloaded>>>", .{ display_key, count });
+        return std.fmt.allocPrint(allocator, "<<<ccr:{s} {d}_rows_offloaded>>>", .{ key, count });
     }
 
     /// Parse a CCR marker to extract the hash key and count.
@@ -191,17 +156,18 @@ pub const CcrSessionStore = struct {
     }
 };
 
-/// Compute a full SHA-256 hex key for content.
-/// Returns 64 hex characters (256 bits) — collision-free at session scale.
+/// Compute a 12-char hex key for content (truncated SHA-256).
+/// 12 hex chars = 48 bits. Collision probability at 1000 entries is ~10⁻⁹.
 fn computeKey(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
     var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
     sha256.update(content);
     var digest: [32]u8 = undefined;
     sha256.final(&digest);
 
+    // Take first 6 bytes (48 bits) and hex-encode to 12 chars.
     const hex_chars = "0123456789abcdef";
-    var key_buf: [64]u8 = undefined;
-    for (0..32) |i| {
+    var key_buf: [key_len]u8 = undefined;
+    for (0..key_len / 2) |i| {
         key_buf[i * 2] = hex_chars[digest[i] >> 4];
         key_buf[i * 2 + 1] = hex_chars[digest[i] & 0x0f];
     }
@@ -260,6 +226,12 @@ test "compute key differs for different content" {
     try std.testing.expect(!std.mem.eql(u8, key1, key2));
 }
 
+test "CCR key length is 12" {
+    const key = try computeKey(std.testing.allocator, "test content");
+    defer std.testing.allocator.free(key);
+    try std.testing.expectEqual(@as(usize, key_len), key.len);
+}
+
 test "CCR store LRU eviction" {
     var store = CcrSessionStore.init(std.testing.allocator);
     store.max_entries = 3;
@@ -282,23 +254,17 @@ test "CCR store LRU eviction" {
     try std.testing.expect(store.retrieve(c) != null);
 }
 
-test "CCR store retrieve by short key (truncated display key)" {
+test "CCR store retrieve by key from marker" {
     var store = CcrSessionStore.init(std.testing.allocator);
     defer store.deinit();
 
-    const full_key = try store.store("some important content");
-    // full_key is 64 chars (SHA-256 hex)
-    try std.testing.expectEqual(@as(usize, 64), full_key.len);
+    const key = try store.store("some important content");
+    // key is 12 chars (truncated SHA-256)
+    try std.testing.expectEqual(@as(usize, key_len), key.len);
 
-    // Retrieving with the full key should work
-    try std.testing.expectEqualStrings("some important content", store.retrieve(full_key).?);
+    // Retrieving with the key should work
+    try std.testing.expectEqualStrings("some important content", store.retrieve(key).?);
 
-    // Retrieving with the truncated 12-char display key should also work
-    const short_key = full_key[0..12];
-    const short_duped = try std.testing.allocator.dupe(u8, short_key);
-    defer std.testing.allocator.free(short_duped);
-    try std.testing.expectEqualStrings("some important content", store.retrieve(short_duped).?);
-
-    // A non-existent short key should return null
+    // A non-existent key should return null
     try std.testing.expect(store.retrieve("nonexistent12") == null);
 }
