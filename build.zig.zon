@@ -12,7 +12,7 @@
     },
     .dependencies = .{
         .zompress = .{
-            .url = "https://github.com/fr12k/zompress/archive/refs/tags/v0.0.3.tar.gz",
+            .url = "https://github.com/fr12k/zompress/archive/refs/tags/v0.1.0.tar.gz",
             .hash = "zompress-0.0.1-hHj4JgJlAQDW5nhQtGE7BA2PnKqvJYLAzoAdNiURv4ie",
         },
     },
