@@ -31,6 +31,7 @@ pub fn tool() at.AgentTool {
         .description = "Create a new file with the given content.",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
+        .skip_compression = true,
         .execute = execute,
     };
 }
@@ -41,6 +42,7 @@ pub fn toolWithWorkspace(ws: *const workspace_mod.Workspace) at.AgentTool {
         .description = "Create a new file with the given content (path-safety enforced).",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
+        .skip_compression = true,
         .ctx = @constCast(@ptrCast(ws)),
         .execute = execute,
     };
