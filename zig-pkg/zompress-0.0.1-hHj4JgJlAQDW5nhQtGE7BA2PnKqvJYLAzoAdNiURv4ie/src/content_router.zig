@@ -102,11 +102,12 @@ test "ContentRouter compresses long plain text" {
     const config = @import("main.zig").CompressConfig{};
 
     // 50 lines of plain text — should trigger plain_text_compressor
-    var input = std.ArrayList(u8).init(a);
+    var input = std.ArrayList(u8).empty;
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         if (i > 0) try input.append(a, '\n');
-        try std.fmt.format(input.writer(), "this is plain text line {d}", .{i});
+        const line = try std.fmt.allocPrint(a, "this is plain text line {d}", .{i});
+        try input.appendSlice(a, line);
     }
 
     const result = try router.compress(a, input.items, config);
