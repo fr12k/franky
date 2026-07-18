@@ -1239,7 +1239,15 @@ pub const Request = struct {
         const old_connection = r.connection.?;
         const old_host = old_connection.host();
         var new_host_name_buffer: [HostName.max_len]u8 = undefined;
-        const new_host = try new_uri.getHost(&new_host_name_buffer);
+        const new_host = if (@hasDecl(std.Io.net.HostName, "fromUri"))
+            HostName.fromUri(new_uri, &new_host_name_buffer) catch |err| switch (err) {
+                error.UriMissingHost => return error.HttpRedirectLocationMissing,
+                error.InvalidHostName, error.NameTooLong => return error.HttpRedirectLocationInvalid,
+            }
+        else
+            new_uri.getHost(&new_host_name_buffer) catch |err| switch (err) {
+                error.UriMissingHost => return error.HttpRedirectLocationMissing,
+            };
         const keep_privileged_headers =
             std.ascii.eqlIgnoreCase(r.uri.scheme, new_uri.scheme) and
             old_host.sameParentDomain(new_host);
@@ -1359,7 +1367,17 @@ fn createProxyFromEnvVar(
 
     const uri = Uri.parse(content) catch try Uri.parseAfterScheme("http", content);
     const protocol = Protocol.fromUri(uri) orelse return null;
-    const raw_host = try uri.getHostAlloc(arena);
+    var raw_host_buffer: [HostName.max_len]u8 = undefined;
+    const raw_host = if (@hasDecl(std.Io.net.HostName, "fromUri"))
+        HostName.fromUri(uri, &raw_host_buffer) catch |err| switch (err) {
+            error.UriMissingHost => return null, // no host in URI => not a valid proxy
+            error.InvalidHostName, error.NameTooLong => return null, // invalid hostname => not a valid proxy
+        }
+    else
+        uri.getHostAlloc(arena) catch |err| switch (err) {
+            error.UriMissingHost => return null,
+            else => return err,
+        };
 
     const authorization: ?[]const u8 = if (uri.user != null or uri.password != null) a: {
         const authorization = try arena.alloc(u8, basic_authorization.valueLengthFromUri(uri));
@@ -1923,7 +1941,15 @@ pub fn request(
 
     const connection = options.connection orelse c: {
         var host_name_buffer: [HostName.max_len]u8 = undefined;
-        const host_name = try uri.getHost(&host_name_buffer);
+        const host_name = if (@hasDecl(std.Io.net.HostName, "fromUri"))
+            HostName.fromUri(uri, &host_name_buffer) catch |err| switch (err) {
+                error.UriMissingHost => return error.UnsupportedUriScheme,
+                error.InvalidHostName, error.NameTooLong => return error.HostUnreachable,
+            }
+        else
+            uri.getHost(&host_name_buffer) catch |err| switch (err) {
+                error.UriMissingHost => return error.UnsupportedUriScheme,
+            };
         break :c try client.connect(host_name, uriPort(uri, protocol), protocol);
     };
 
