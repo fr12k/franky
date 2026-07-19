@@ -255,6 +255,91 @@ fn emitChunked(
     }
 }
 
+/// Result of checking whether a path refers to an existing directory.
+/// Used by `resolveCwd` to decide whether to auto-clear a stale
+/// session cwd — only `gone` triggers that behaviour; `unknown`
+/// means we couldn't confirm the directory is missing (e.g. permission
+/// error) and should let the spawn attempt proceed normally.
+const DirCheck = enum { exists, gone, unknown };
+
+/// Check whether `path` refers to an existing directory.
+/// Returns `.exists` when `statFile` succeeds and the entry is a
+/// directory, `.gone` when the path is confirmed absent (ENOENT or
+/// ENOTDIR), and `.unknown` for any other error (EACCES, I/O, etc.)
+/// where the directory might still exist but we can't prove it.
+fn checkDir(io: std.Io, path: []const u8) DirCheck {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .gone,
+        else => return .unknown,
+    };
+    if (stat.kind == .directory) return .exists;
+    // Path exists but is not a directory (e.g. regular file).
+    return .gone;
+}
+
+/// Resolve the effective cwd for a bash invocation.
+///
+/// When a session-tracked cwd is stale (the directory was deleted by a
+/// prior command, e.g. `rm -rf /tmp/workdir` while the cwd still points
+/// there), `std.process.run` would fail with `error.FileNotFound` because
+/// the child's `chdir` fails. This was previously misreported as
+/// "bash_shell_missing: /bin/sh not found".
+///
+/// This function:
+///   - When the cwd directory exists: returns it unchanged.
+///   - When no cwd is set: returns `null` (inherit parent's cwd).
+///   - For **stale session-tracked** cwds confirmed `.gone`: clears the
+///     stale cwd from state and returns `null`. This matches how
+///     interactive shells behave when their cwd is deleted.
+///   - For **unknown** cwd status (e.g. permission error): returns
+///     the cwd as-is and lets the spawn attempt proceed. If the
+///     directory truly doesn't exist, the spawn's `FileNotFound`
+///     will produce an improved error message.
+///   - For **explicit** cwd args confirmed `.gone`: returns
+///     `error.CwdNotFound` so the caller can surface a clear error.
+///   - For **explicit** cwd args with `.unknown` status: also returns
+///     `error.CwdNotFound`, since the user-specified directory is
+///     unusable regardless of whether it's missing or inaccessible.
+const CwdResolveError = error{CwdNotFound};
+
+fn resolveCwd(
+    io: std.Io,
+    cwd_from_arg: ?[]const u8,
+    state: ?*SessionBashState,
+) CwdResolveError!?[]const u8 {
+    // No cwd at all — just inherit.
+    const cwd_opt: ?[]const u8 = cwd_from_arg orelse if (state) |s| s.getCwd() else null;
+    if (cwd_opt == null) return null;
+
+    // Fast path: directory exists — nothing to fix.
+    switch (checkDir(io, cwd_opt.?)) {
+        .exists => return cwd_opt,
+        .gone => {}, // fall through to stale-cwd handling
+        .unknown => {
+            // Can't confirm the directory is gone (e.g. permission error).
+            // For session-tracked cwds: don't clear it — let the spawn
+            // attempt proceed. If it truly doesn't exist, the spawn will
+            // fail with FileNotFound which now has an improved message.
+            // For explicit cwd args: treat as unusable.
+            if (cwd_from_arg != null) return error.CwdNotFound;
+            return cwd_opt;
+        },
+    }
+
+    // Directory is confirmed gone. Decide what to do based on source.
+    const had_explicit_cwd = cwd_from_arg != null;
+    if (had_explicit_cwd) {
+        // The model explicitly asked for this directory and it doesn't
+        // exist. Surface a clear error rather than letting the spawn
+        // fail with a misleading "shell not found".
+        return error.CwdNotFound;
+    }
+
+    // Stale session-tracked cwd. Clear it and fall back to inherit.
+    if (state) |s| s.cwd_buf.clearRetainingCapacity();
+    return null;
+}
+
 fn execute(
     self: *const at.AgentTool,
     allocator: std.mem.Allocator,
@@ -298,7 +383,12 @@ fn execute(
     }
 
     // Precedence: explicit `cwd` arg > session-tracked cwd > inherit.
-    const cwd_opt: ?[]const u8 = cwd_arg_opt orelse if (state) |s| s.getCwd() else null;
+    // v1.28.0 — resolveCwd validates the directory exists. If the
+    // session-tracked cwd is stale (directory was deleted by a prior
+    // command), it is cleared and we fall back to inherited cwd.
+    const cwd_opt = resolveCwd(io, cwd_arg_opt, state) catch |err| switch (err) {
+        error.CwdNotFound => return common.toolError(allocator, "bash_cwd_missing", "working directory does not exist"),
+    };
 
     // v1.7.4 — `background: true` detaches and returns.
     const background: bool = if (root.object.get("background")) |v|
@@ -338,7 +428,13 @@ fn execute(
         .timeout = timeout,
     }) catch |err| switch (err) {
         error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 8 MiB cap; redirect to a file or pipe through head/tail"),
-        error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "/bin/sh not found"),
+        // v1.28.0 — FileNotFound can mean either the shell binary
+        // is missing or the cwd directory doesn't exist. Since we now
+        // pre-validate the cwd via resolveCwd, the cwd case should be
+        // rare here (only for explicit cwd args that we couldn't auto-
+        // clear). Keep the error code for backward compat but improve
+        // the message.
+        error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "/bin/sh not found or working directory does not exist"),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute /bin/sh"),
         else => |e| return common.toolError(allocator, "bash_spawn_failed", @errorName(e)),
     };
@@ -434,7 +530,12 @@ fn executeWithCtx(
     }
 
     // Precedence: explicit `cwd` arg > session-tracked cwd > inherit.
-    const cwd_opt: ?[]const u8 = cwd_from_arg orelse if (state) |s| s.getCwd() else null;
+    // v1.28.0 — resolveCwd validates the directory exists. If the
+    // session-tracked cwd is stale (directory was deleted by a prior
+    // command), it is cleared and we fall back to inherited cwd.
+    const cwd_opt = resolveCwd(io, cwd_from_arg, state) catch |err| switch (err) {
+        error.CwdNotFound => return common.toolError(allocator, "bash_cwd_missing", "working directory does not exist"),
+    };
 
     // v1.7.4 — `background: true` detaches and returns.
     const background: bool = if (root.object.get("background")) |v|
@@ -483,7 +584,11 @@ fn executeWithCtx(
         .environ_map = if (filtered_env) |*m| m else null,
     }) catch |err| switch (err) {
         error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 8 MiB cap; redirect to a file or pipe through head/tail"),
-        error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "shell not found"),
+        // v1.28.0 — FileNotFound can mean either the shell binary
+        // is missing or the cwd directory doesn't exist. resolveCwd
+        // pre-validates for session-tracked cwds; explicit cwd args
+        // that don't exist will still reach this path.
+        error.FileNotFound => return common.toolError(allocator, "bash_shell_missing", "shell not found or working directory does not exist"),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute shell"),
         else => |e| return common.toolError(allocator, "bash_spawn_failed", @errorName(e)),
     };
@@ -1398,4 +1503,89 @@ test "bash tool: spill falls back to /tmp when state has no session dir (v1.27.2
     defer f.close(io);
     const len = try f.length(io);
     try testing.expect(len > 70 * 1024);
+}
+
+test "checkDir: returns .exists for existing directories" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    try testing.expect(checkDir(io, "/tmp") == .exists);
+    try testing.expect(checkDir(io, "/") == .exists);
+}
+
+test "checkDir: returns .gone for non-existent paths" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    try testing.expect(checkDir(io, "/no/such/directory/ever") == .gone);
+}
+
+test "checkDir: returns .gone for regular files" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    // Create a temp file and verify checkDir returns .gone for it.
+    const tmp_path = "/tmp/franky_test_checkDir_file";
+    const f = std.Io.Dir.cwd().createFile(io, tmp_path, .{}) catch |err| {
+        // If we cannot create the file (e.g. permissions), skip.
+        if (err == error.AccessDenied) return error.SkipZigTest;
+        return err;
+    };
+    f.close(io);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    try testing.expect(checkDir(io, tmp_path) == .gone);
+}
+
+test "resolveCwd: null arg + null state returns null" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const result = try resolveCwd(io, null, null);
+    try testing.expect(result == null);
+}
+
+test "resolveCwd: stale session cwd is cleared and returns null" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    // Set cwd to a non-existent path.
+    try state.setCwd("/no/such/directory/ever");
+    const result = try resolveCwd(io, null, &state);
+    // Stale cwd is auto-cleared; returns null (inherit).
+    try testing.expect(result == null);
+    // State cwd should be cleared.
+    try testing.expect(state.getCwd() == null);
+}
+
+test "resolveCwd: existing session cwd is preserved" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    try state.setCwd("/tmp");
+    const result = try resolveCwd(io, null, &state);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("/tmp", result.?);
+}
+
+test "resolveCwd: explicit cwd pointing to non-existent dir returns error.CwdNotFound" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const result = resolveCwd(io, "/no/such/directory/ever", null);
+    try testing.expectError(error.CwdNotFound, result);
+}
+
+test "resolveCwd: explicit cwd pointing to existing dir is returned" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const result = try resolveCwd(io, "/tmp", null);
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("/tmp", result.?);
 }
