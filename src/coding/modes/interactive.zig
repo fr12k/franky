@@ -1163,6 +1163,7 @@ fn runOneTurn(
                     .ccr_enabled = session.cfg.compress_ccr,
                 };
                 lc.ccr_store = &session.ccr_store;
+                lc.compression_stats = &session.compression_stats;
             }
             break :blk lc;
         },
@@ -1738,6 +1739,10 @@ const SessionBinding = struct {
     guardrail_state: agent.guardrails.GuardrailState = undefined,
     /// v3.0 — session-scoped CCR store for reversible compression.
     ccr_store: compression_mod.CcrSessionStore = undefined,
+    /// v3.0 — compression statistics.
+    compression_stats: compression_mod.CompressionStats = .{},
+    /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
+    ccr_ctx: compression_mod.CcrContext = undefined,
 
     /// Fills `binding` in place. Taking the destination pointer is
     /// required: the `FauxProvider`'s address gets registered with
@@ -1774,6 +1779,7 @@ const SessionBinding = struct {
             .startup_ms = ai.stream.nowMillis(),
             .ccr_store = compression_mod.CcrSessionStore.init(allocator),
         };
+        binding.ccr_ctx = .{ .store = &binding.ccr_store, .stats = &binding.compression_stats };
         binding.read_ctx = .{
             .workspace = if (binding.workspace) |*ws| ws else null,
         };
@@ -1982,7 +1988,7 @@ const SessionBinding = struct {
             final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
             final_tools[binding.tools.len + 2] = binding.guardrail_state.finishTaskTool();
             // v3.0 — ccr_retrieve tool for reversible compression
-            final_tools[binding.tools.len + 3] = tools_mod.ccr_retrieve.toolWithCtx(@ptrCast(&binding.ccr_store));
+            final_tools[binding.tools.len + 3] = tools_mod.ccr_retrieve.toolWithCtxAndStats(&binding.ccr_ctx);
             binding.tools = final_tools;
         }
 

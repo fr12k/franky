@@ -369,6 +369,8 @@ const Session = struct {
     ccr_store: compression_mod.CcrSessionStore = undefined,
     /// v3.0 — compression statistics for the status line.
     compression_stats: compression_mod.CompressionStats = .{},
+    /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
+    ccr_ctx: compression_mod.CcrContext = undefined,
 
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
@@ -718,6 +720,7 @@ fn initSession(
         .tool_usage = std.StringHashMap(u32).init(allocator),
         .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
+    session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(
         allocator,
@@ -861,7 +864,7 @@ fn initSession(
         final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
         final_tools[off + 2] = session.guardrail_state.finishTaskTool();
         // v3.0 — ccr_retrieve tool for reversible compression
-        final_tools[off + 3] = tools_mod.ccr_retrieve.toolWithCtx(@ptrCast(&session.ccr_store));
+        final_tools[off + 3] = tools_mod.ccr_retrieve.toolWithCtxAndStats(&session.ccr_ctx);
         session.tools = final_tools;
     }
 
@@ -2829,6 +2832,39 @@ fn respondUsage(
                 return;
             };
         }
+        body.appendSlice(allocator, ",\"bytesRetrieved\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.bytes_retrieved}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"netSaved\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [32]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{cs.netBytesSaved()}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+        body.appendSlice(allocator, ",\"netRatio\":") catch {
+            sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+            return;
+        };
+        {
+            var num: [64]u8 = undefined;
+            body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d:.3}", .{cs.netRatio()}) catch unreachable) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
         body.append(allocator, '}') catch {
             sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
             return;
@@ -3688,6 +3724,7 @@ fn initSessionForTestWithDir(
         .tool_usage = std.StringHashMap(u32).init(allocator),
         .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
+    session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(allocator, .{ .workspace_dir = "." }, io);
     session.session_gates = .{ .role = &session.role_gate };

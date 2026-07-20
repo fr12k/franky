@@ -27,6 +27,7 @@ const franky = @import("../../root.zig");
 const ai = franky.ai;
 const agent = franky.agent;
 const at = agent.types;
+const compression_mod = franky.coding.compression;
 const cli_mod = franky.coding.cli;
 const session_mod = @import("mod.zig");
 const branching_mod = @import("branching.zig");
@@ -49,6 +50,10 @@ pub const SessionState = struct {
     tree: branching_mod.Tree,
     /// v3.0 — session-scoped CCR store for reversible compression.
     ccr_store: ccr_store_mod.CcrSessionStore,
+    /// v3.0 — compression statistics for this session.
+    compression_stats: compression_mod.CompressionStats = .{},
+    /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
+    ccr_ctx: compression_mod.CcrContext = undefined,
 
     /// Initialise a `SessionState` from a parsed CLI config.
     ///
@@ -117,7 +122,7 @@ pub const SessionState = struct {
                 tree.switchTo(name) catch {};
                 session_mod.writeBranchTranscript(allocator, io, session_dir, &transcript, name) catch {};
             }
-            return .{
+            var state = SessionState{
                 .arena = arena,
                 .session_id = owned_id,
                 .parent_dir = parent_dir,
@@ -126,6 +131,8 @@ pub const SessionState = struct {
                 .tree = tree,
                 .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator),
             };
+            state.ccr_ctx = .{ .store = &state.ccr_store, .stats = &state.compression_stats };
+            return state;
         }
 
         // Case 2: --session <sid> provided — use it as-is.
@@ -145,7 +152,7 @@ pub const SessionState = struct {
             tree.switchTo(name) catch {};
         }
 
-        return .{
+        var state = SessionState{
             .arena = arena,
             .session_id = owned_id,
             .parent_dir = parent_dir,
@@ -154,6 +161,8 @@ pub const SessionState = struct {
             .tree = tree,
             .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator),
         };
+        state.ccr_ctx = .{ .store = &state.ccr_store, .stats = &state.compression_stats };
+        return state;
     }
 
     pub fn deinit(self: *SessionState, allocator: std.mem.Allocator) void {

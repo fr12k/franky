@@ -5,7 +5,10 @@
 //! compressed content when it needs details.
 //!
 //! The tool is registered alongside the compression config and injected
-//! with a reference to the session's CCR store via the `ctx` field.
+//! with a `CcrContext` (store + stats pointer) via the `ctx` field.
+//! When content is retrieved, the byte count is recorded in the session's
+//! compression stats so that `netBytesSaved` accurately reflects effective
+//! savings (gross savings minus bytes that re-enter the context).
 
 const std = @import("std");
 const ct = @import("../types.zig");
@@ -13,6 +16,7 @@ const at = ct.agent.types;
 const ai = ct.ai;
 const common = @import("common.zig");
 const ccr_store = @import("../session/ccr_store.zig");
+const compression_mod = @import("../compression.zig");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -28,15 +32,15 @@ pub const parameters_json: []const u8 =
     \\}
 ;
 
-/// Create a ccr_retrieve tool with a reference to the session's CCR store.
-pub fn tool(store: *ccr_store.CcrSessionStore) at.AgentTool {
+/// Create a ccr_retrieve tool with a CcrContext (store + stats pointer).
+pub fn tool(ctx: *compression_mod.CcrContext) at.AgentTool {
     return .{
         .name = "ccr_retrieve",
         .description = "Retrieve original content that was compressed during tool execution. " ++
             "Pass the hash key from a `<<<ccr:<hash> N_rows_offloaded>>>` marker.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
-        .ctx = @ptrCast(store),
+        .ctx = @ptrCast(ctx),
         .execute = execute,
     };
 }
@@ -51,6 +55,20 @@ pub fn toolWithCtx(ctx: ?*anyopaque) at.AgentTool {
         .execution_mode = .parallel,
         .skip_compression = true,
         .ctx = ctx,
+        .execute = execute,
+    };
+}
+
+/// Create a ccr_retrieve tool with a CcrContext that includes stats tracking.
+pub fn toolWithCtxAndStats(ctx: ?*compression_mod.CcrContext) at.AgentTool {
+    return .{
+        .name = "ccr_retrieve",
+        .description = "Retrieve original content that was compressed during tool execution. " ++
+            "Pass the hash key from a `<<<ccr:<hash> N_rows_offloaded>>>` marker.",
+        .parameters_json = parameters_json,
+        .execution_mode = .parallel,
+        .skip_compression = true,
+        .ctx = if (ctx) |c| @ptrCast(c) else null,
         .execute = execute,
     };
 }
@@ -79,11 +97,30 @@ fn execute(
     if (key_v != .string) return common.toolError(allocator, "invalid_args", "key must be a string");
     const key = key_v.string;
 
-    const store: *ccr_store.CcrSessionStore = @ptrCast(@alignCast(self.ctx orelse
-        return common.toolError(allocator, "no_store", "CCR store not available")));
+    // The ctx field points to a CcrContext struct (store + optional stats pointer).
+    // Fall back to raw CcrSessionStore pointer for backward compatibility with
+    // toolWithCtx() callers that haven't been migrated yet.
+    const ccr_ctx: ?*compression_mod.CcrContext = if (self.ctx) |raw| blk: {
+        // Try to interpret as CcrContext first.
+        // CcrContext has .store as the first field, so a valid CcrContext
+        // pointer is also a valid CcrSessionStore pointer for the old path.
+        break :blk @ptrCast(@alignCast(raw));
+    } else null;
+
+    const store: *ccr_store.CcrSessionStore = if (ccr_ctx) |ctx_node|
+        ctx_node.store
+    else
+        return common.toolError(allocator, "no_store", "CCR store not available");
 
     const original = store.retrieve(key) orelse
         return common.toolError(allocator, "not_found", "no content found for this CCR key (may have been evicted)");
+
+    // Record retrieved bytes in compression stats so net savings is accurate.
+    if (ccr_ctx) |ctx_node| {
+        if (ctx_node.stats) |stats| {
+            stats.bytes_retrieved += original.len;
+        }
+    }
 
     const content = try allocator.alloc(ai.types.ContentBlock, 1);
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, original) } };

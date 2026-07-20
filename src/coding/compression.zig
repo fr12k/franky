@@ -20,7 +20,8 @@ const ccr_store = @import("./session/ccr_store.zig");
 pub const CcrSessionStore = ccr_store.CcrSessionStore;
 
 /// Compression statistics tracked per-session for the status line.
-/// Updated by `compressToolResult` when a non-null pointer is provided.
+/// Updated by `compressToolResult` when a non-null pointer is provided,
+/// and by `ccr_retrieve` when original content is fetched back.
 ///
 /// Thread safety: the agent loop writes from a single thread (parallel
 /// tool paths join before stats access). The HTTP `/usage` handler reads
@@ -37,11 +38,18 @@ pub const CompressionStats = struct {
     items_passthrough: u64 = 0,
     /// Number of text blocks that failed compression (fell back to passthrough).
     items_failed: u64 = 0,
+    /// Total bytes of original content retrieved back via ccr_retrieve.
+    /// Each call to ccr_retrieve adds the length of the retrieved content.
+    /// This represents bytes that were "saved" by compression but are now
+    /// back in the context, so net savings = bytesSaved() - bytes_retrieved.
+    bytes_retrieved: u64 = 0,
 
     /// Mutex for thread-safe reads from the HTTP handler.
     mutex: std.Io.Mutex = .init,
 
     /// Bytes saved (before - after). Saturating subtraction.
+    /// This is the **gross** savings — the potential bytes removed from context
+    /// by compression, without accounting for bytes retrieved back via ccr_retrieve.
     pub fn bytesSaved(self: *const CompressionStats) u64 {
         return if (self.bytes_before > self.bytes_after)
             self.bytes_before - self.bytes_after
@@ -49,11 +57,33 @@ pub const CompressionStats = struct {
             0;
     }
 
+    /// Net bytes saved (gross savings minus bytes retrieved back via ccr_retrieve).
+    /// Saturating subtraction — cannot go below 0.
+    /// This is the **effective** savings accounting for the fact that retrieved
+    /// content re-enters the context.
+    pub fn netBytesSaved(self: *const CompressionStats) u64 {
+        const saved = self.bytesSaved();
+        return if (saved > self.bytes_retrieved)
+            saved - self.bytes_retrieved
+        else
+            0;
+    }
+
     /// Compression ratio as a float 0..1 (1 = 100% saved).
     /// Returns 0 when bytes_before is 0 (no data processed).
+    /// This is the **gross** ratio — does not account for retrieved bytes.
     pub fn ratio(self: *const CompressionStats) f64 {
         if (self.bytes_before == 0) return 0;
         return @as(f64, @floatFromInt(self.bytesSaved())) /
+            @as(f64, @floatFromInt(self.bytes_before));
+    }
+
+    /// Net compression ratio as a float 0..1 (1 = 100% effectively saved).
+    /// Returns 0 when bytes_before is 0.
+    /// Accounts for bytes retrieved back via ccr_retrieve.
+    pub fn netRatio(self: *const CompressionStats) f64 {
+        if (self.bytes_before == 0) return 0;
+        return @as(f64, @floatFromInt(self.netBytesSaved())) /
             @as(f64, @floatFromInt(self.bytes_before));
     }
 
@@ -67,6 +97,7 @@ pub const CompressionStats = struct {
             .items_compressed = self.items_compressed,
             .items_passthrough = self.items_passthrough,
             .items_failed = self.items_failed,
+            .bytes_retrieved = self.bytes_retrieved,
         };
     }
 
@@ -79,6 +110,14 @@ pub const CompressionStats = struct {
     pub fn unlock(self: *CompressionStats, io: std.Io) void {
         self.mutex.unlock(io);
     }
+};
+
+/// Context struct passed to the ccr_retrieve tool via its `ctx` field.
+/// Bundles the CCR store pointer with a pointer to the session's compression
+/// stats so that ccr_retrieve can record how many bytes are retrieved back.
+pub const CcrContext = struct {
+    store: *CcrSessionStore,
+    stats: ?*CompressionStats,
 };
 
 /// Compression configuration with sensible defaults.
@@ -404,4 +443,26 @@ test "CompressionStats accumulates correctly" {
 
     // Verify total = compressed + passthrough + failed
     try std.testing.expectEqual(@as(u64, 3), stats.items_compressed + stats.items_passthrough + stats.items_failed);
+
+    // Before any retrieval, netBytesSaved == bytesSaved
+    try std.testing.expectEqual(@as(u64, 800), stats.netBytesSaved());
+    try std.testing.expect(stats.netRatio() > 0.43 and stats.netRatio() < 0.46);
+
+    // Simulate retrieving back 300 bytes via ccr_retrieve
+    stats.bytes_retrieved += 300;
+
+    // Gross savings unchanged
+    try std.testing.expectEqual(@as(u64, 800), stats.bytesSaved());
+    // Net savings reduced by retrieved bytes
+    try std.testing.expectEqual(@as(u64, 500), stats.netBytesSaved()); // 800 - 300
+    // Net ratio is lower than gross ratio
+    try std.testing.expect(stats.netRatio() < stats.ratio());
+    try std.testing.expect(stats.netRatio() > 0.27 and stats.netRatio() < 0.29); // 500/1800 ≈ 0.278
+
+    // Simulate retrieving more bytes than were saved (edge case)
+    stats.bytes_retrieved += 600; // total retrieved = 900 > bytesSaved = 800
+
+    // netBytesSaved saturates to 0
+    try std.testing.expectEqual(@as(u64, 0), stats.netBytesSaved());
+    try std.testing.expectEqual(@as(f64, 0), stats.netRatio());
 }

@@ -134,6 +134,10 @@ const Session = struct {
     guardrail_state: agent.guardrails.GuardrailState = undefined,
     /// v3.0 — session-scoped CCR store for reversible compression.
     ccr_store: compression_mod.CcrSessionStore = undefined,
+    /// v3.0 — compression statistics.
+    compression_stats: compression_mod.CompressionStats = .{},
+    /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
+    ccr_ctx: compression_mod.CcrContext = undefined,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
@@ -250,6 +254,7 @@ fn initSession(
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
+    session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.session_gates = .{
         .role = &session.role_gate,
@@ -396,7 +401,7 @@ fn initSession(
     final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
     final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
     // v3.0 — ccr_retrieve tool for reversible compression
-    final_tools[session.tools.len + 2] = tools_mod.ccr_retrieve.toolWithCtx(@ptrCast(&session.ccr_store));
+    final_tools[session.tools.len + 2] = tools_mod.ccr_retrieve.toolWithCtxAndStats(&session.ccr_ctx);
     session.tools = final_tools;
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
@@ -727,6 +732,7 @@ fn runPrompt(
                     .ccr_enabled = session.cfg.compress_ccr,
                 };
                 lc.ccr_store = &session.ccr_store;
+                lc.compression_stats = &session.compression_stats;
             }
             break :blk lc;
         },
