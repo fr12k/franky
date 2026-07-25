@@ -381,6 +381,18 @@ Full list: `franky --help`. Highlights:
 | `FRANKY_CONNECT_TIMEOUT_MS` / `FRANKY_UPLOAD_TIMEOUT_MS` / `FRANKY_FIRST_BYTE_TIMEOUT_MS` / `FRANKY_EVENT_GAP_TIMEOUT_MS` | Override the matching `--*-timeout-ms` flag |
 | `ZEROBOX_ACTIVE` | Set externally to silence the sandbox warning |
 
+Commands run by the LLM-callable `bash` tool also receive current session metadata:
+
+| Variable | Purpose |
+|---|---|
+| `FRANKY_SESSION_ID` | Current session ID |
+| `FRANKY_SESSION_FILE` | Absolute transcript JSON path; unset for ephemeral / in-memory sessions |
+| `FRANKY_PROVIDER` | Currently selected model provider |
+| `FRANKY_MODEL` | Currently selected model ID |
+| `FRANKY_REASONING_LEVEL` | Current effective reasoning level: `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` (unset when `off`) |
+
+These are resolved when each command starts, so switching models or changing the reasoning level affects the next bash command without restarting. The bash tool description includes a hint to inspect these instead of inferring the model from the system prompt. Custom / factory-created bash tools can opt out via `expose_session_environment = false` on the `SessionBashState`; inherited values are still scrubbed so nested franky processes don't leak stale parent-session metadata.
+
 ### Bearer-token auth
 
 Franky no longer ships a built-in OAuth/PKCE/device-code minting flow

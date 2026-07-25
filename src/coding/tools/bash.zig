@@ -92,6 +92,31 @@ pub const SessionBashState = struct {
     /// rpc, and proxy bash invocations still get a spill path.
     session_dir_buf: std.ArrayList(u8) = .empty,
 
+    // ─── session metadata for env injection (v0.30.0) ───────────
+    /// The parent-process env map to clone for each bash command when no
+    /// workspace filter applies (the `execute` path). Set by mode drivers
+    /// alongside `setSessionMetadata`. Null → `execute` inherits the
+    /// parent env verbatim (legacy behavior) and only scrubs the five
+    /// `FRANKY_*` session vars.
+    parent_env: ?*const std.process.Environ.Map = null,
+    /// Owned copies of the session identity + model state. Empty buf →
+    /// the corresponding `FRANKY_*` variable is omitted. `thinking_level`
+    /// `.off` → `FRANKY_REASONING_LEVEL` is omitted.
+    session_id_buf: std.ArrayList(u8) = .empty,
+    session_file_buf: std.ArrayList(u8) = .empty,
+    provider_buf: std.ArrayList(u8) = .empty,
+    model_buf: std.ArrayList(u8) = .empty,
+    thinking_level: ai.types.ThinkingLevel = .off,
+    /// When true (default), the five `FRANKY_*` session vars are injected
+    /// into the child env. When false, inherited values are still scrubbed
+    /// so nested franky processes do not leak stale parent metadata.
+    expose_session_environment: bool = true,
+    has_session_metadata: bool = false,
+    /// v0.30.0 — owns the session-env hint appended to the bash tool
+    /// description when `expose_session_environment` is on, so `deinit`
+    /// can free it. Empty when the hint is disabled.
+    description_extra_buf: std.ArrayList(u8) = .empty,
+
     pub fn init(allocator: std.mem.Allocator) SessionBashState {
         return .{ .allocator = allocator };
     }
@@ -99,6 +124,11 @@ pub const SessionBashState = struct {
     pub fn deinit(self: *SessionBashState) void {
         self.cwd_buf.deinit(self.allocator);
         self.session_dir_buf.deinit(self.allocator);
+        self.session_id_buf.deinit(self.allocator);
+        self.session_file_buf.deinit(self.allocator);
+        self.provider_buf.deinit(self.allocator);
+        self.model_buf.deinit(self.allocator);
+        self.description_extra_buf.deinit(self.allocator);
     }
 
     pub fn setCwd(self: *SessionBashState, dir: []const u8) !void {
@@ -129,7 +159,76 @@ pub const SessionBashState = struct {
     pub fn defaultTimeoutMs(self: *const SessionBashState) u64 {
         return self.default_timeout_ms_override orelse default_timeout_ms;
     }
+
+    /// v0.30.0 — record the session identity + selected model state so the
+    /// bash tool can inject `FRANKY_SESSION_ID` / `FRANKY_SESSION_FILE` /
+    /// `FRANKY_PROVIDER` / `FRANKY_MODEL` / `FRANKY_REASONING_LEVEL` into
+    /// the child env of each command. `session_file` may be null (ephemeral
+    /// / rpc sessions). `provider`/`model` may be null when no model is
+    /// selected. `thinking` `.off` means `FRANKY_REASONING_LEVEL` is
+    /// omitted. Replaces any previously-set metadata.
+    pub fn setSessionMetadata(
+        self: *SessionBashState,
+        session_id: ?[]const u8,
+        session_file: ?[]const u8,
+        provider: ?[]const u8,
+        model: ?[]const u8,
+        thinking: ai.types.ThinkingLevel,
+    ) !void {
+        self.session_id_buf.clearRetainingCapacity();
+        self.session_file_buf.clearRetainingCapacity();
+        self.provider_buf.clearRetainingCapacity();
+        self.model_buf.clearRetainingCapacity();
+        if (session_id) |s| if (s.len > 0) try self.session_id_buf.appendSlice(self.allocator, s);
+        if (session_file) |s| if (s.len > 0) try self.session_file_buf.appendSlice(self.allocator, s);
+        if (provider) |s| if (s.len > 0) try self.provider_buf.appendSlice(self.allocator, s);
+        if (model) |s| if (s.len > 0) try self.model_buf.appendSlice(self.allocator, s);
+        self.thinking_level = thinking;
+        self.has_session_metadata = self.session_id_buf.items.len > 0 or
+            self.session_file_buf.items.len > 0 or
+            self.provider_buf.items.len > 0 or
+            self.model_buf.items.len > 0 or
+            thinking != .off;
+    }
 };
+
+/// v0.30.0 — the five `FRANKY_*` session-metadata env vars injected into
+/// the child env of bash commands. Always scrubbed from the inherited env
+/// first (so a nested franky process never leaks stale parent metadata);
+/// re-added from `SessionBashState` when `expose_session_environment` is on.
+const SESSION_ENV_VARS = [_][]const u8{
+    "FRANKY_SESSION_ID",
+    "FRANKY_SESSION_FILE",
+    "FRANKY_PROVIDER",
+    "FRANKY_MODEL",
+    "FRANKY_REASONING_LEVEL",
+};
+
+/// v0.30.0 — scrub inherited `FRANKY_*` session vars, then, when exposure
+/// is enabled and metadata is present, set them from `state`. Mutates
+/// `env` in place. Used by both `execute` and `executeWithCtx`.
+fn injectSessionEnv(
+    env: *std.process.Environ.Map,
+    state: ?*const SessionBashState,
+) void {
+    for (SESSION_ENV_VARS) |name| _ = env.swapRemove(name);
+    const s = state orelse return;
+    if (!s.expose_session_environment or !s.has_session_metadata) return;
+    if (s.session_id_buf.items.len > 0)
+        env.put("FRANKY_SESSION_ID", s.session_id_buf.items) catch {};
+    if (s.session_file_buf.items.len > 0)
+        env.put("FRANKY_SESSION_FILE", s.session_file_buf.items) catch {};
+    if (s.provider_buf.items.len > 0)
+        env.put("FRANKY_PROVIDER", s.provider_buf.items) catch {};
+    if (s.model_buf.items.len > 0)
+        env.put("FRANKY_MODEL", s.model_buf.items) catch {};
+    if (s.thinking_level != .off)
+        env.put("FRANKY_REASONING_LEVEL", s.thinking_level.toString()) catch {};
+}
+
+/// v0.30.0 — short hint appended to the bash tool description when session
+/// env exposure is on, so the model knows to inspect `FRANKY_*` vars.
+const session_env_hint = " Commands also receive FRANKY_SESSION_ID, FRANKY_SESSION_FILE, FRANKY_PROVIDER, FRANKY_MODEL, and FRANKY_REASONING_LEVEL describing the current session; inspect those instead of inferring the model from the system prompt.";
 
 /// Resolves the effective per-call default timeout for both the
 /// state-only and ctx-bearing execution paths. Used in places where
@@ -150,9 +249,20 @@ pub fn tool() at.AgentTool {
 }
 
 pub fn toolWithState(state: *SessionBashState) at.AgentTool {
+    // v0.30.0 — append the session-env hint to the description when
+    // exposure is on. The hint is stored in `description_extra_buf`
+    // (session-scoped, freed by `deinit`) so it lives as long as the
+    // tool. Falls back to the static base string on allocation failure.
+    const base = "Run a shell command (via /bin/sh -c). Cwd persists via SessionBashState across calls; the result includes a `[cwd]` footer so drift after an in-place `cd` is visible. Pass `resetCwd: true` to clear the tracked cwd before the call. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.";
+    const desc: []const u8 = if (state.expose_session_environment) blk: {
+        state.description_extra_buf.clearRetainingCapacity();
+        state.description_extra_buf.appendSlice(state.allocator, base) catch break :blk base;
+        state.description_extra_buf.appendSlice(state.allocator, session_env_hint) catch break :blk base;
+        break :blk state.description_extra_buf.items;
+    } else base;
     return .{
         .name = "bash",
-        .description = "Run a shell command (via /bin/sh -c). Cwd persists via SessionBashState across calls; the result includes a `[cwd]` footer so drift after an in-place `cd` is visible. Pass `resetCwd: true` to clear the tracked cwd before the call. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
+        .description = desc,
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(state),
@@ -170,9 +280,20 @@ pub const BashCtx = struct {
 };
 
 pub fn toolWithStateAndWorkspace(ctx: *BashCtx) at.AgentTool {
+    // v0.30.0 — append the session-env hint when exposure is on. Stored
+    // in the state's `description_extra_buf` (freed by `deinit`).
+    const base = "Run a shell command with session-tracked cwd + workspace path-safety + env denylist + shell-trust policy. Result includes a `[cwd]` footer so cwd drift is visible; pass `resetCwd: true` to clear the tracked cwd before the call. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.";
+    const desc: []const u8 = blk: {
+        const s = ctx.state orelse break :blk base;
+        if (!s.expose_session_environment) break :blk base;
+        s.description_extra_buf.clearRetainingCapacity();
+        s.description_extra_buf.appendSlice(s.allocator, base) catch break :blk base;
+        s.description_extra_buf.appendSlice(s.allocator, session_env_hint) catch break :blk base;
+        break :blk s.description_extra_buf.items;
+    };
     return .{
         .name = "bash",
-        .description = "Run a shell command with session-tracked cwd + workspace path-safety + env denylist + shell-trust policy. Result includes a `[cwd]` footer so cwd drift is visible; pass `resetCwd: true` to clear the tracked cwd before the call. Output truncates to last 2000 lines / 50 KB with on-disk spill — pipe through `head`/`tail`/`grep` for long output.",
+        .description = desc,
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(ctx),
@@ -197,6 +318,7 @@ fn runBackground(
     io: std.Io,
     command: []const u8,
     cwd: ?[]const u8,
+    state: ?*SessionBashState,
 ) !at.ToolResult {
     const ts: i64 = ai.stream.nowMillis();
     const out_file = try std.fmt.allocPrint(allocator, "/tmp/franky_bg_{d}.out", .{ts});
@@ -204,12 +326,22 @@ fn runBackground(
 
     const wrapper = "nohup sh -c \"$1\" sh > \"$2\" 2>&1 < /dev/null & echo $!";
 
+    // v0.30.0 — build a child env so session metadata is injected into
+    // background commands too (same pattern as execute/executeWithCtx).
+    var child_env: ?std.process.Environ.Map = if (state) |s|
+        if (s.parent_env) |pe| try pe.clone(allocator) else null
+    else
+        null;
+    defer if (child_env) |*m| m.deinit();
+    if (child_env) |*m| injectSessionEnv(m, state);
+
     const argv = [_][]const u8{ "/bin/sh", "-c", wrapper, "__franky_bg", command, out_file };
     const result = std.process.run(allocator, io, .{
         .argv = &argv,
         .cwd = if (cwd) |c| std.process.Child.Cwd{ .path = c } else .inherit,
         .stdout_limit = std.Io.Limit.limited(256),
         .stderr_limit = std.Io.Limit.limited(1024),
+        .environ_map = if (child_env) |*m| m else null,
     }) catch |err| return common.toolError(allocator, "bash_spawn_failed", @errorName(err));
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -395,7 +527,7 @@ fn execute(
         (v == .bool and v.bool)
     else
         false;
-    if (background) return try runBackground(allocator, io, command, cwd_opt);
+    if (background) return try runBackground(allocator, io, command, cwd_opt, state);
 
     const eff_default_ms: u64 = resolveDefaultTimeoutMs(state);
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
@@ -420,12 +552,26 @@ fn execute(
 
     const argv = [_][]const u8{ "/bin/sh", "-c", wrapped };
 
+    // v0.30.0 — build a child env so session metadata can be injected and
+    // inherited `FRANKY_*` vars scrubbed. When a `SessionBashState` is
+    // wired, clone its `parent_env` (if set) into a mutable map, inject,
+    // and pass it to the child. When `state` is null (the stateless
+    // `tool()` factory, used only in tests), inherit the parent env
+    // verbatim as before — we cannot inject without a parent_env base.
+    var child_env: ?std.process.Environ.Map = if (state) |s|
+        if (s.parent_env) |pe| try pe.clone(allocator) else null
+    else
+        null;
+    defer if (child_env) |*m| m.deinit();
+    if (child_env) |*m| injectSessionEnv(m, state);
+
     const result = std.process.run(allocator, io, .{
         .argv = &argv,
         .cwd = if (cwd_opt) |c| std.process.Child.Cwd{ .path = c } else .inherit,
         .stdout_limit = std.Io.Limit.limited(max_output_bytes),
         .stderr_limit = std.Io.Limit.limited(max_output_bytes),
         .timeout = timeout,
+        .environ_map = if (child_env) |*m| m else null,
     }) catch |err| switch (err) {
         error.StreamTooLong => return common.toolError(allocator, "bash_output_too_large", "output exceeded 8 MiB cap; redirect to a file or pipe through head/tail"),
         // v1.28.0 — FileNotFound can mean either the shell binary
@@ -542,7 +688,7 @@ fn executeWithCtx(
         (v == .bool and v.bool)
     else
         false;
-    if (background) return try runBackground(allocator, io, command, cwd_opt);
+    if (background) return try runBackground(allocator, io, command, cwd_opt, state);
 
     const eff_default_ms: u64 = resolveDefaultTimeoutMs(state);
     const timeout_ms: u64 = if (root.object.get("timeoutMs")) |v| blk: {
@@ -557,11 +703,21 @@ fn executeWithCtx(
 
     // §R.5 shell choice + §R.6 env filter.
     const shell = if (workspace) |ws| workspace_mod.chosenShell(ws, ws.host_env) else "/bin/sh";
+    // v0.30.0 — build a mutable env map so session metadata can be
+    // injected/scrubbed, but only when we have a base to start from.
+    // When a workspace filter applies, start from it; otherwise clone
+    // the session's `parent_env` (if set) so the child still inherits
+    // PATH etc. When neither is available, pass null so std.process.run
+    // inherits the parent env verbatim (legacy behavior) — we cannot
+    // scrub/inject without a base, but that only happens when a mode
+    // driver forgot to set `parent_env`, which all four do.
     var filtered_env: ?std.process.Environ.Map = if (workspace) |ws|
-        try workspace_mod.filteredEnv(allocator, ws)
+        (try workspace_mod.filteredEnv(allocator, ws)) orelse std.process.Environ.Map.init(allocator)
+    else if (state) |s| if (s.parent_env) |pe| try pe.clone(allocator) else null
     else
         null;
     defer if (filtered_env) |*m| m.deinit();
+    if (filtered_env) |*m| injectSessionEnv(m, state);
 
     // Wrap the user command so $PWD is captured after the command
     // exits. Grouping + preserving `$?` keeps exit-code semantics
@@ -1588,4 +1744,116 @@ test "resolveCwd: explicit cwd pointing to existing dir is returned" {
     const result = try resolveCwd(io, "/tmp", null);
     try testing.expect(result != null);
     try testing.expectEqualStrings("/tmp", result.?);
+}
+
+// ─── v0.30.0 session-env tests ────────────────────────────────────
+
+/// Helper: build a minimal parent env map with PATH so the shell can run.
+fn buildTestEnvMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    var m = std.process.Environ.Map.init(allocator);
+    try m.put("PATH", "/usr/bin:/bin");
+    try m.put("FRANKY_SESSION_ID", "stale-parent-value"); // scrubbed
+    return m;
+}
+
+test "session env: injectSessionEnv sets FRANKY_* from state" {
+    const gpa = testing.allocator;
+    var env = try buildTestEnvMap(gpa);
+    defer env.deinit();
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    try state.setSessionMetadata("s1", "/tmp/s1/transcript.json", "anthropic", "claude-sonnet-4-5", .high);
+
+    injectSessionEnv(&env, &state);
+
+    try testing.expectEqualStrings("s1", env.get("FRANKY_SESSION_ID").?);
+    try testing.expectEqualStrings("/tmp/s1/transcript.json", env.get("FRANKY_SESSION_FILE").?);
+    try testing.expectEqualStrings("anthropic", env.get("FRANKY_PROVIDER").?);
+    try testing.expectEqualStrings("claude-sonnet-4-5", env.get("FRANKY_MODEL").?);
+    try testing.expectEqualStrings("high", env.get("FRANKY_REASONING_LEVEL").?);
+}
+
+test "session env: thinking .off omits FRANKY_REASONING_LEVEL" {
+    const gpa = testing.allocator;
+    var env = try buildTestEnvMap(gpa);
+    defer env.deinit();
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    try state.setSessionMetadata("s2", null, "openai", "gpt-4o", .off);
+
+    injectSessionEnv(&env, &state);
+
+    try testing.expectEqualStrings("s2", env.get("FRANKY_SESSION_ID").?);
+    try testing.expect(env.get("FRANKY_SESSION_FILE") == null);
+    try testing.expect(env.get("FRANKY_REASONING_LEVEL") == null);
+}
+
+test "session env: expose_session_environment=false scrubs inherited values" {
+    const gpa = testing.allocator;
+    var env = try buildTestEnvMap(gpa);
+    defer env.deinit();
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    state.expose_session_environment = false;
+    try state.setSessionMetadata("s3", "/tmp/s3/transcript.json", "google-gemini", "gemini-pro", .medium);
+
+    injectSessionEnv(&env, &state);
+
+    // Even with metadata set, exposure disabled → all five scrubbed.
+    try testing.expect(env.get("FRANKY_SESSION_ID") == null);
+    try testing.expect(env.get("FRANKY_SESSION_FILE") == null);
+    try testing.expect(env.get("FRANKY_PROVIDER") == null);
+    try testing.expect(env.get("FRANKY_MODEL") == null);
+    try testing.expect(env.get("FRANKY_REASONING_LEVEL") == null);
+}
+
+test "session env: null state still scrubs inherited FRANKY_* vars" {
+    const gpa = testing.allocator;
+    var env = try buildTestEnvMap(gpa);
+    defer env.deinit();
+
+    injectSessionEnv(&env, null);
+
+    // The stale parent value must be gone.
+    try testing.expect(env.get("FRANKY_SESSION_ID") == null);
+    // Non-FRANKY vars are untouched.
+    try testing.expect(env.get("PATH") != null);
+}
+
+test "session env: bash execute injects FRANKY_* into child env" {
+    // End-to-end: a bash command run through toolWithState sees the
+    // session metadata as env vars. Requires a parent_env on the state
+    // so the child shell inherits PATH.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var parent_env = try buildTestEnvMap(gpa);
+    defer parent_env.deinit();
+
+    var state = SessionBashState.init(gpa);
+    defer state.deinit();
+    state.parent_env = &parent_env;
+    try state.setSessionMetadata("e2e-1", "/tmp/e2e/transcript.json", "anthropic", "claude-sonnet-4-5", .high);
+
+    var cancel: ai.stream.Cancel = .{};
+    const t = toolWithState(&state);
+    const args =
+        \\{"command":"printf '%s\n%s\n%s\n%s\n%s\n' \"$FRANKY_SESSION_ID\" \"$FRANKY_SESSION_FILE\" \"$FRANKY_PROVIDER\" \"$FRANKY_MODEL\" \"$FRANKY_REASONING_LEVEL\""}
+    ;
+    var res = try t.execute(&t, gpa, io, "e2e-1", args, &cancel, .{});
+    defer res.deinit(gpa);
+
+    const txt = res.content[0].text.text;
+    try testing.expect(std.mem.indexOf(u8, txt, "e2e-1") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "/tmp/e2e/transcript.json") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "anthropic") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "claude-sonnet-4-5") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "high") != null);
+    // The stale inherited value must NOT appear.
+    try testing.expect(std.mem.indexOf(u8, txt, "stale-parent-value") == null);
 }

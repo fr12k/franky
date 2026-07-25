@@ -1925,6 +1925,25 @@ const SessionBinding = struct {
         binding.guardrail_state.restart_requested = &binding.restart_requested;
 
         binding.provider = try print_mode.resolveProvider(allocator, environ, cfg);
+        // v0.30.0 — expose session metadata to the bash tool's child env.
+        // Interactive mode keeps the transcript in-memory (no persistent
+        // session file), so `FRANKY_SESSION_FILE` is unset. The session id
+        // is derived from the startup timestamp (matches the diagnostics
+        // persist id `interactive-<ms>`). Provider/model/reasoning are
+        // always available.
+        binding.bash_state.parent_env = environ_map;
+        const iid = std.fmt.allocPrint(
+            binding.arena.allocator(),
+            "interactive-{d}",
+            .{binding.startup_ms},
+        ) catch "";
+        binding.bash_state.setSessionMetadata(
+            iid,
+            null,
+            binding.provider.provider_name,
+            binding.provider.model_id,
+            binding.cfg.thinking,
+        ) catch {};
         try binding.registry.register(.{
             .api = "faux",
             .provider = "faux",

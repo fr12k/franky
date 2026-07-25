@@ -305,6 +305,20 @@ fn runPrint(
             offload_dir_path = std.fs.path.join(allocator, &.{ sd, "offloaded-tool-results" }) catch null;
         }
     }
+    // v0.30.0 — expose session metadata to the bash tool's child env.
+    resolved.bash_state.parent_env = environ_map;
+    const tfile: ?[]const u8 = if (session_dir_path) |sd|
+        std.fs.path.join(allocator, &.{ sd, "transcript.json" }) catch null
+    else
+        null;
+    defer if (tfile) |p| allocator.free(p);
+    resolved.bash_state.setSessionMetadata(
+        session_state.id(),
+        tfile,
+        resolved.provider_name,
+        resolved.model_id,
+        resolved.thinking_level,
+    ) catch {};
 
     // v1.18.0 — per-session log file (opt-in via --log-per-session).
     maybeReinitLoggerForSession(allocator, io, cfg, environ_map, session_state.id());

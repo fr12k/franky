@@ -118,6 +118,10 @@ const Session = struct {
     cfg: *cli_mod.Config,
     environ_map: *std.process.Environ.Map,
     cancel: ai.stream.Cancel = .{},
+    /// v0.30.0 — process-scoped session id (e.g. `rpc-<ms>`) used for
+    /// bash spill dir + `FRANKY_SESSION_ID` env injection. Owned by the
+    /// session arena; empty when `FRANKY_HOME`/`HOME` is unset.
+    session_id: []const u8 = "",
     /// v1.19.0 — resolved per-tool-prompt toggle. CLI `--prompts`
     /// wins; otherwise honors settings.json `prompts: bool`.
     prompts_enabled: bool = false,
@@ -293,6 +297,9 @@ fn initSession(
             const sd = try std.fs.path.join(allocator, &.{ hr, rpc_id });
             defer allocator.free(sd);
             session.bash_state.setSessionDir(sd) catch {};
+            // v0.30.0 — keep the rpc id for env injection once the provider
+            // is resolved below.
+            session.session_id = try session.role_arena.allocator().dupe(u8, rpc_id);
         }
     }
 
@@ -324,6 +331,18 @@ fn initSession(
     session.guardrail_state.setupAutoCommitBranch(allocator, io);
 
     session.provider = try print_mode.resolveProviderIo(allocator, io, environ, cfg);
+
+    // v0.30.0 — expose session metadata to the bash tool's child env.
+    // Provider/model are only known after `resolveProviderIo`; the session
+    // id was minted above. Rpc sessions have no transcript file.
+    session.bash_state.parent_env = session.environ_map;
+    session.bash_state.setSessionMetadata(
+        session.session_id,
+        null,
+        session.provider.provider_name,
+        session.provider.model_id,
+        session.cfg.thinking,
+    ) catch {};
 
     try session.registry.register(.{
         .api = "faux",
