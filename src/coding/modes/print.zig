@@ -1631,10 +1631,43 @@ pub fn buildSystemPromptIo(
     }
     defer if (compression_owned) allocator.free(with_compression);
 
-    if (cfg.append_system_prompt) |extra| {
+    // v3.2 — memory tools hint: tell the LLM about memory_search and
+    // memory_save so new sessions know to search memory. Gated by
+    // cfg.memory_enabled (default true; disable via --no-memory or
+    // settings.json tools.memory.enabled=false).
+    var with_memory: []u8 = with_compression;
+    var memory_owned = false;
+    if (cfg.memory_enabled) {
         const trimmed = std.mem.trimEnd(u8, if (compression_owned) with_compression else if (review_owned) with_review else with_skills, &std.ascii.whitespace);
+        with_memory = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n## Memory Tools\n\n" ++
+            "You have access to persistent memory that survives across sessions:\n\n" ++
+            "- **memory_search**: Search for relevant memories from previous sessions.\n" ++
+            "  Use this when you need to recall user preferences, past decisions, or\n" ++
+            "  facts established in earlier conversations. Pass a natural language\n" ++
+            "  query; results are ranked by relevance.\n\n" ++
+            "- **memory_save**: Save a fact, decision, preference, or instruction to\n" ++
+            "  persistent memory. Only save information that is:\n" ++
+            "  - Durable: not one-time or transient\n" ++
+            "  - Self-contained: makes sense without conversation context\n" ++
+            "  - User or AI centric: the subject is \"User\" or \"AI\"\n\n" ++
+            "When you finish a task, consider whether anything worth remembering happened.\n" ++
+            "If so, save it with memory_save before calling finish_task.\n",
+            .{trimmed},
+        );
+        memory_owned = true;
+    }
+    defer if (memory_owned) allocator.free(with_memory);
+
+    if (cfg.append_system_prompt) |extra| {
+        const trimmed = std.mem.trimEnd(u8, if (memory_owned) with_memory else if (compression_owned) with_compression else if (review_owned) with_review else with_skills, &std.ascii.whitespace);
         const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
         return out;
+    }
+    if (memory_owned) {
+        memory_owned = false;
+        return with_memory;
     }
     if (compression_owned) {
         compression_owned = false;

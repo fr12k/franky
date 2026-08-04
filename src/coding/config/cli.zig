@@ -267,6 +267,13 @@ pub const Config = struct {
     /// `--compress-plain-text` — enable plain text compression for bash output, file contents, etc. (default on).
     compress_plain_text: bool = true,
 
+    /// v3.2 — `--memory` / `--no-memory` — enable/disable the memory
+    /// tools (memory_search, memory_save) and the `## Memory Tools`
+    /// system-prompt section. Default on; settings.json `tools.memory.enabled`
+    /// overlays the default. When off, the memory tools are not
+    /// registered and the system prompt contains no memory guidance.
+    memory_enabled: bool = true,
+
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
 
@@ -484,6 +491,14 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--no-compress-plain-text")) {
         cfg.compress_plain_text = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--memory")) {
+        cfg.memory_enabled = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-memory")) {
+        cfg.memory_enabled = false;
         return true;
     }
     return false;

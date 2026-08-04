@@ -442,6 +442,15 @@ pub fn applyCompressionSettingsOverlay(
     if (settings.compress_plain_text) |v| cfg.compress_plain_text = v;
 }
 
+/// v3.2 — apply `tools.memory.enabled` settings.json overlay onto `cfg`.
+/// Settings fill in when CLI didn't set them (CLI always wins).
+pub fn applyMemorySettingsOverlay(
+    cfg: *cli_mod.Config,
+    settings: *const settings_mod.Settings,
+) void {
+    if (settings.memory_enabled) |v| cfg.memory_enabled = v;
+}
+
 /// Apply permissions settings overlay onto permission store.
 pub fn applyPermissionsSettingsOverlay(
     store: *permissions_mod.Store,
@@ -915,6 +924,7 @@ pub fn resolve(
     applyMaxTurnsSettingsOverlay(cfg, &settings);
     applyRetrySettingsOverlay(cfg, &settings);
     applyCompressionSettingsOverlay(cfg, &settings);
+    applyMemorySettingsOverlay(cfg, &settings);
 
     // ── Step 5: Resolve provider ──────────────────────────────────
     const provider = try resolveProvider(allocator, io, cfg, environ_map);
