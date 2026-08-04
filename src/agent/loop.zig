@@ -1138,6 +1138,18 @@ fn parallelWorker(w: *ParWork) void {
     w.out_result = r;
 }
 
+/// v1.30.0 — safety deadline for the parallel-tool poll loop. The
+/// subagent tool enforces its own `timeout_ms` via a supervisor
+/// thread that fires the sub-agent's `Cancel`, but a worker thread
+/// that panics or wedges without flipping `done_flag` would otherwise
+/// hang the main loop forever (the "phantom subagent" hang). This is
+/// a generous upper bound — well above `subagent.max_timeout_ms`
+/// (2 h) — so it only ever fires when something has already gone
+/// wrong. When it trips, every still-unjoined worker is treated as a
+/// `timeout` error result and its thread is detached (leaked) rather
+/// than blocking the loop indefinitely.
+const parallel_batch_deadline_ms: i64 = 7_200_000 + 300_000; // max subagent timeout + 5 min margin
+
 fn runToolsParallel(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1222,6 +1234,15 @@ fn runToolsParallel(
         remaining += 1;
     };
 
+    // v1.30.0 — bound the poll loop so a wedged worker (one whose
+    // `done_flag` never flips — e.g. a subagent supervisor that
+    // failed to cancel, or a panic in the worker) can't hang the
+    // main loop forever. The deadline is generous (2h05m) so it only
+    // trips when something has already gone wrong; on trip, every
+    // still-unjoined worker is reported as a `timeout` error and its
+    // thread is detached (leaked) rather than blocking indefinitely.
+    const batch_deadline_ms: i64 = ai.stream.nowMillis() + parallel_batch_deadline_ms;
+
     while (remaining > 0) {
         var progress = false;
         for (workers, 0..) |*w, i| {
@@ -1255,6 +1276,79 @@ fn runToolsParallel(
             progress = true;
         }
         if (!progress) io.sleep(.fromMilliseconds(1), .awake) catch {};
+
+        // v1.30.0 — deadline trip: force-complete any wedged workers.
+        if (remaining > 0 and ai.stream.nowMillis() >= batch_deadline_ms) {
+            for (workers, 0..) |*w, i| {
+                if (emitted[i]) continue;
+                // Re-check done_flag: a worker that flipped between the
+                // normal poll above and this deadline block is NOT wedged
+                // — it just completed. Join it and use its real result so
+                // we don't (a) report a false timeout and (b) detach a
+                // thread that is about to write to `workers[i]` after we
+                // free the array (use-after-free). Only workers that are
+                // STILL not done are genuinely wedged and get detached.
+                // Multi-model review flagged this as the top HIGH finding.
+                if (w.done_flag.load(.acquire)) {
+                    threads[i].?.join();
+                    var call_res: at.ToolResult = if (w.out_result) |r|
+                        r
+                    else
+                        try makeErrorResult(allocator, w.err_name orelse "tool failed");
+                    if (config.after_tool_call) |hook| {
+                        hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
+                    }
+                    if (config.guardrails) |gr| gr.afterToolCall(&w.tool_def, w.tc.id, &call_res);
+                    if (config.compression) |cc| {
+                        if (cc.enabled and call_res.content.len > 0 and !w.tool_def.skip_compression) {
+                            var old = call_res;
+                            call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
+                            old.deinit(allocator);
+                        }
+                    }
+                    try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, call_res);
+                    slot_results[i] = call_res;
+                    emitted[i] = true;
+                    remaining -= 1;
+                    progress = true;
+                    continue;
+                }
+                // Genuinely wedged — `done_flag` still false after the
+                // deadline. Synthesize a timeout error, emit the end event,
+                // and detach the thread (leak) rather than joining a
+                // thread that may never return. The thread will eventually
+                // exit when its subagent's own supervisor/timeout fires;
+                // detaching just means we don't wait for it.
+                if (threads[i]) |t| t.detach();
+                // Build an owned message. `allocPrint` can fail (OOM);
+                // fall back to a static literal that `makeErrorResult`
+                // dupes anyway, so we never free the fallback.
+                const owned_msg = std.fmt.allocPrint(
+                    allocator,
+                    "parallel tool batch deadline ({d} ms) exceeded; worker for call_id={s} did not complete",
+                    .{ parallel_batch_deadline_ms, w.tc.id },
+                ) catch null;
+                defer if (owned_msg) |m| allocator.free(m);
+                const msg: []const u8 = owned_msg orelse "parallel tool batch deadline exceeded";
+                var call_res = try makeErrorResult(allocator, msg);
+                // v1.30.1 — classify the synthetic result as a timeout so
+                // consumers keying off `tool_code` (like the subagent tool's
+                // own errorResult path) can distinguish it from a generic
+                // agent_error. Owned by `call_res`'s allocator (freed in deinit).
+                call_res.tool_code = try allocator.dupe(u8, "timeout");
+                if (config.after_tool_call) |hook| {
+                    hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
+                }
+                if (config.guardrails) |gr| gr.afterToolCall(&w.tool_def, w.tc.id, &call_res);
+                try pushToolEnd(out, io, allocator, w.tc.id, w.tool_def, call_res);
+                slot_results[i] = call_res;
+                emitted[i] = true;
+                remaining -= 1;
+                progress = true;
+            }
+            // Loop once more to drain `progress`; the `remaining > 0`
+            // guard then exits the outer while.
+        }
     }
 
     // Results appended in source order — preserves the

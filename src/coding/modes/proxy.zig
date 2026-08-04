@@ -4096,6 +4096,19 @@ test "proxy: served app.js wires v1.7.8 retry + edit" {
     try testing.expect(std.mem.indexOf(u8, web_app_js, "case 'fill_input':") != null);
 }
 
+test "proxy: served app.js wires v1.30.0 subagent panel reconciliation" {
+    // v1.30.0 — createSubagentSection is idempotent (guards against
+    // the 24-row accumulation bug where rehydrate + live SSE re-added
+    // rows for the same callId).
+    try testing.expect(std.mem.indexOf(u8, web_app_js, "v1.30.0 — idempotent") != null);
+    // reconcileSubagentPanel demotes any still-running row to cancelled
+    // at the end of rehydrate so a persisted transcript never renders
+    // a phantom running subagent.
+    try testing.expect(std.mem.indexOf(u8, web_app_js, "function reconcileSubagentPanel()") != null);
+    try testing.expect(std.mem.indexOf(u8, web_app_js, "reconcileSubagentPanel();") != null);
+    try testing.expect(std.mem.indexOf(u8, web_app_js, "'cancelled'") != null);
+}
+
 test "proxy: served app.js wires v1.7.7 history nav + status line + help overlay" {
     // History — localStorage ring with ↑/↓ navigation.
     try testing.expect(std.mem.indexOf(u8, web_app_js, "function loadHistory()") != null);

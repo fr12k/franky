@@ -1911,6 +1911,17 @@ function highlightCodeBlocks(container) {
     function createSubagentSection(callId, argsJson) {
         if (!subagentPanelEl) return null;
 
+        // v1.30.0 — idempotent: if a section for this callId already
+        // exists (can happen when the live `tool_execution_start` path
+        // and the rehydrate `appendFinalizedToolCard` path both fire for
+        // the same call, or when an SSE replay re-emits a start event),
+        // return the existing state instead of appending a duplicate
+        // row. Previously every call appended a new row, so a session
+        // with 8 subagent calls rendered 24 rows after a couple of
+        // reconnect/replay cycles.
+        const existing = subagentSections.get(callId);
+        if (existing) return existing;
+
         let preset = 'subagent';
         let profile = '';
         try {
@@ -3162,11 +3173,49 @@ function highlightCodeBlocks(container) {
 
         if (subagentSections.size > 0) openSubagentPanel();
 
+        // v1.30.0 — reconcile: every subagent section that rehydrate
+        // built from a persisted tool_call should now be marked done
+        // (the matching tool_result was applied in pass 2, or, if the
+        // result is missing from the transcript, the call is orphaned
+        // and must never render as `running` on reload). Pre-existing
+        // `running` sections can only come from a buffered live progress
+        // event that arrived before rehydrate ran; demote them to
+        // `cancelled` so the panel never shows a phantom running row
+        // after a reload/reconnect. This is the client-side half of the
+        // "phantom subagent" fix — the server-side half is the parallel
+        // batch deadline in loop.zig that guarantees a tool_execution_end
+        // is always emitted.
+        reconcileSubagentPanel();
+
         // Page just loaded / session just switched — land at the
         // bottom (newest message) regardless of saved scroll state.
         scrollToBottom(true);
         // vN — after rehydrating from saved transcript, check for URL anchor.
         scrollToAnchor();
+    }
+
+    /// v1.30.0 — walk every subagent section and force any still-`running`
+    /// row to a terminal `cancelled` state. Called at the end of rehydrate
+    /// so a persisted transcript can never render a phantom running row
+    /// (the matching tool_result is either present, in which case
+    /// `appendFinalizedToolCard` already marked the section done, or
+    /// missing, in which case the call is orphaned and must be shown as
+    /// cancelled, not running). Safe to call at any time — it only touches
+    /// sections with `done === false`.
+    function reconcileSubagentPanel() {
+        for (const [callId, state] of subagentSections.entries()) {
+            if (state.done) continue;
+            state.done = true;
+            state.isError = true;
+            if (state.badgeEl) {
+                state.badgeEl.className = 'sa-badge error';
+                state.badgeEl.textContent = 'cancelled';
+            }
+            if (currentOverlayCallId === callId && saOverlayBadge) {
+                setBadge(saOverlayBadge, 'cancelled', 'sa-overlay-badge');
+            }
+        }
+        updateSubagentPanelSubtitle();
     }
 
     // v1.7.7 — load prompt history before connecting; it's

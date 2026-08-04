@@ -703,11 +703,10 @@ fn executeUnconfigured(
 ) anyerror!at.ToolResult {
     _ = self;
     _ = io;
-    _ = call_id;
     _ = args_json;
     _ = cancel;
     _ = on_update;
-    return errorResult(allocator, .config_error, "subagent tool is not configured: register via toolWithCtx in the mode driver", .{});
+    return errorResult(allocator, .config_error, "subagent tool is not configured: register via toolWithCtx in the mode driver", .{ .spawn_id = call_id });
 }
 
 fn executeWithCtx(
@@ -721,7 +720,7 @@ fn executeWithCtx(
 ) anyerror!at.ToolResult {
     _ = on_update;
     const ctx_ptr = self.ctx orelse {
-        return errorResult(allocator, .config_error, "subagent tool ctx pointer is null", .{});
+        return errorResult(allocator, .config_error, "subagent tool ctx pointer is null", .{ .spawn_id = call_id });
     };
     const ctx: *const Ctx = @ptrCast(@alignCast(ctx_ptr));
 
@@ -831,7 +830,7 @@ fn runSubagent(
     // Defers release so EVERY exit path (success / error /
     // structured-result) frees the slot.
     acquireSubagentSlot(io, parent_cancel) catch {
-        return errorResult(allocator, .aborted, "parent agent aborted while sub-agent was queued behind concurrency cap", .{});
+        return errorResult(allocator, .aborted, "parent agent aborted while sub-agent was queued behind concurrency cap", .{ .spawn_id = call_id });
     };
     defer releaseSubagentSlot(io);
 
@@ -846,7 +845,7 @@ fn runSubagent(
             error.MaxTurnsOutOfRange => "max_turns must be >= 1",
             else => "invalid arguments",
         };
-        return errorResult(allocator, .invalid_args, msg, .{});
+        return errorResult(allocator, .invalid_args, msg, .{ .spawn_id = call_id });
     };
     defer parsed.deinit(allocator);
 
@@ -870,7 +869,7 @@ fn runSubagent(
             .{parsed.preset},
         ) catch unreachable;
         defer allocator.free(msg);
-        return errorResult(allocator, .preset_not_found, msg, .{});
+        return errorResult(allocator, .preset_not_found, msg, .{ .spawn_id = call_id });
     };
 
     // Resolve role (demotion only; preset default used when not overridden).
@@ -883,7 +882,7 @@ fn runSubagent(
             .{ preset.name, sub_role.toString(), ctx.parent_role.toString(), sub_role.toString() },
         ) catch unreachable;
         defer allocator.free(msg);
-        return errorResult(allocator, .role_promotion_denied, msg, .{});
+        return errorResult(allocator, .role_promotion_denied, msg, .{ .spawn_id = call_id });
     }
 
     // v1.24.2 — clone the parent's environ_map per-call. `applyProfile`
@@ -916,12 +915,12 @@ fn runSubagent(
                 defer if (list) |l| allocator.free(l);
                 const msg = std.fmt.allocPrint(allocator, "profile '{s}' not found", .{effective_profile}) catch unreachable;
                 defer allocator.free(msg);
-                return errorResult(allocator, .profile_not_found, msg, .{ .profiles_listing = list });
+                return errorResult(allocator, .profile_not_found, msg, .{ .profiles_listing = list, .spawn_id = call_id });
             },
             else => {
                 const msg = std.fmt.allocPrint(allocator, "profile load failed: {s}", .{@errorName(e)}) catch unreachable;
                 defer allocator.free(msg);
-                return errorResult(allocator, .invalid_args, msg, .{});
+                return errorResult(allocator, .invalid_args, msg, .{ .spawn_id = call_id });
             },
         };
     }
@@ -940,11 +939,11 @@ fn runSubagent(
             else
                 try allocator.dupe(u8, "the requested profile needs an API key that is not configured; set the required environment variable or retry with a different profile");
             defer allocator.free(hint);
-            return errorResult(allocator, .agent_error, hint, .{});
+            return errorResult(allocator, .agent_error, hint, .{ .spawn_id = call_id });
         }
         const msg = try std.fmt.allocPrint(allocator, "provider resolve failed: {s}", .{@errorName(e)});
         defer allocator.free(msg);
-        return errorResult(allocator, .agent_error, msg, .{});
+        return errorResult(allocator, .agent_error, msg, .{ .spawn_id = call_id });
     };
 
     // Build the sub-agent's tool list via the preset's builder.
@@ -1060,7 +1059,7 @@ fn runSubagent(
     const supervisor = std.Thread.spawn(.{}, supervisorMain, .{supervisor_args}) catch |e| {
         const msg = std.fmt.allocPrint(allocator, "failed to spawn supervisor thread: {s}", .{@errorName(e)}) catch unreachable;
         defer allocator.free(msg);
-        return errorResult(allocator, .agent_error, msg, .{});
+        return errorResult(allocator, .agent_error, msg, .{ .spawn_id = call_id });
     };
 
     // Run the sub-agent. Buffered: we wait until idle and read
@@ -1073,7 +1072,7 @@ fn runSubagent(
         supervisor.join();
         const msg = std.fmt.allocPrint(allocator, "agent.prompt failed: {s}", .{@errorName(e)}) catch unreachable;
         defer allocator.free(msg);
-        return errorResult(allocator, .agent_error, msg, .{});
+        return errorResult(allocator, .agent_error, msg, .{ .spawn_id = call_id });
     };
     sub_agent.waitForIdle();
 
@@ -1113,7 +1112,7 @@ fn runSubagent(
         const turn_count = countAssistantTurns(&sub_agent.transcript);
         const msg = std.fmt.allocPrint(allocator, "sub-agent {s} after {d} ms ({d} turns)", .{ kind.name(), elapsed_ms, turn_count }) catch unreachable;
         defer allocator.free(msg);
-        return errorResult(allocator, kind, msg, .{ .partial_text = partial, .turn_count = turn_count });
+        return errorResult(allocator, kind, msg, .{ .partial_text = partial, .turn_count = turn_count, .spawn_id = call_id });
     }
     if (sub_agent.last_error) |err_details| {
         const msg = std.fmt.allocPrint(allocator, "sub-agent failed: {s} — {s}", .{ @tagName(err_details.code), err_details.message }) catch unreachable;
@@ -1121,7 +1120,7 @@ fn runSubagent(
         const partial = lastAssistantText(allocator, &sub_agent.transcript) catch null;
         defer if (partial) |p| allocator.free(p);
         const turn_count = countAssistantTurns(&sub_agent.transcript);
-        return errorResult(allocator, .agent_error, msg, .{ .partial_text = partial, .turn_count = turn_count });
+        return errorResult(allocator, .agent_error, msg, .{ .partial_text = partial, .turn_count = turn_count, .spawn_id = call_id });
     }
 
     const final_text_raw = (lastAssistantText(allocator, &sub_agent.transcript) catch null) orelse try allocator.dupe(u8, "");
@@ -1148,7 +1147,7 @@ fn runSubagent(
         ) catch unreachable;
         defer allocator.free(msg);
         ai.log.log(.warn, "subagent", "no-final-text", "call_id={s} turns={d} tool_calls={d} stop={s}", .{ call_id, turn_count, tool_call_count, stop_name });
-        return errorResult(allocator, .no_final_text, msg, .{ .partial_text = thinking_tail, .turn_count = turn_count });
+        return errorResult(allocator, .no_final_text, msg, .{ .partial_text = thinking_tail, .turn_count = turn_count, .spawn_id = call_id });
     }
 
     // Cap `final_text`. Two limits; whichever is lower wins:
@@ -1192,7 +1191,7 @@ fn runSubagent(
     defer if (transcript_path) |p| allocator.free(p);
 
     ai.log.log(.info, "subagent", "done", "call_id={s} turns={d} tool_calls={d} duration_ms={d}", .{ call_id, turn_count, tool_call_count, elapsed_ms });
-    return successResult(allocator, capped.items, turn_count, tool_call_count, elapsed_ms, call_id, transcript_path);
+    return successResult(allocator, capped.items, turn_count, tool_call_count, elapsed_ms, call_id, transcript_path, call_id);
 }
 
 /// v1.28.0 — cap on the `final_text` field returned by every
@@ -1416,6 +1415,12 @@ fn successResult(
     /// `--no-session` runs and in interactive mode (in-memory
     /// transcripts only).
     transcript_path: ?[]const u8,
+    /// v1.30.0 — stable spawn id echoed back in the result envelope
+    /// so the UI panel can match a result row to its spawn by key
+    /// (not by positional order, which races when one sub-agent
+    /// fast-fails while siblings are still streaming). Always equal
+    /// to the tool-call `id` issued by the parent model.
+    spawn_id: []const u8,
 ) !at.ToolResult {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -1429,6 +1434,8 @@ fn successResult(
     try ai.utils.appendJsonInt(&buf, allocator, duration_ms);
     try buf.appendSlice(allocator, ",\"session_id\":");
     try ai.utils.appendJsonStr(&buf, allocator, session_id);
+    try buf.appendSlice(allocator, ",\"spawn_id\":");
+    try ai.utils.appendJsonStr(&buf, allocator, spawn_id);
     if (transcript_path) |p| {
         try buf.appendSlice(allocator, ",\"transcript_path\":");
         try ai.utils.appendJsonStr(&buf, allocator, p);
@@ -1445,6 +1452,11 @@ const ErrorOpts = struct {
     partial_text: ?[]const u8 = null,
     turn_count: u32 = 0,
     profiles_listing: ?[]const u8 = null,
+    /// v1.30.0 — stable spawn id (the parent tool-call id). Null for
+    /// error paths that fire before a call_id is known (none today,
+    /// but kept optional so the fast-fail paths don't have to thread
+    /// one synthetically).
+    spawn_id: ?[]const u8 = null,
 };
 
 fn errorResult(
@@ -1473,6 +1485,10 @@ fn errorResult(
     if (profiles_listing) |pl| {
         try buf.appendSlice(allocator, ",\"available_profiles\":");
         try ai.utils.appendJsonStr(&buf, allocator, pl);
+    }
+    if (opts.spawn_id) |sid| {
+        try buf.appendSlice(allocator, ",\"spawn_id\":");
+        try ai.utils.appendJsonStr(&buf, allocator, sid);
     }
     try buf.append(allocator, '}');
 
@@ -1741,7 +1757,7 @@ test "ErrorKind hints are non-empty for all variants" {
 
 test "successResult emits valid JSON with the expected fields" {
     const gpa = testing.allocator;
-    var r = try successResult(gpa, "the answer", 4, 7, 1234, "01J0", null);
+    var r = try successResult(gpa, "the answer", 4, 7, 1234, "01J0", null, "call_abc");
     defer r.deinit(gpa);
     try testing.expect(!r.is_error);
     try testing.expectEqual(@as(usize, 1), r.content.len);
@@ -1752,6 +1768,7 @@ test "successResult emits valid JSON with the expected fields" {
     try testing.expect(std.mem.indexOf(u8, text, "\"tool_call_count\":7") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"duration_ms\":1234") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"session_id\":\"01J0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"spawn_id\":\"call_abc\"") != null);
     // null transcript_path → field omitted entirely.
     try testing.expect(std.mem.indexOf(u8, text, "transcript_path") == null);
 }
@@ -1766,6 +1783,7 @@ test "successResult emits transcript_path field when set (v1.28.0)" {
         1234,
         "01J0",
         "/home/user/.franky/sessions/abc/subagents/01J0/transcript.json",
+        "call_xyz",
     );
     defer r.deinit(gpa);
     try testing.expect(!r.is_error);
@@ -1776,7 +1794,7 @@ test "successResult emits transcript_path field when set (v1.28.0)" {
 
 test "errorResult emits valid JSON with kind + hint + tool_code" {
     const gpa = testing.allocator;
-    var r = try errorResult(gpa, .timeout, "took too long", .{ .partial_text = "partial answer", .turn_count = 3 });
+    var r = try errorResult(gpa, .timeout, "took too long", .{ .partial_text = "partial answer", .turn_count = 3, .spawn_id = "call_t1" });
     defer r.deinit(gpa);
     try testing.expect(r.is_error);
     try testing.expectEqualStrings("timeout", r.tool_code.?);
@@ -1786,6 +1804,7 @@ test "errorResult emits valid JSON with kind + hint + tool_code" {
     try testing.expect(std.mem.indexOf(u8, text, "\"error_message\":\"took too long\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"partial_text\":\"partial answer\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"turn_count\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"spawn_id\":\"call_t1\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"hint\":\"") != null);
 }
 
