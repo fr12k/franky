@@ -274,6 +274,13 @@ pub const Config = struct {
     /// registered and the system prompt contains no memory guidance.
     memory_enabled: bool = true,
 
+    /// v3.2 — `--memory-nudge` — opt-in memory save nudge. When true and
+    /// the agent calls `finish_task` without having called `memory_save`
+    /// this session, the guardrail injects a synthetic user message
+    /// reminding it to save important facts. Default off. Requires
+    /// `--memory` (no-op when memory is disabled).
+    memory_nudge: bool = false,
+
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
 
@@ -499,6 +506,14 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--no-memory")) {
         cfg.memory_enabled = false;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--memory-nudge")) {
+        cfg.memory_nudge = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-memory-nudge")) {
+        cfg.memory_nudge = false;
         return true;
     }
     return false;

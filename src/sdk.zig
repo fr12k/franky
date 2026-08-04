@@ -153,9 +153,16 @@ pub fn createSession(
     var session_state = try SessionState.init(allocator, io, environ, cfg);
     errdefer session_state.deinit(allocator);
 
-    // Step 3: Build system prompt.
-    const system_prompt = try build_sysprompt(allocator, io, environ, cfg);
+    // Step 3: Build system prompt (with recalled memory context).
+    var memory_context: ?[]u8 = null;
+    errdefer if (memory_context) |mc| allocator.free(mc);
+    if (resolved.memory_state) |ms| {
+        memory_context = ms.buildContextBlock(cfg.prompt) catch null;
+    }
+    const system_prompt = try build_sysprompt(allocator, io, environ, cfg, memory_context);
     errdefer allocator.free(system_prompt);
+    if (memory_context) |mc| allocator.free(mc);
+    memory_context = null;
 
     const provider_info: session_create.ProviderInfo = .{
         .provider_name = resolved.provider_name,

@@ -42,21 +42,36 @@ pub const MemoryState = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: MemoryConfig) !MemoryState {
         // db_path needs to be null-terminated for SQLite.
-        const db_path_z = try allocator.dupeZ(u8, config.db_path);
+        const db_path_z = try allocator.allocSentinel(u8, config.db_path.len, 0);
         defer allocator.free(db_path_z);
+        @memcpy(db_path_z[0..config.db_path.len], config.db_path);
 
-        var store = try agent_memory.SqliteStore.init(allocator, io, db_path_z, config.data_dir);
+        const store = try agent_memory.SqliteStore.init(allocator, io, db_path_z, config.data_dir);
 
-        return .{
+        var state: MemoryState = .{
             .allocator = allocator,
             .io = io,
             .store = store,
+            // ctx.store is patched below — `toMemoryStore()` captures
+            // `&store`, so it MUST point at the field in its final
+            // location, not the local `store` in this frame.
             .ctx = .{
-                .store = store.toMemoryStore(),
+                .store = undefined,
                 .iso = config.iso,
             },
             .config = config,
         };
+        state.ctx.store = state.store.toMemoryStore();
+        return state;
+    }
+
+    /// v3.2 — re-point `ctx.store` at the `store` field in its current
+    /// location. `init()` returns by value, so the pointer captured in
+    /// `init()` dangles after the caller moves the struct into its
+    /// final home (typically `a.create(MemoryState); mem.* = init(...)`).
+    /// Call this once after the struct lands at its final address.
+    pub fn repointCtx(self: *MemoryState) void {
+        self.ctx.store = self.store.toMemoryStore();
     }
 
     pub fn deinit(self: *MemoryState) void {
@@ -90,18 +105,22 @@ pub const MemoryState = struct {
         if (recall.l1_results.len > 0) {
             try buf.appendSlice(self.allocator, "## Relevant Memories\n");
             for (recall.l1_results) |r| {
-                try buf.writer().print(self.allocator, "- [{s}, p={d}] {s}\n", .{
+                const line = try std.fmt.allocPrint(self.allocator, "- [{s}, p={d}] {s}\n", .{
                     r.type.toString(),
                     @as(i32, @intFromFloat(r.priority)),
                     r.content,
                 });
+                defer self.allocator.free(line);
+                try buf.appendSlice(self.allocator, line);
             }
             try buf.appendSlice(self.allocator, "\n");
         }
 
         // L2 scenarios
         for (recall.scenario_files) |s| {
-            try buf.writer().print(self.allocator, "## Scenario: {s}\n", .{s.path});
+            const header = try std.fmt.allocPrint(self.allocator, "## Scenario: {s}\n", .{s.path});
+            defer self.allocator.free(header);
+            try buf.appendSlice(self.allocator, header);
             try buf.appendSlice(self.allocator, s.content);
             try buf.appendSlice(self.allocator, "\n\n");
         }
@@ -192,12 +211,12 @@ fn nowMillis() i64 {
 }
 
 /// Convert a franky Message role to a string for L0 storage.
-fn roleString(role: ai.Message.Role) ![]const u8 {
+fn roleString(role: ai.Role) ![]const u8 {
     return switch (role) {
         .user => "user",
         .assistant => "assistant",
-        .tool => "tool",
-        .system => "system",
+        .tool_result => "tool",
+        .custom => "custom",
     };
 }
 

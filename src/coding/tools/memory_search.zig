@@ -93,12 +93,14 @@ fn execute(
         try buf.appendSlice(allocator, query);
     } else {
         for (results, 0..) |r, i| {
-            try buf.writer().print(allocator, "[{d}] ({s}, priority={d}) {s}\n", .{
+            const line = try std.fmt.allocPrint(allocator, "[{d}] ({s}, priority={d}) {s}\n", .{
                 i + 1,
                 r.type.toString(),
                 @as(i32, @intFromFloat(r.priority)),
                 r.content,
             });
+            defer allocator.free(line);
+            try buf.appendSlice(allocator, line);
         }
     }
 

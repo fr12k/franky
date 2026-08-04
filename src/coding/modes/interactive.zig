@@ -1165,6 +1165,12 @@ fn runOneTurn(
                 lc.ccr_store = &session.ccr_store;
                 lc.compression_stats = &session.compression_stats;
             }
+            // v3.2 — L0 capture: persist each turn's messages to the raw
+            // conversation store. Best-effort; disabled when memory is off.
+            if (session.memory_state != null) {
+                lc.capture_turn = captureTurnHook;
+                lc.capture_turn_userdata = @ptrCast(session.memory_state);
+            }
             break :blk lc;
         },
         .ch = &ch,
@@ -1405,6 +1411,20 @@ const WorkerArgs = struct {
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+}
+
+/// v3.2 — L0 capture hook: persist the messages appended during a turn
+/// to the raw conversation store. Best-effort — errors are logged and
+/// swallowed so capture never blocks the agent loop.
+fn captureTurnHook(
+    userdata: ?*anyopaque,
+    _: *agent.loop.Transcript,
+    new_messages: []const at.AgentMessage,
+) void {
+    const ms: *franky.coding.memory.MemoryState = @ptrCast(@alignCast(userdata.?));
+    ms.captureTurn(new_messages) catch |err| {
+        ai.log.log(.warn, "memory", "capture_turn_failed", "err={s}", .{@errorName(err)});
+    };
 }
 
 /// vN — callback for `loop.Config.stop_requested_fn` in interactive
@@ -1691,6 +1711,37 @@ pub const Scrollback = struct {
 // `franky <prompt>` they can also do at the interactive prompt
 // without re-plumbing.
 
+/// v3.2 — open the SQLite memory store. Returns null (degraded mode)
+/// when allocation or store init fails, after logging a warning.
+/// Mirrors `config.initMemoryState` for interactive mode (which doesn't
+/// use the unified resolver).
+fn initMemoryStateInteractive(
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db_path: []const u8,
+    data_dir: []const u8,
+) ?*franky.coding.memory.MemoryState {
+    const mem = arena_alloc.create(franky.coding.memory.MemoryState) catch |err| {
+        ai.log.log(.warn, "memory", "alloc_failed",
+            "err={s} — memory disabled", .{@errorName(err)});
+        return null;
+    };
+    mem.* = franky.coding.memory.MemoryState.init(allocator, io, .{
+        .db_path = db_path,
+        .data_dir = data_dir,
+    }) catch |err| {
+        ai.log.log(.warn, "memory", "store_init_failed",
+            "path={s} err={s} — memory disabled (degraded mode)",
+            .{ db_path, @errorName(err) });
+        arena_alloc.destroy(mem);
+        return null;
+    };
+    // v3.2 — re-point ctx.store at the now-stable `mem` address.
+    mem.repointCtx();
+    return mem;
+}
+
 const SessionBinding = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1743,6 +1794,12 @@ const SessionBinding = struct {
     compression_stats: compression_mod.CompressionStats = .{},
     /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
     ccr_ctx: compression_mod.CcrContext = undefined,
+    /// v3.2 — memory state (null when memory is disabled or store
+    /// init failed). Owned by `arena`.
+    memory_state: ?*franky.coding.memory.MemoryState = null,
+    /// v3.2 — memory nudge guardrail (null when --memory-nudge is off
+    /// or memory is disabled). Owned by `arena`.
+    memory_guardrail: ?*franky.coding.memory_guardrail.MemoryGuardrail = null,
 
     /// Fills `binding` in place. Taking the destination pointer is
     /// required: the `FauxProvider`'s address gets registered with
@@ -1924,6 +1981,39 @@ const SessionBinding = struct {
         // v2.17 - wire guardrail restart signal to session flag.
         binding.guardrail_state.restart_requested = &binding.restart_requested;
 
+        // v3.2 — memory state + guardrail. Mirrors config.zig's resolve()
+        // step 12.5 but inline (interactive mode doesn't use the unified
+        // resolver). Degraded mode: memory_state stays null on failure.
+        if (cfg.memory_enabled) {
+            const a = binding.arena.allocator();
+            const franky_home = environ_map.get("FRANKY_HOME") orelse blk: {
+                if (environ_map.get("HOME")) |h| break :blk h;
+                break :blk null;
+            };
+            const db_path = if (franky_home) |h|
+                std.fs.path.join(a, &.{ h, "memory.db" }) catch null
+            else
+                a.dupe(u8, "./memory.db") catch null;
+            const data_dir = if (franky_home) |h|
+                std.fs.path.join(a, &.{ h, "memory" }) catch null
+            else
+                a.dupe(u8, "./memory") catch null;
+            if (db_path != null and data_dir != null) {
+                std.Io.Dir.cwd().createDirPath(io, data_dir.?) catch {};
+                binding.memory_state = initMemoryStateInteractive(a, allocator, io, db_path.?, data_dir.?);
+            }
+
+            if (binding.memory_state != null and cfg.memory_nudge) {
+                const mg = a.create(franky.coding.memory_guardrail.MemoryGuardrail) catch null;
+                if (mg) |g| {
+                    g.* = franky.coding.memory_guardrail.MemoryGuardrail.init(.{ .enabled = true });
+                    binding.memory_guardrail = g;
+                    binding.guardrail_state.memory_guardrail = g;
+                }
+            }
+        }
+        errdefer if (binding.memory_state) |ms| ms.deinit();
+
         binding.provider = try print_mode.resolveProvider(allocator, environ, cfg);
         // v0.30.0 — expose session metadata to the bash tool's child env.
         // Interactive mode keeps the transcript in-memory (no persistent
@@ -2001,17 +2091,32 @@ const SessionBinding = struct {
                 .permission_prompter_slot = null,
                 .parent_session_dir = null,
             };
-            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 4);
+            // v3.2 — +2 for memory tools when memory is enabled.
+            const mem_extra: usize = if (binding.memory_state != null) 2 else 0;
+            const final_tools = try aa.alloc(at.AgentTool, binding.tools.len + 4 + mem_extra);
             @memcpy(final_tools[0..binding.tools.len], binding.tools);
             final_tools[binding.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
             final_tools[binding.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_registry);
             final_tools[binding.tools.len + 2] = binding.guardrail_state.finishTaskTool();
             // v3.0 — ccr_retrieve tool for reversible compression
             final_tools[binding.tools.len + 3] = tools_mod.ccr_retrieve.toolWithCtxAndStats(&binding.ccr_ctx);
+            if (binding.memory_state) |ms| {
+                final_tools[binding.tools.len + 4] = tools_mod.memory_search.tool(ms);
+                final_tools[binding.tools.len + 5] = tools_mod.memory_save.tool(ms);
+            }
             binding.tools = final_tools;
         }
 
-        binding.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
+        // v3.2 — recall memory context before building the system prompt.
+        var memory_context: ?[]u8 = null;
+        defer if (memory_context) |mc| allocator.free(mc);
+        if (binding.memory_state) |ms| {
+            memory_context = ms.buildContextBlock(cfg.prompt) catch |err| blk: {
+                ai.log.log(.warn, "memory", "recall_failed", "err={s}", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+        binding.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, memory_context);
     }
 
     fn deinit(self: *SessionBinding) void {
@@ -2024,6 +2129,9 @@ const SessionBinding = struct {
         self.bash_state.deinit();
         self.guardrail_state.deinit();
         self.ccr_store.deinit();
+        // v3.2 — memory state owns the SQLite store; deinit before the
+        // arena that backs it. memory_guardrail needs no deinit.
+        if (self.memory_state) |ms| ms.deinit();
         self.arena.deinit();
     }
 

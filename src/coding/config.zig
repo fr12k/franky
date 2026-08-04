@@ -34,6 +34,8 @@ const skills_mod = franky.coding.skills;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compression_mod = franky.coding.compression;
+const memory_mod = franky.coding.memory;
+const memory_guard_mod = franky.coding.memory_guardrail;
 
 /// Error set for config resolution.
 pub const ResolveError = error{
@@ -133,6 +135,20 @@ pub const ResolvedConfig = struct {
     // ── Compression config ────────────────────────────────────────
     compression: compression_mod.CompressionConfig,
 
+    // ── Memory (v3.2) ──────────────────────────────────────────────
+    /// Memory state owning the SQLite store. `null` when memory is
+    /// disabled (--no-memory) or the store failed to open (degraded
+    /// mode — tools are still registered but no-op). Owned by the
+    /// resolver arena's allocator; deinit'd in `deinit`.
+    memory_state: ?*memory_mod.MemoryState = null,
+    /// Memory guardrail (nudge). `null` when `--memory-nudge` is off
+    /// or memory is disabled. Owned by the resolver arena.
+    memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+    /// Whether the memory nudge is enabled (mirrors cfg.memory_nudge
+    /// after settings overlay). Mode drivers use this to set the
+    /// guardrail pointer on their GuardrailState.
+    memory_nudge_enabled: bool = false,
+
     // ── Arena ────────────────────────────────────────────────────
     /// Everything that outlives `resolve()` is allocated on this arena.
     arena: std.heap.ArenaAllocator,
@@ -150,6 +166,12 @@ pub const ResolvedConfig = struct {
         // Guardrail state owns its sub-structures.
         self.guardrail_state.deinit();
         a.destroy(self.guardrail_state);
+        // v3.2 — memory state + guardrail.
+        if (self.memory_state) |ms| {
+            ms.deinit();
+            a.destroy(ms);
+        }
+        if (self.memory_guardrail) |mg| a.destroy(mg);
         // Extension manager deinits its extensions.
         self.ext_manager.deinit();
         // Preset registry deinits its presets.
@@ -449,6 +471,7 @@ pub fn applyMemorySettingsOverlay(
     settings: *const settings_mod.Settings,
 ) void {
     if (settings.memory_enabled) |v| cfg.memory_enabled = v;
+    if (settings.memory_nudge) |v| cfg.memory_nudge = v;
 }
 
 /// Apply permissions settings overlay onto permission store.
@@ -802,6 +825,38 @@ pub fn resolveAnthropicAlias(input: []const u8) []const u8 {
 
 // ─── Path helpers ───────────────────────────────────────────────
 
+/// v3.2 — Open the SQLite memory store. Returns null (degraded mode)
+/// when allocation or store init fails, after logging a warning. The
+/// caller owns the returned `MemoryState` (allocated on `arena_alloc`).
+fn initMemoryState(
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    db_path: []const u8,
+    data_dir: []const u8,
+) ?*memory_mod.MemoryState {
+    const mem = arena_alloc.create(memory_mod.MemoryState) catch |err| {
+        ai.log.log(.warn, "memory", "alloc_failed",
+            "err={s} — memory disabled", .{@errorName(err)});
+        return null;
+    };
+    mem.* = memory_mod.MemoryState.init(allocator, io, .{
+        .db_path = db_path,
+        .data_dir = data_dir,
+    }) catch |err| {
+        ai.log.log(.warn, "memory", "store_init_failed",
+            "path={s} err={s} — memory disabled (degraded mode)",
+            .{ db_path, @errorName(err) });
+        arena_alloc.destroy(mem);
+        return null;
+    };
+    // v3.2 — re-point ctx.store at the now-stable `mem` address.
+    // `init()` captured a pointer to its local `store`, which dangles
+    // after the by-value return into `mem.*`.
+    mem.repointCtx();
+    return mem;
+}
+
 fn authJsonPathFrom(
     arena_alloc: std.mem.Allocator,
     franky_home: ?[]const u8,
@@ -1126,6 +1181,46 @@ pub fn resolve(
     );
     errdefer guardrail_state.deinit();
 
+    // ── Step 12.5: Memory state + guardrail (v3.2) ──────────────
+    // Open the SQLite store under $FRANKY_HOME/memory.db (or
+    // $HOME/.franky/memory.db). When memory is disabled or the store
+    // fails to open, we run in degraded mode: memory_state stays
+    // null, the memory tools are not registered, and the system
+    // prompt hint is omitted. Everything else works normally.
+    var memory_state: ?*memory_mod.MemoryState = null;
+    var memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null;
+    if (cfg.memory_enabled) {
+        const franky_home = environ_map.get("FRANKY_HOME") orelse blk: {
+            if (environ_map.get("HOME")) |h| break :blk h;
+            break :blk null;
+        };
+        const db_path = if (franky_home) |h|
+            try std.fs.path.join(a, &.{ h, "memory.db" })
+        else
+            try a.dupe(u8, "./memory.db");
+        const data_dir = if (franky_home) |h|
+            try std.fs.path.join(a, &.{ h, "memory" })
+        else
+            try a.dupe(u8, "./memory");
+        // Ensure the data dir exists for L2/L3 markdown files.
+        std.Io.Dir.cwd().createDirPath(io, data_dir) catch {};
+
+        memory_state = initMemoryState(a, allocator, io, db_path, data_dir);
+        if (memory_state != null and cfg.memory_nudge) {
+            const mg = try a.create(memory_guard_mod.MemoryGuardrail);
+            errdefer a.destroy(mg);
+            mg.* = memory_guard_mod.MemoryGuardrail.init(.{ .enabled = true });
+            memory_guardrail = mg;
+            // Wire the guardrail into the GuardrailState so the loop's
+            // afterToolCall + betweenTurns forward to it.
+            guardrail_state.memory_guardrail = mg;
+        }
+    }
+    // Common errdefer cleanup (no-op when null).
+    errdefer if (memory_state) |ms| ms.deinit();
+    errdefer if (memory_guardrail) |mg| a.destroy(mg);
+
+
     // ── Step 13: Subagent context ────────────────────────────────
     // Build the Ctx first, then wire in the tools that reference it.
     // `parent_session_dir` is late-bound by the mode after session init.
@@ -1148,7 +1243,11 @@ pub fn resolve(
     };
     const all_final_tools = blk: {
         const base_len = role_filtered_tools.len + ext_tools.len;
-        const slice = try a.alloc(at.AgentTool, base_len + 4);
+        // v3.2 — +2 for memory tools (memory_search, memory_save)
+        // when memory is enabled. The ccr_retrieve ctx is patched
+        // later by the mode driver.
+        const extra: usize = if (memory_state != null) 6 else 4;
+        const slice = try a.alloc(at.AgentTool, base_len + extra);
         @memcpy(slice[0..role_filtered_tools.len], role_filtered_tools);
         if (ext_tools.len > 0) {
             @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
@@ -1158,6 +1257,10 @@ pub fn resolve(
         slice[base_len + 2] = guardrail_state.finishTaskTool();
         // ccr_retrieve tool — ctx is set by the mode driver after session creation
         slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithCtx(null);
+        if (memory_state) |ms| {
+            slice[base_len + 4] = tools_mod.memory_search.tool(ms);
+            slice[base_len + 5] = tools_mod.memory_save.tool(ms);
+        }
         break :blk slice;
     };
 
@@ -1232,6 +1335,9 @@ pub fn resolve(
             .code_compressor_enabled = cfg.compress_code,
             .ccr_enabled = cfg.compress_ccr,
         },
+        .memory_state = memory_state,
+        .memory_guardrail = memory_guardrail,
+        .memory_nudge_enabled = cfg.memory_nudge,
         .arena = arena,
     };
 }

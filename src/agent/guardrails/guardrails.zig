@@ -22,6 +22,9 @@ const at = @import("../types.zig");
 const stuck_mod = @import("stuck_detector.zig");
 const compile_mod = @import("compilation_guard.zig");
 const finish_mod = @import("finish_task.zig");
+// v3.2 — memory guardrail lives in coding/ but only depends on ai/ +
+// agent/types.zig, so importing it here introduces no layering cycle.
+const memory_guard_mod = @import("../../coding/memory_guardrail.zig");
 
 pub const Config = struct {
     /// Consecutive identical errors before the stuck hint fires.
@@ -53,6 +56,12 @@ pub const GuardrailState = struct {
     guardrail_fire_count: u32 = 0,
     finish_task_pending_compilation: bool = false,
     restart_requested: ?*std.atomic.Value(bool) = null,
+    /// v3.2 — optional memory nudge guardrail. When non-null and
+    /// `finish_task` fires without any `memory_save` call this session,
+    /// the guardrail injects a synthetic user message reminding the
+    /// agent to save important facts before finishing. Owned by the
+    /// mode driver (which also owns the MemoryState); set after init.
+    memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
 
     /// ── Auto-commit lifecycle state ────────────────────────────────────
     pr_url: ?[]const u8 = null,
@@ -142,6 +151,8 @@ pub const GuardrailState = struct {
     ) void {
         self.stuck_detector.afterToolCall(tool, call_id, result);
         self.compilation_guard.bumpIfMutation(tool.name);
+        // v3.2 — track memory_save so the nudge knows the agent already saved.
+        if (self.memory_guardrail) |mg| mg.afterToolCall(tool.name);
     }
 
     pub fn betweenTurns(
@@ -178,6 +189,22 @@ pub const GuardrailState = struct {
 
         // ── 1. finish_task triggered ──
         if (self.finish_task_state.triggered) {
+            // v3.2 — memory nudge: if the agent finished without saving
+            // any memory this session, inject a reminder before the
+            // compilation/commit pipeline runs. This gives the agent one
+            // extra turn to call memory_save (or skip and re-finish).
+            if (self.memory_guardrail) |mg| {
+                const wants_turn = try mg.betweenTurns(allocator, transcript, true);
+                if (wants_turn) {
+                    self.guardrail_fire_count += 1;
+                    // Consume the trigger so the next finish_task call
+                    // re-enters this branch; the nudge message tells the
+                    // agent to call finish_task again when done.
+                    self.finish_task_state.triggered = false;
+                    self.finish_task_pending_compilation = false;
+                    return true;
+                }
+            }
             self.finish_task_state.triggered = false;
             self.finish_task_pending_compilation = true;
             self.ci_poll_active = false;
@@ -886,4 +913,121 @@ test "GuardrailState: deinit with all owned fields null is safe" {
     try testing.expect(state.pr_url == null);
     try testing.expect(state.auto_commit_branch == null);
     try testing.expect(state.pending_ci_failure == null);
+}
+
+// ─── v3.2 memory guardrail wiring tests ─────────────────────────────
+
+test "GuardrailState: afterToolCall forwards to memory_guardrail" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var state = try GuardrailState.init(gpa, .{ .workspace_dir = "/tmp" }, io);
+    defer state.deinit();
+
+    var mg = memory_guard_mod.MemoryGuardrail.init(.{ .enabled = true });
+    state.memory_guardrail = &mg;
+
+    const memory_save_tool = at.AgentTool{
+        .name = "memory_save",
+        .description = "",
+        .parameters_json = "{}",
+        .execute = undefined,
+    };
+    var ok_result: at.ToolResult = .{ .content = &.{} };
+
+    try testing.expect(!mg.session_has_saved);
+    state.afterToolCall(&memory_save_tool, "id1", &ok_result);
+    try testing.expect(mg.session_has_saved);
+}
+
+test "GuardrailState: betweenTurns fires memory nudge on finish_task without save" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var state = try GuardrailState.init(gpa, .{ .workspace_dir = "/tmp" }, io);
+    defer state.deinit();
+
+    var mg = memory_guard_mod.MemoryGuardrail.init(.{ .enabled = true });
+    state.memory_guardrail = &mg;
+
+    // Simulate finish_task trigger (no memory_save called).
+    state.finish_task_state.triggered = true;
+
+    var transcript = at.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var channel = try ai.channel.Channel(at.AgentEvent).init(gpa, 64);
+    defer channel.deinit();
+
+    const wants_turn = try state.betweenTurns(gpa, io, &transcript, &channel);
+    // The nudge fires → wants another turn.
+    try testing.expect(wants_turn);
+    // The nudge injected a user message.
+    try testing.expect(transcript.messages.items.len > 0);
+    // finish_task was consumed so it doesn't re-enter the pipeline.
+    try testing.expect(!state.finish_task_state.triggered);
+    try testing.expect(!state.finish_task_pending_compilation);
+}
+
+test "GuardrailState: betweenTurns skips nudge when memory already saved" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var state = try GuardrailState.init(gpa, .{ .workspace_dir = "/tmp" }, io);
+    defer state.deinit();
+
+    var mg = memory_guard_mod.MemoryGuardrail.init(.{ .enabled = true });
+    state.memory_guardrail = &mg;
+
+    // Agent already saved memory this session.
+    mg.session_has_saved = true;
+
+    state.finish_task_state.triggered = true;
+
+    var transcript = at.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var channel = try ai.channel.Channel(at.AgentEvent).init(gpa, 64);
+    defer channel.deinit();
+
+    const wants_turn = try state.betweenTurns(gpa, io, &transcript, &channel);
+    // No nudge → finish_task pipeline proceeds normally (wants a turn
+    // for the compilation step).
+    try testing.expect(wants_turn);
+    // The finish_task state was consumed and moved to pending_compilation.
+    try testing.expect(!state.finish_task_state.triggered);
+    try testing.expect(state.finish_task_pending_compilation);
+    // No nudge message was injected.
+    try testing.expectEqual(@as(usize, 0), transcript.messages.items.len);
+}
+
+test "GuardrailState: null memory_guardrail is a no-op" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var state = try GuardrailState.init(gpa, .{ .workspace_dir = "/tmp" }, io);
+    defer state.deinit();
+    // memory_guardrail stays null.
+
+    state.finish_task_state.triggered = true;
+
+    var transcript = at.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var channel = try ai.channel.Channel(at.AgentEvent).init(gpa, 64);
+    defer channel.deinit();
+
+    const wants_turn = try state.betweenTurns(gpa, io, &transcript, &channel);
+    // Without memory_guardrail, finish_task proceeds normally.
+    try testing.expect(wants_turn);
+    try testing.expect(state.finish_task_pending_compilation);
+    try testing.expectEqual(@as(usize, 0), transcript.messages.items.len);
 }

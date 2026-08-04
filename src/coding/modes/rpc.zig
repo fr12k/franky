@@ -423,7 +423,7 @@ fn initSession(
     final_tools[session.tools.len + 2] = tools_mod.ccr_retrieve.toolWithCtxAndStats(&session.ccr_ctx);
     session.tools = final_tools;
 
-    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg);
+    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
 }
 
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
