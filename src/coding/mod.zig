@@ -15,6 +15,8 @@ pub const tools = struct {
     pub const common = @import("tools/common.zig");
     pub const truncate = @import("tools/truncate.zig");
     pub const ccr_retrieve = @import("tools/ccr_retrieve.zig");
+    pub const memory_search = @import("tools/memory_search.zig");
+    pub const memory_save = @import("tools/memory_save.zig");
 };
 
 pub const modes = struct {
@@ -46,6 +48,8 @@ pub const branching = @import("session/branching.zig");
 pub const compaction = @import("session/compaction.zig");
 pub const replay = @import("session/replay.zig");
 pub const compression = @import("compression.zig");
+pub const memory = @import("memory.zig");
+pub const memory_guardrail = @import("memory_guardrail.zig");
 pub const models = @import("model_catalog/models.zig");
 pub const models_render = @import("model_catalog/render.zig");
 pub const models_fetch = @import("model_catalog/fetch.zig");
@@ -118,6 +122,8 @@ test {
     _ = compaction; // backward compat alias
     _ = replay; // backward compat alias
     _ = compression;
+    _ = memory;
+    _ = memory_guardrail;
     _ = models; // backward compat alias
     _ = models_render; // backward compat alias
     _ = models_fetch; // backward compat alias

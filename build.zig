@@ -62,6 +62,13 @@ pub fn build(b: *std.Build) void {
     });
     const zompress_module = zompress_dep.module("zompress");
 
+    // ── agent_memory dependency ────────────────────────────────────
+    const am_dep = b.dependency("agent_memory", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const am_module = am_dep.module("agent_memory");
+
     // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
     // The internal binary still imports through the same `franky_module`
     // so there's only one definition. This is what makes franky-do (and
@@ -74,6 +81,7 @@ pub fn build(b: *std.Build) void {
     });
     franky_module.addOptions("build_options", franky_options);
     franky_module.addImport("zompress", zompress_module);
+    franky_module.addImport("agent_memory", am_module);
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/bin/main.zig"),
@@ -82,6 +90,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_module.addImport("franky", franky_module);
     exe_module.addImport("zompress", zompress_module);
+    exe_module.addImport("agent_memory", am_module);
 
     const exe = b.addExecutable(.{
         .name = "franky",
@@ -153,6 +162,7 @@ pub fn build(b: *std.Build) void {
     });
     test_module.addOptions("build_options", test_options);
     test_module.addImport("zompress", zompress_module);
+    test_module.addImport("agent_memory", am_module);
     const unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = test_module,
