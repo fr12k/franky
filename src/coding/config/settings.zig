@@ -91,6 +91,11 @@ pub const Settings = struct {
     /// `tools.compress.plainText` — enable plain text compression for bash output, file contents, etc.
     compress_plain_text: ?bool = null,
 
+    /// v3.2 — `tools.memory.enabled` — settings-layer toggle for the
+    /// memory tools (memory_search, memory_save) and the `## Memory Tools`
+    /// system-prompt section. `null` = no setting (CLI default on applies).
+    memory_enabled: ?bool = null,
+
     /// `permissions.ask_all` — settings-layer default for the
     /// "ask before every tool call" toggle. CLI `--ask-tools all`
     /// still wins.
@@ -322,6 +327,13 @@ fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
             };
             if (compress_v.object.get("plainText")) |v| if (v == .bool) {
                 settings.compress_plain_text = v.bool;
+            };
+        };
+
+        // v3.2 — tools.memory.enabled (bool, default true)
+        if (tools_v.object.get("memory")) |mem_v| if (mem_v == .object) {
+            if (mem_v.object.get("enabled")) |v| if (v == .bool) {
+                settings.memory_enabled = v.bool;
             };
         };
     };
