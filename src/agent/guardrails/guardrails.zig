@@ -24,7 +24,9 @@ const compile_mod = @import("compilation_guard.zig");
 const finish_mod = @import("finish_task.zig");
 // v3.2 — memory guardrail lives in coding/ but only depends on ai/ +
 // agent/types.zig, so importing it here introduces no layering cycle.
-const memory_guard_mod = @import("../../coding/memory_guardrail.zig");
+const memory_guard_mod = @import("memory_guardrail.zig");
+pub const MemoryGuardrail = memory_guard_mod.MemoryGuardrail;
+pub const MemoryGuardrailConfig = memory_guard_mod.Config;
 
 pub const Config = struct {
     /// Consecutive identical errors before the stuck hint fires.

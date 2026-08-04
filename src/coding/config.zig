@@ -35,7 +35,7 @@ const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compression_mod = franky.coding.compression;
 const memory_mod = franky.coding.memory;
-const memory_guard_mod = franky.coding.memory_guardrail;
+const memory_guard_mod = franky.agent.guardrails;
 
 /// Error set for config resolution.
 pub const ResolveError = error{

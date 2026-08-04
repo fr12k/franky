@@ -339,6 +339,11 @@ fn runPrint(
     // v3.2 — recall memory context (L1/L2/L3) from previous sessions
     // before building the system prompt. The recalled block is injected
     // between the memory-tools hint and any appended user prompt.
+    //
+    // Degraded mode: when memory is enabled but the store failed to open
+    // (memory_state == null), flip cfg.memory_enabled off so the system
+    // prompt's Memory Tools hint is suppressed — otherwise the LLM would
+    // see the hint but have no tools to call.
     var memory_context: ?[]u8 = null;
     defer if (memory_context) |mc| allocator.free(mc);
     if (resolved.memory_state) |ms| {
@@ -346,6 +351,8 @@ fn runPrint(
             ai.log.log(.warn, "memory", "recall_failed", "err={s}", .{@errorName(err)});
             break :blk null;
         };
+    } else if (cfg.memory_enabled) {
+        cfg.memory_enabled = false;
     }
     const system_prompt = try buildSystemPromptIo(allocator, io, environ, cfg, memory_context);
     defer allocator.free(system_prompt);

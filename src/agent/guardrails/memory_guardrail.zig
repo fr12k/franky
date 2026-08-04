@@ -11,11 +11,11 @@
 
 const std = @import("std");
 const ai = struct {
-    pub const types = @import("../ai/types.zig");
-    pub const stream = @import("../ai/stream.zig");
-    pub const log = @import("../ai/log.zig");
+    pub const types = @import("../../ai/types.zig");
+    pub const stream = @import("../../ai/stream.zig");
+    pub const log = @import("../../ai/log.zig");
 };
-const at = @import("../agent/types.zig");
+const at = @import("../types.zig");
 
 /// Configuration for the memory guardrail.
 pub const Config = struct {

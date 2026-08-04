@@ -1799,7 +1799,7 @@ const SessionBinding = struct {
     memory_state: ?*franky.coding.memory.MemoryState = null,
     /// v3.2 — memory nudge guardrail (null when --memory-nudge is off
     /// or memory is disabled). Owned by `arena`.
-    memory_guardrail: ?*franky.coding.memory_guardrail.MemoryGuardrail = null,
+    memory_guardrail: ?*franky.agent.guardrails.MemoryGuardrail = null,
 
     /// Fills `binding` in place. Taking the destination pointer is
     /// required: the `FauxProvider`'s address gets registered with
@@ -2004,9 +2004,9 @@ const SessionBinding = struct {
             }
 
             if (binding.memory_state != null and cfg.memory_nudge) {
-                const mg = a.create(franky.coding.memory_guardrail.MemoryGuardrail) catch null;
+                const mg = a.create(franky.agent.guardrails.MemoryGuardrail) catch null;
                 if (mg) |g| {
-                    g.* = franky.coding.memory_guardrail.MemoryGuardrail.init(.{ .enabled = true });
+                    g.* = franky.agent.guardrails.MemoryGuardrail.init(.{ .enabled = true });
                     binding.memory_guardrail = g;
                     binding.guardrail_state.memory_guardrail = g;
                 }
@@ -2115,6 +2115,10 @@ const SessionBinding = struct {
                 ai.log.log(.warn, "memory", "recall_failed", "err={s}", .{@errorName(err)});
                 break :blk null;
             };
+        } else if (cfg.memory_enabled) {
+            // Degraded mode: store failed to open — suppress the Memory
+            // Tools hint so the LLM doesn't hallucinate tool calls.
+            cfg.memory_enabled = false;
         }
         binding.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, memory_context);
     }
