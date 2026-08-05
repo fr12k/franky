@@ -68,6 +68,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const am_module = am_dep.module("agent_memory");
+    // v0.2.0 — agent_memory vendors the SQLite amalgamation as a static
+    // lib artifact. Link it so sqlite3 symbols resolve at link time.
+    const sqlite3_art = am_dep.artifact("sqlite3");
 
     // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
     // The internal binary still imports through the same `franky_module`
@@ -82,9 +85,12 @@ pub fn build(b: *std.Build) void {
     franky_module.addOptions("build_options", franky_options);
     franky_module.addImport("zompress", zompress_module);
     franky_module.addImport("agent_memory", am_module);
-    // v3.2 — agent_memory embeds SQLite (FTS5 + relational); the
-    // consuming project must link the system libsqlite3.
-    franky_module.linkSystemLibrary("sqlite3", .{});
+    // v0.2.0 — link the vendored sqlite3 static lib from agent_memory.
+    franky_module.linkLibrary(sqlite3_art);
+    // v0.2.0 — agent_memory now vendors the SQLite amalgamation
+    // (vendor/sqlite3.c compiled from source), so we no longer need
+    // to link the system libsqlite3 here. This enables cross-compilation
+    // (goreleaser builds for 5 targets including aarch64-linux and macOS).
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/bin/main.zig"),
@@ -166,8 +172,9 @@ pub fn build(b: *std.Build) void {
     test_module.addOptions("build_options", test_options);
     test_module.addImport("zompress", zompress_module);
     test_module.addImport("agent_memory", am_module);
-    // v3.2 — link sqlite3 for the agent_memory embedded store tests.
-    test_module.linkSystemLibrary("sqlite3", .{});
+    // v0.2.0 — link vendored sqlite3 from agent_memory.
+    test_module.linkLibrary(sqlite3_art);
+    // v0.2.0 — agent_memory vendors SQLite; no system lib needed.
     const unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = test_module,
