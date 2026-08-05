@@ -16,4 +16,5 @@ test {
     _ = @import("guardrails/stuck_detector.zig");
     _ = @import("guardrails/compilation_guard.zig");
     _ = @import("guardrails/finish_task.zig");
+    _ = @import("guardrails/memory_guardrail.zig");
 }

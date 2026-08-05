@@ -95,6 +95,9 @@ pub const Settings = struct {
     /// memory tools (memory_search, memory_save) and the `## Memory Tools`
     /// system-prompt section. `null` = no setting (CLI default on applies).
     memory_enabled: ?bool = null,
+    /// v3.2 — `tools.memory.nudge` — settings-layer toggle for the
+    /// memory save nudge guardrail. `null` = no setting (CLI default off).
+    memory_nudge: ?bool = null,
 
     /// `permissions.ask_all` — settings-layer default for the
     /// "ask before every tool call" toggle. CLI `--ask-tools all`
@@ -330,10 +333,13 @@ fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
             };
         };
 
-        // v3.2 — tools.memory.enabled (bool, default true)
+        // v3.2 — tools.memory.{enabled, nudge}
         if (tools_v.object.get("memory")) |mem_v| if (mem_v == .object) {
             if (mem_v.object.get("enabled")) |v| if (v == .bool) {
                 settings.memory_enabled = v.bool;
+            };
+            if (mem_v.object.get("nudge")) |v| if (v == .bool) {
+                settings.memory_nudge = v.bool;
             };
         };
     };

@@ -92,8 +92,8 @@ fn execute(
         return common.toolError(allocator, "invalid_args", "'type' must be 'persona', 'episodic', or 'instruction'");
 
     const priority: f32 = if (root.object.get("priority")) |v| blk: {
-        if (v == .integer) break :blk @floatFromInt(@as(f32, @floatFromInt(v.integer)));
-        if (v == .float) break :blk @floatCast(v.float);
+        if (v == .integer) break :blk @as(f32, @floatFromInt(v.integer));
+        if (v == .float) break :blk @as(f32, @floatCast(v.float));
         break :blk 50.0;
     } else 50.0;
 

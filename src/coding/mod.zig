@@ -49,7 +49,6 @@ pub const compaction = @import("session/compaction.zig");
 pub const replay = @import("session/replay.zig");
 pub const compression = @import("compression.zig");
 pub const memory = @import("memory.zig");
-pub const memory_guardrail = @import("memory_guardrail.zig");
 pub const models = @import("model_catalog/models.zig");
 pub const models_render = @import("model_catalog/render.zig");
 pub const models_fetch = @import("model_catalog/fetch.zig");
@@ -123,7 +122,6 @@ test {
     _ = replay; // backward compat alias
     _ = compression;
     _ = memory;
-    _ = memory_guardrail;
     _ = models; // backward compat alias
     _ = models_render; // backward compat alias
     _ = models_fetch; // backward compat alias

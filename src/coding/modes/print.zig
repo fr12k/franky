@@ -336,7 +336,25 @@ fn runPrint(
     }
 
     // ── Agent loop ─────────────────────────────────────────────────
-    const system_prompt = try buildSystemPromptIo(allocator, io, environ, cfg);
+    // v3.2 — recall memory context (L1/L2/L3) from previous sessions
+    // before building the system prompt. The recalled block is injected
+    // between the memory-tools hint and any appended user prompt.
+    //
+    // Degraded mode: when memory is enabled but the store failed to open
+    // (memory_state == null), flip cfg.memory_enabled off so the system
+    // prompt's Memory Tools hint is suppressed — otherwise the LLM would
+    // see the hint but have no tools to call.
+    var memory_context: ?[]u8 = null;
+    defer if (memory_context) |mc| allocator.free(mc);
+    if (resolved.memory_state) |ms| {
+        memory_context = ms.buildContextBlock(cfg.prompt) catch |err| blk: {
+            ai.log.log(.warn, "memory", "recall_failed", "err={s}", .{@errorName(err)});
+            break :blk null;
+        };
+    } else if (cfg.memory_enabled) {
+        cfg.memory_enabled = false;
+    }
+    const system_prompt = try buildSystemPromptIo(allocator, io, environ, cfg, memory_context);
     defer allocator.free(system_prompt);
 
     const model: ai.types.Model = .{
@@ -376,6 +394,10 @@ fn runPrint(
         .compression = if (resolved.compression.enabled) resolved.compression else null,
         .ccr_store = &session_state.ccr_store,
         .compression_stats = &session_state.compression_stats,
+        // v3.2 — L0 capture: persist each turn's messages to the raw
+        // conversation store. Best-effort; disabled when memory is off.
+        .capture_turn = if (resolved.memory_state != null) captureTurnHook else null,
+        .capture_turn_userdata = @ptrCast(resolved.memory_state),
         .stream_options = .{
             .api_key = resolved.api_key,
             .auth_token = resolved.auth_token,
@@ -638,6 +660,20 @@ fn handleSseConn(args: HandleConnArgs) void {
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
+}
+
+/// v3.2 — L0 capture hook: persist the messages appended during a turn
+/// to the raw conversation store. Best-effort — errors are logged and
+/// swallowed so capture never blocks the agent loop.
+fn captureTurnHook(
+    userdata: ?*anyopaque,
+    _: *agent.loop.Transcript,
+    new_messages: []const at.AgentMessage,
+) void {
+    const ms: *franky.coding.memory.MemoryState = @ptrCast(@alignCast(userdata.?));
+    ms.captureTurn(new_messages) catch |err| {
+        ai.log.log(.warn, "memory", "capture_turn_failed", "err={s}", .{@errorName(err)});
+    };
 }
 
 // ─── model alias resolution ──────────────────────────────────────
@@ -1428,6 +1464,7 @@ pub fn buildSystemPromptIo(
     io: ?std.Io,
     environ: std.process.Environ,
     cfg: *const cli_mod.Config,
+    memory_context: ?[]const u8,
 ) ![]u8 {
     if (cfg.system_prompt) |s| return try allocator.dupe(u8, s);
 
@@ -1660,10 +1697,32 @@ pub fn buildSystemPromptIo(
     }
     defer if (memory_owned) allocator.free(with_memory);
 
-    if (cfg.append_system_prompt) |extra| {
+    // v3.2 — inject recalled memory context (L1/L2/L3) from previous
+    // sessions. The caller (mode driver) builds this via
+    // `MemoryState.buildContextBlock()` before calling us, so this fn
+    // stays a pure string-composition primitive. When null or memory
+    // is disabled, no block is injected.
+    var with_recall: []u8 = with_memory;
+    var recall_owned = false;
+    if (memory_context) |block| {
         const trimmed = std.mem.trimEnd(u8, if (memory_owned) with_memory else if (compression_owned) with_compression else if (review_owned) with_review else with_skills, &std.ascii.whitespace);
+        with_recall = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n{s}\n",
+            .{ trimmed, block },
+        );
+        recall_owned = true;
+    }
+    defer if (recall_owned) allocator.free(with_recall);
+
+    if (cfg.append_system_prompt) |extra| {
+        const trimmed = std.mem.trimEnd(u8, if (recall_owned) with_recall else if (memory_owned) with_memory else if (compression_owned) with_compression else if (review_owned) with_review else with_skills, &std.ascii.whitespace);
         const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
         return out;
+    }
+    if (recall_owned) {
+        recall_owned = false;
+        return with_recall;
     }
     if (memory_owned) {
         memory_owned = false;
@@ -2840,7 +2899,7 @@ test "buildSystemPromptIo: --system-prompt flag beats disk + default" {
     cfg.system_prompt = explicit;
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, null, env, &cfg);
+    const out = try buildSystemPromptIo(gpa, null, env, &cfg, null);
     defer gpa.free(out);
     try testing.expectEqualStrings("you are a test", out);
 }
@@ -2856,7 +2915,7 @@ test "buildSystemPromptIo: missing system.md falls back to default + appends sub
 
     // Env with no FRANKY_HOME/HOME → no disk lookup attempted.
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    const out = try buildSystemPromptIo(gpa, io, env, &cfg, null);
     defer gpa.free(out);
     // Default prompt body is preserved verbatim at the start.
     try testing.expect(std.mem.startsWith(u8, out, default_system_prompt));
@@ -2908,7 +2967,7 @@ test "buildSystemPromptIo: --skill NAME injects body under Active skills (§6.1)
     cfg.skills_select_csv = try cfg.arena.allocator().dupe(u8, "demo");
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    const out = try buildSystemPromptIo(gpa, io, env, &cfg, null);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "## Active skills") != null);
@@ -2950,7 +3009,7 @@ test "buildSystemPromptIo: skill stays out when not selected and no auto_apply (
     // No skills_select_csv, no auto_apply on the skill → inactive.
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg);
+    const out = try buildSystemPromptIo(gpa, io, env, &cfg, null);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "Active skills") == null);

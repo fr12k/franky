@@ -82,6 +82,9 @@ pub fn build(b: *std.Build) void {
     franky_module.addOptions("build_options", franky_options);
     franky_module.addImport("zompress", zompress_module);
     franky_module.addImport("agent_memory", am_module);
+    // v3.2 — agent_memory embeds SQLite (FTS5 + relational); the
+    // consuming project must link the system libsqlite3.
+    franky_module.linkSystemLibrary("sqlite3", .{});
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/bin/main.zig"),
@@ -163,6 +166,8 @@ pub fn build(b: *std.Build) void {
     test_module.addOptions("build_options", test_options);
     test_module.addImport("zompress", zompress_module);
     test_module.addImport("agent_memory", am_module);
+    // v3.2 — link sqlite3 for the agent_memory embedded store tests.
+    test_module.linkSystemLibrary("sqlite3", .{});
     const unit_tests = b.addTest(.{
         .name = "franky-test",
         .root_module = test_module,
