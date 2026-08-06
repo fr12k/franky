@@ -16,7 +16,7 @@
             .hash = "zompress-0.0.1-hHj4JvKLAQD99DOqFg8rU0NfnwqGflzoPr0m_2A0ZmVG",
         },
         .agent_memory = .{
-            .url = "https://github.com/franky-agent/franky-memory/archive/refs/tags/v0.2.0.tar.gz",
+            .url = "https://github.com/fr12k/franky-memory/archive/1919a1397ee23ee2689cdb13f3eae69cb672c6d8.tar.gz",
             .hash = "agent_memory-0.0.1-yf36frMUlgCyt9qIRBszkWkTisneOBSqebb6thVtpL79",
         },
     },
