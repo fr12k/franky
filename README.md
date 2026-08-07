@@ -9,7 +9,7 @@ Google Gemini, Google Vertex, plus a scripted fake), a stateful agent
 loop with parallel tool execution, built-in `read` / `write` / `edit` /
 `bash` / `ls` / `find` / `grep` tools (with regex, gitignore, atomic
 edits, and §R workspace path-safety), session persistence + branching
-on disk, **four run modes** (`print` / `interactive` / `rpc` / `proxy`),
+on disk, **three run modes** (`print` / `rpc` / `proxy`),
 a built-in web UI served by proxy mode, capability roles, a per-tool
 permission overlay, bearer-token auth (`--auth-token` /
 `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`) for subscription /
@@ -29,9 +29,6 @@ zig build
 # Run against the real Anthropic API
 export ANTHROPIC_API_KEY=sk-ant-…
 ./zig-out/bin/franky "refactor foo.zig"
-
-# Interactive TUI
-./zig-out/bin/franky --mode interactive
 
 # Web UI (HTTP/SSE listener on http://127.0.0.1:8787/)
 ./zig-out/bin/franky --mode proxy
@@ -118,7 +115,7 @@ and the `sbx secret set-custom` commands that go with each.
 | Feature | Default | Enable | Disable |
 |---|---|---|---|
 | **Provider** | auto-selected from API keys; `faux` if none | `--provider <name>` (`anthropic` / `openai_chat` / `openai_responses` / `openai_gateway` / `google_gemini` / `google_vertex` / `faux`) | `--offline` forces faux even when a key is set |
-| **Run mode** | `print` (one prompt → output → exit) | `--mode interactive` (TUI) / `--mode rpc` (JSON-RPC over stdio) / `--mode proxy` (HTTP/SSE + web UI) | n/a — explicit choice per run |
+| **Run mode** | `print` (one prompt → output → exit) | `--mode rpc` (JSON-RPC over stdio) / `--mode proxy` (HTTP/SSE + web UI) | n/a — explicit choice per run |
 | **Capability role** | `plan` (read + workspace writes, no shell) | `--role read` / `--role plan` / `--role code` (adds bash) / `--role full` (no §R restrictions) | n/a — always bound at session init |
 | **Permission overlay** | off | `--prompts` toggles the gate. Pair with `--yes` (CI), `--allow-tools <csv>`, `--deny-tools <csv>`, or `--ask-tools <csv>` (or `--ask-tools all` for ask-on-every-call) | omit `--prompts` |
 | **Sandbox** | host process (auto-detected) | run in a container (see `docs/sandbox.md` recipes) | n/a — recommendation, not enforced |
@@ -127,7 +124,7 @@ and the `sbx secret set-custom` commands that go with each.
 | **Resume / branching** | new session per run | `--continue` (most recent) or `--resume <id>`; `--fork <name>` / `--checkout <name>` | n/a |
 | **Phase timeouts** | 10 s connect / 120 s upload / 30 s first-byte / 60 s event-gap (10 min first-byte when `--base-url` points at a loopback host) | `--connect-timeout-ms` / `--upload-timeout-ms` / `--first-byte-timeout-ms` / `--event-gap-timeout-ms` (or matching `FRANKY_*_TIMEOUT_MS` env vars) | set field to `0` to disable that phase's watchdog |
 | **Bearer-token auth** | API-key path | `--auth-token <token>` (or `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN` env vars). Mint long-lived tokens externally — e.g. `claude setup-token` — and paste the result in. | n/a |
-| **Logging** | warnings + errors → stderr | `--log-level info\|debug\|trace` or `FRANKY_LOG=…` or `FRANKY_DEBUG=1`; route to a file with `--log-file PATH` (or `FRANKY_LOG_FILE`); interactive mode auto-diverts above `warn` to `$FRANKY_HOME/logs/franky-<ts>.log` so the TUI stays usable | `--log-level error` |
+| **Logging** | warnings + errors → stderr | `--log-level info\|debug\|trace` or `FRANKY_LOG=…` or `FRANKY_DEBUG=1`; route to a file with `--log-file PATH` (or `FRANKY_LOG_FILE`); proxy mode auto-diverts above `warn` to `$FRANKY_HOME/logs/franky-<ts>.log` so the web UI stays usable | `--log-level error` |
 | **Tool subset** | every built-in tool | `--tools read,grep,…` (registry filter) | n/a — pair with `--role` for capability-tier scoping instead |
 | **Skills / templates** | n/a | `--skills <path>`, `--prompts-dir <dir>` (template root, was `--prompts` before v1.11.0) | omit |
 | **Orchestrator registration** | off | `--register <url>` (or `FRANKY_ORCHESTRATOR_URL`); proxy calls `POST /register` / `POST /unregister` with exponential backoff | omit `--register` |
@@ -159,22 +156,12 @@ explicitly to override. Each provider has its own env-var fallback —
 
 ### Run modes
 
-`--mode <print|interactive|rpc|proxy>` picks how franky drives the agent
+`--mode <print|rpc|proxy>` picks how franky drives the agent
 loop. Default is `print`.
 
 ```sh
 # Print (default): one-shot prompt → streamed output → exit.
 franky "what's in foo.zig?"
-
-# Interactive: full TUI with scrollback + slash commands.
-franky --mode interactive
-#  /help      list slash commands
-#  /role      show the active capability role + permitted tools
-#  /tools     list registered tools
-#  /branch    list / create / checkout session branches
-#  /compact   summarize earlier turns (frees context window)
-#  /retry     re-run the last user turn
-#  /export    dump transcript as markdown / json
 
 # RPC: LSP-style JSON-RPC over stdio for programmatic clients.
 echo 'Content-Length: 14\r\n\r\n{"method":"ping"}' | franky --mode rpc
@@ -215,11 +202,11 @@ context. Default is `plan`.
 
 ```sh
 franky --role read --mode print "summarize the diff in this PR"
-franky --role code --mode interactive
+franky --role code --mode proxy
 ```
 
 The role binds at session init — there is no mid-session escalation. To
-change role, restart franky. The `/role` slash command in interactive
+change role, restart franky. The `/role` slash command in proxy
 mode is read-only.
 
 When you select `code` or `full` outside a detected sandbox a yellow
@@ -263,7 +250,7 @@ Disk hiccups never abort an in-flight turn — failed writes / missing
 HOME / corrupt JSON degrade silently to in-memory-only state.
 
 **Curating the persisted set** (v1.15.2). Inside `--mode
-interactive`:
+proxy`:
 
 ```
 /permissions             — show status + every entry, alphabetized
@@ -295,22 +282,20 @@ franky --prompts \
     "..."
 ```
 
-**Interactive modal (v1.11.2).** `franky --prompts --mode interactive`
+**Proxy modal (v1.11.4).** `franky --prompts --mode proxy`
 is the canonical "ask before every tool call" entry point. When the
 agent attempts a write/edit/bash that the policy would `ask` for, the
-TUI appends a yellow modal overlay to the scrollback:
+web UI renders a yellow inline modal in the conversation pane:
 
 ```
 🔒 permission required: bash (fingerprint: rm)
    args: {"command":"rm -rf /tmp/foo"}
-   [a]llow once  [A]lways allow  [d]eny once  [D]eny always  (Esc=deny)
+   [Allow once]  [Always allow]  [Deny once]  [Always deny]
 ```
 
-Press one of `a / A / d / D / Esc`. `*_always` decisions get
-remembered per-fingerprint for the rest of the session; `*_once`
-decides only the in-flight call. Esc and any unrecognized key
-default to `deny_once` — explicit choice is required (no
-"Enter accepts").
+Click a button to decide. `Always` decisions get
+remembered per-fingerprint for the rest of the session; `once`
+decides only the in-flight call.
 
 **RPC mode (v1.11.3).** Same overlay shape, JSON-RPC transport.
 Server emits `tool_permission_request` as a `method:"event"`
@@ -330,7 +315,7 @@ collapses to a green ✓ or red ✗ result line.
 
 > **Print mode is non-interactive by design** — use `--yes` or
 > `--allow-tools` for CI / one-shot runs. The interactive prompt UX
-> requires a TUI / RPC client / browser.
+> requires an RPC client or browser (proxy web UI).
 
 ### CLI flags
 
@@ -345,7 +330,7 @@ Full list: `franky --help`. Highlights:
 | `--base-url URL` | Endpoint override for `openai_gateway` and other compatible servers |
 | `--system-prompt TEXT` / `--append-system-prompt TEXT` | Override / extend system prompt |
 | `--thinking LEVEL` | `off` / `minimal` / `low` / `medium` / `high` / `xhigh` |
-| `--mode MODE` | `print` / `interactive` / `rpc` / `proxy` |
+| `--mode MODE` | `print` / `rpc` / `proxy` |
 | `--proxy-port N` | TCP port for `--mode proxy` (default 8787) |
 | `--register URL` | Orchestrator base URL; proxy calls `POST /register` after binding and `POST /unregister` on shutdown. Env: `FRANKY_ORCHESTRATOR_URL` |
 | `--role NAME` | `read` / `plan` / `code` / `full` (default `plan`) |
@@ -534,24 +519,12 @@ src/
       common.zig       # Shared tool utilities
     modes/
       print.zig        # One-shot print-mode CLI driver
-      interactive.zig  # Full TUI with scrollback + slash commands
       rpc.zig          # JSON-RPC over stdio for programmatic clients
       proxy.zig        # HTTP/SSE listener (127.0.0.1:8787) + built-in web UI
       web/
         index.html     # Web UI HTML
         app.js         # Web UI client (js)
         style.css      # Web UI styles
-
-  tui/                  # Terminal UI components (interactive mode)
-    mod.zig             # Module root
-    buffer.zig          # Terminal screen buffer with double-buffering
-    cell.zig            # Screen cell representation
-    editor.zig          # Text editing widget
-    text_buffer.zig     # Line-based text storage
-    key_decoder.zig     # Terminal input parsing
-    region.zig          # Screen region management
-    keybindings.zig     # Configurable key binding system
-    diff_renderer.zig   # Side-by-side diff display
 
   bin/
     main.zig              # CLI entrypoint (franky binary)
@@ -828,7 +801,7 @@ const grep_tool = franky.coding.tools.grep.tool();
 | `ai` providers | faux, anthropic, openai_chat, openai_responses, openai_gateway, google_gemini, google_vertex | ✅ (7 providers, full wire format + SSE) |
 | `agent` | low-level loop (sequential + parallel-homogeneous), stateful `Agent` (worker thread + subscribers + steer/followUp drain) | ✅ |
 | `coding` tools | read, write, edit (atomic), bash (cwd-locked + env-denylist + §R), ls, find, grep (regex + gitignore) | ✅ |
-| `coding` modes | print, interactive (TUI), rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
+| `coding` modes | print, rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
 | `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, bearer-token auth (`--auth-token` + `auth.json` round-trip), Tier-1 extensions | ✅ |
 
 **881 tests** pass at the current cut across one library binary and the
@@ -1013,7 +986,7 @@ A comprehensive automated audit of every module in the source tree was performed
 
 5. **`freeSessionHeader` is fragile** (`src/coding/session.zig:147-151`) — Adding a new owning-string field to `SessionHeader` silently leaks unless `freeSessionHeader` is updated. **Fix:** use compile-time reflection or add a comptime assertion.
 
-6. **No end-to-end tests for the four run modes** (`src/coding/modes/`) — `print.zig`, `interactive.zig`, `rpc.zig`, `proxy.zig` have zero mode-level integration tests.
+6. **No end-to-end tests for the three run modes** (`src/coding/modes/`) — `print.zig`, `rpc.zig`, `proxy.zig` have zero mode-level integration tests.
 
 ### 🟡 Medium-severity issues
 

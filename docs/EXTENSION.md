@@ -1,4 +1,4 @@
-Here is the minimal `main.zig` that wires a franky extension — tools, skills, and hooks — into both print and interactive modes with a single registration call:
+Here is the minimal `main.zig` that wires a franky extension — tools, skills, and hooks — into print mode with a single registration call:
 
 ```zig
 //! franky-go — standalone binary with the go-dev extension pre-loaded.
@@ -9,8 +9,8 @@ Here is the minimal `main.zig` that wires a franky extension — tools, skills, 
 //!
 //! Usage:
 //!   zig build run -- --extensions go-dev \"Write a Go http handler\"
-//!   zig build run -- --mode interactive
-//!   zig build run -- --extensions go-dev --mode interactive
+//!   zig build run -- --mode proxy
+//!   zig build run -- --extensions go-dev --mode proxy
 
 const std = @import(\"std\");
 const franky = @import(\"franky\");
@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     // at startup. The extension's init_fn registers:
     //   - Tools  → merged into the agent loop's tool list
     //   - Presets → merged into the subagent PresetRegistry
-    //   - Slash commands → merged into the slash registry (interactive mode)
+    //   - Slash commands → merged into the slash registry (proxy mode)
     try franky.ext_catalog.register(\"go-dev\", go_dev.extension);
 
     // ── 2. Skills go in <workspace>/skills/*.md ─────────────────────
@@ -53,13 +53,13 @@ pub fn main(init: std.process.Init) !void {
     // The extension system already provides the Host API:
     //   host.registerTool()     — add a tool
     //   host.registerPreset()   — add a subagent preset
-    //   host.registerCommand()  — add a slash command (interactive)
+    //   host.registerCommand()  — add a slash command (proxy)
     //   host.subscribe()        — subscribe to agent events
     //
     // No additional wiring needed.
 
     // ── 4. Delegate to franky's mode driver ─────────────────────────
-    // Dispatches --mode print (default) and --mode interactive.
+    // Dispatches --mode print (default) and --mode proxy.
     // The extension tools are already in final_tools; skills are in
     // the system prompt; hooks are active.
     var args_list: std.ArrayList([]const u8) = .empty;
@@ -83,10 +83,10 @@ pub fn main(init: std.process.Init) !void {
 | **Tools** | Extension `init_fn` calls `host.registerTool()` | `ext_catalog.register(\"go-dev\", go_dev.extension)` |
 | **Subagent presets** | Extension `init_fn` calls `host.registerPreset()` (or `registerPreset(&preset_registry)` for standalone) | Same one-liner |
 | **Skills** | `<workspace>/skills/*.md` files auto-discovered by `buildSystemPromptIo()` | Zero |
-| **Slash commands** | Extension `init_fn` calls `host.registerCommand()` — active in interactive mode | Same one-liner |
+| **Slash commands** | Extension `init_fn` calls `host.registerCommand()` — active in proxy mode | Same one-liner |
 | **Event subscriptions** | Extension `init_fn` calls `host.subscribe()` — agent events forwarded | Same one-liner |
 | **Print mode** | `--extensions go-dev \"write a Go http server\"` | Delegated to franky |
-| **Interactive mode** | `--extensions go-dev --mode interactive` | Delegated to franky |
+| **Proxy mode** | `--extensions go-dev --mode proxy` | Delegated to franky |
 | **CLI flags** | `--provider`, `--model`, `--thinking`, `--role`, etc. | Delegated to franky |
 | **Session persistence** | Auto-saved under `$FRANKY_HOME/sessions/` | Delegated to franky |
 | **Agent loop** | Turn logic, tool execution, error recovery, guardrails | Delegated to franky |
@@ -120,7 +120,7 @@ The `Host` view gives access to `registerTool`, `registerPreset`, `registerComma
 
 1. **`extensions_builtin/catalog.zig`** — added `register()` for runtime registration
 2. **`print.zig`** — added extension loading + tool merging into `final_tools`
-3. **`interactive.zig`** — added extension tool merging into `session.tools` after extension loading
+3. **`proxy.zig`** — added extension tool merging into `session.tools` after extension loading
 4. **`sdk.zig`** — added `ext_catalog` re-export
 
 No changes to the agent loop, skill loading, or mode dispatch were needed — franky's existing architecture already supports all of this once the extension's tools are properly merged.

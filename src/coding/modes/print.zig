@@ -91,7 +91,7 @@ pub fn run(
 
     var cfg = cli_mod.parse(allocator, argv) catch |e| switch (e) {
         error.MissingValue => return exitWithMessage(io, "missing value for flag; see --help\n", 2),
-        error.UnknownMode => return exitWithMessage(io, "unknown --mode value; use print\n", 2),
+        error.UnknownMode => return exitWithMessage(io, "unknown --mode value; use print, rpc, or proxy\n", 2),
         error.UnknownThinkingLevel => return exitWithMessage(io, "unknown --thinking value; use off|minimal|low|medium|high|xhigh\n", 2),
         else => |err| return err,
     };
@@ -187,12 +187,6 @@ pub fn run(
     if (cfg.mode == .proxy) {
         const proxy_mode = @import("proxy.zig");
         return proxy_mode.run(allocator, io, environ, environ_map, &cfg, argv);
-    }
-    if (cfg.mode == .interactive) {
-        // Interactive mode doesn't require a prompt — the REPL
-        // collects input from the terminal.
-        const interactive = @import("interactive.zig");
-        return interactive.run(allocator, io, environ, environ_map, &cfg);
     }
     if (cfg.prompt.len == 0 and cfg.resume_id == null) {
         return exitWithMessage(io, "no prompt given; try: franky \"hello\"\n", 2);

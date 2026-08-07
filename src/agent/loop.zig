@@ -201,7 +201,7 @@ pub const MaxTurnsDecision = union(enum) {
 /// to its current cap. Receives the number of turns consumed and
 /// the cap that was just hit; returns `.extend(N)` to continue or
 /// `.stop` to give up. Mode drivers wire this to whatever UX the
-/// surface allows — interactive prompts the user, RPC/proxy can
+/// surface allows — proxy prompts the user via the web UI, RPC can
 /// surface a `tool_permission_request`-style event, print mode
 /// typically passes null and lets the loop terminate.
 pub const OnMaxTurnsFn = *const fn (

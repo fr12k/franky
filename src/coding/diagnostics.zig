@@ -26,7 +26,7 @@ pub const Options = struct {
     /// does not stat the directory.
     http_trace_dir: ?[]const u8 = null,
     /// `<parent_dir>/<session_id>` when known (print/proxy/rpc),
-    /// else null (interactive). When set, the analyzer renders the
+    /// else null. When set, the analyzer renders the
     /// expected reducer-dump path for each degenerate turn so the
     /// user can `cat` it.
     session_dir: ?[]const u8 = null,

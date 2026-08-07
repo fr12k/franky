@@ -74,6 +74,7 @@ const ext_catalog = franky.coding.extensions_builtin.catalog;
 const review_mod = @import("../review.zig");
 const sse_mod = @import("../sse.zig");
 const compression_mod = franky.coding.compression;
+const config_mod = franky.coding.config.resolver;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -631,18 +632,8 @@ fn initSession(
     const role_gate = role_mod.RoleGate.init(active_role);
     var role_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer role_arena.deinit();
-    const all_tools = [_]at.AgentTool{
-        tools_mod.read.tool(),
-        tools_mod.write.tool(),
-        tools_mod.edit.tool(),
-        tools_mod.bash.tool(),
-        tools_mod.ls.tool(),
-        tools_mod.find.tool(),
-        tools_mod.grep.tool(),
-        tools_mod.web_search.tool(),
-        tools_mod.web_fetch.tool(),
-    };
-    const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
+    // Tools are built after session init (need &session.bash_state).
+    const filtered: []const at.AgentTool = &.{};
 
     var permission_store = permissions_mod.Store.init(allocator);
     errdefer permission_store.deinit();
@@ -749,25 +740,14 @@ fn initSession(
     // resolveProviderIo below.
     session.bash_state.parent_env = session.environ_map;
 
-    // v1.27.3 — rebuild the filtered tool list with `bash.toolWithState`
-    // now that `&session.bash_state` is at a stable address. The
-    // initial `bash.tool()` factory above couldn't reference the
-    // bash_state because the session struct hadn't been populated
-    // yet; switching here ensures the bash invocation actually sees
-    // the session-dir spill plumbing.
+    // v1.27.3 — build the filtered tool list with session-owned
+    // state now that `&session.bash_state` is at a stable address.
     {
-        const all_tools_with_state = [_]at.AgentTool{
-            tools_mod.read.tool(),
-            tools_mod.write.tool(),
-            tools_mod.edit.tool(),
-            tools_mod.bash.toolWithState(&session.bash_state),
-            tools_mod.ls.tool(),
-            tools_mod.find.tool(),
-            tools_mod.grep.tool(),
-            tools_mod.web_search.toolWithCtx(&session.web_search_ctx),
-            tools_mod.web_fetch.toolWithCtx(&session.web_search_ctx),
-        };
-        session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
+        session.web_search_ctx = .{ .environ_map = session.environ_map };
+        session.tools = try config_mod.buildBaseToolSet(session.role_arena.allocator(), active_role, .{
+            .bash_state = &session.bash_state,
+            .web_search_ctx = &session.web_search_ctx,
+        });
     }
     // No resume_loaded cleanup — SessionState.init() handled
     // the loaded header internally, transferring transcript ownership.
@@ -875,17 +855,14 @@ fn initSession(
             // §6.7 — enable full text/thinking deltas for the panel.
             .verbose_progress = true,
         };
-        const final_tools = try ra.alloc(at.AgentTool, session.tools.len + @as(u32, @intCast(ext_tools.len)) + 4);
-        @memcpy(final_tools[0..session.tools.len], session.tools);
-        if (ext_tools.len > 0) {
-            @memcpy(final_tools[session.tools.len..][0..ext_tools.len], ext_tools);
-        }
-        const off = session.tools.len + ext_tools.len;
-        final_tools[off] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        final_tools[off + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
-        final_tools[off + 2] = session.guardrail_state.finishTaskTool();
-        // v3.0 — ccr_retrieve tool for reversible compression
-        final_tools[off + 3] = tools_mod.ccr_retrieve.toolWithCtxAndStats(&session.ccr_ctx);
+        const final_tools = try config_mod.finalizeToolSet(ra, .{
+            .base_tools = session.tools,
+            .ext_tools = ext_tools,
+            .subagent_ctx = subagent_ctx,
+            .preset_registry = preset_reg,
+            .guardrail_state = &session.guardrail_state,
+            .ccr_ctx = &session.ccr_ctx,
+        });
         session.tools = final_tools;
     }
 

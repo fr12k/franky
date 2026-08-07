@@ -12,7 +12,7 @@
 //!   --session-dir DIR          Parent dir for sessions (default ~/.franky/sessions)
 //!   --resume ID                Resume a prior session (same as --session + load)
 //!   --no-session               Do not persist this run
-//!   --mode MODE                print (default) | interactive (deferred) | rpc (deferred)
+//!   --mode MODE                print (default) | rpc | proxy
 //!   --verbose                  Extra logging to stderr
 //!   -h / --help                Show usage and exit(0)
 //!   --version                  Print version and exit(0)
@@ -24,7 +24,7 @@
 const std = @import("std");
 const types = @import("../../ai/types.zig");
 
-pub const Mode = enum { print, interactive, rpc, proxy };
+pub const Mode = enum { print, rpc, proxy };
 
 pub const Config = struct {
     provider: ?[]const u8 = null,
@@ -52,8 +52,8 @@ pub const Config = struct {
     log_level: ?[]const u8 = null,
     /// `--log-file <path>` (v1.13.0). Routes the leveled logger
     /// (`ai.log`) to a file instead of stderr — essential when
-    /// pairing `--mode interactive` with verbose log levels, as
-    /// stderr would otherwise garble the TUI on the same TTY.
+    /// pairing `--mode proxy` with verbose log levels, as
+    /// stderr would otherwise garble the web UI on the same TTY.
     /// Env fallback: `FRANKY_LOG_FILE`.
     log_file: ?[]const u8 = null,
     /// `--log-per-session` (v1.18.0). When set AND `--log-file`
@@ -207,7 +207,7 @@ pub const Config = struct {
 
     /// `--max-turns N` — hard cap on agent-loop turns per prompt.
     /// Default 100. When the cap is reached, the loop emits
-    /// `agent_error{max_turns_exceeded}` (interactive mode prompts
+    /// `agent_error{max_turns_exceeded}` (proxy mode prompts
     /// the user to extend; other modes terminate). Env fallback:
     /// `FRANKY_MAX_TURNS`. Settings/profile keys: `max_turns`.
     max_turns: ?u32 = null,
@@ -217,7 +217,7 @@ pub const Config = struct {
     /// off (default) the gate isn't installed, preserving v1.10.x
     /// behavior. When on, the default policy auto-allows
     /// read/ls/find/grep and refuses write/edit/bash unless
-    /// `--yes`, `--allow-tools`, or (v1.11.1+) interactive
+    /// `--yes`, `--allow-tools`, or (v1.11.1+) proxy
     /// approval permits the call.
     prompts: bool = false,
     /// `--yes` / `-y` — every "ask" decision becomes auto-allow.
@@ -627,7 +627,6 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
     } else if (std.mem.eql(u8, name, "--mode")) {
         const v = try takeValue(argv, i, inline_value);
         if (std.mem.eql(u8, v, "print")) cfg.mode = .print
-        else if (std.mem.eql(u8, v, "interactive")) cfg.mode = .interactive
         else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
         else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
         else return error.UnknownMode;
@@ -665,7 +664,7 @@ pub const usage_text: []const u8 =
     \\                               — http->trace, all else->info).
     \\                               env: FRANKY_LOG
     \\  --log-file PATH              Route logs to PATH instead of stderr (essential
-    \\                               when pairing --mode interactive with verbose levels;
+    \\                               when pairing --mode proxy with verbose levels;
     \\                               env: FRANKY_LOG_FILE)
     \\  --log-per-session            After session id is known, route logs to
     \\                               $FRANKY_HOME/logs/<session-id>.log so each run
@@ -692,7 +691,7 @@ pub const usage_text: []const u8 =
     \\  --session-dir DIR            Parent dir (default: $FRANKY_HOME/sessions or ~/.franky/sessions)
     \\  --resume ID                  Resume a prior session (implies --session)
     \\  --no-session                 Do not persist this run
-    \\  --mode MODE                  print | interactive | rpc | proxy
+    \\  --mode MODE                  print | rpc | proxy
     \\  --proxy-port N               TCP port for --mode proxy (§4.7) [default: 8787]
     \\  --continue                   Resume the most-recent session in session-dir
     \\  --fork NAME                  Fork a new branch at the current head (§5.1)
@@ -716,7 +715,7 @@ pub const usage_text: []const u8 =
     \\  --event-gap-timeout-ms N     Max gap between SSE events (default 60000)
     \\  --max-turns N                Cap agent-loop turns per prompt (default 100).
     \\                               Reaching the cap emits agent_error{max_turns_exceeded};
-    \\                               interactive mode prompts to extend.
+    \\                               proxy mode prompts to extend.
     \\  --prompts                    Enable per-tool permission gate (Approach A)
     \\  --yes, -y                    Auto-allow every "ask" decision (CI mode)
     \\  --allow-tools LIST           CSV of tool names or bash:<fingerprint>
