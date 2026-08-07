@@ -794,13 +794,30 @@ fn runTurn(
 
     // Call provider via registry, draining into a Reducer while forwarding
     // deltas as agent events.
+    //
+    // vFIX — run the provider's `stream` on a DEDICATED THREAD and drain the
+    // stream channel concurrently on THIS thread. Previously `registry.stream`
+    // was called synchronously and the drain loop (`stream_ch.next`) ran only
+    // after it returned — on the SAME thread. The provider pushes every SSE
+    // event into the bounded stream channel (16 384 slots) before the drain
+    // starts, so a large response (observed: 5.6 MB / 5.8 MB → ~28K-93K events)
+    // fills the ring and `Channel.push` blocks forever on `not_full.wait` — a
+    // classic bounded-channel single-thread deadlock. Cancel cannot break it
+    // (`push` is uncancelable; the HTTP driver's cancel check only runs between
+    // events, not inside a blocked `push`), so interrupts silently no-op and
+    // the whole agent wedges until the process is killed.
+    //
+    // Threading the producer mirrors the existing `loopWorkerMain` fix for the
+    // agent→UI channel (agent.zig v1.21.0). The drain loop now pops events as the
+    // producer pushes them, so the ring never fills regardless of response size.
     var stream_ch = try streamChannel(allocator);
     defer stream_ch.deinit();
 
     var opts = config.stream_options;
     opts.cancel = config.cancel;
 
-    try config.registry.stream(.{
+    const stream_args = StreamWorkerArgs{
+        .registry = config.registry,
         .allocator = allocator,
         .io = io,
         .model = config.model,
@@ -808,30 +825,21 @@ fn runTurn(
         .options = opts,
         .out = &stream_ch,
         .http_client = http_client,
-    });
-
-    // Diagnostic — channel usage during the synchronous stream that just
-    // completed. Because the provider pushes all events before the drain
-    // loop starts, the watermark at this point is the true peak. Log a
-    // warning at ≥75 % so operators can increase capacity before a future
-    // turn with more events hits 100 % and deadlocks.
-    // See docs/limits/stream-channel-capacity.md for full analysis.
-    {
-        const sc_used = stream_ch.len;
-        const sc_cap  = stream_ch.capacity;
-        if (sc_used * 4 >= sc_cap * 3) {
-            ai.log.log(
-                .warn, "loop", "stream_channel_high_watermark",
-                "events={d}/{d} ({d}%) — approaching deadlock threshold; see docs/limits/stream-channel-capacity.md",
-                .{ sc_used, sc_cap, sc_used * 100 / sc_cap },
-            );
-        } else {
-            ai.log.log(
-                .debug, "loop", "stream_channel_usage",
-                "events={d}/{d} ({d}%)",
-                .{ sc_used, sc_cap, sc_used * 100 / sc_cap },
-            );
-        }
+    };
+    const stream_thread = std.Thread.spawn(.{}, streamWorkerMain, .{stream_args}) catch |e| {
+        ai.log.log(.err, "loop", "stream_spawn_failed", "err={s}", .{@errorName(e)});
+        try pushAgentError(out, io, allocator, .internal, "failed to spawn provider stream thread");
+        return false;
+    };
+    // vFIX — on EVERY exit path (normal drain completion, an error from
+    // `out.push`/`reducer.apply`, or an early `return`) we must (a) close the
+    // stream channel so a producer still blocked in `push` on a full ring
+    // wakes with `error.Closed` and exits, then (b) join the producer thread
+    // to free its handle. `close()` is idempotent so the normal path (where
+    // the producer already closed + returned) is a no-op + instant join.
+    defer {
+        stream_ch.close(io);
+        stream_thread.join();
     }
 
     try out.push(io, .{ .message_start = .{ .role = .assistant } });
@@ -840,7 +848,12 @@ fn runTurn(
     defer reducer.deinit();
 
     var provider_error: ?ai.errors.ErrorDetails = null;
+    var peak_watermark: usize = 0;
     while (stream_ch.next(io)) |ev| {
+        // vFIX — track the peak channel usage for the post-stream diagnostic.
+        // Sampled on each pop; with a concurrent producer this is the true
+        // high-water mark (events in flight), not the pre-drain total.
+        if (stream_ch.len > peak_watermark) peak_watermark = stream_ch.len;
         reducer.apply(ev) catch |e| {
             ev.deinit(allocator);
             return e;
@@ -892,6 +905,29 @@ fn runTurn(
             else => {},
         }
         ev.deinit(allocator);
+    }
+
+    // vFIX — post-stream channel diagnostic. With a concurrent producer this
+    // `peak_watermark` is the true high-water mark (max events in flight), not
+    // the pre-drain total the old sequential code measured. A value near
+    // `capacity` means the producer was out-pacing the drain and the ring
+    // nearly filled; a sustained 100 % would have deadlocked the old code.
+    // See docs/limits/stream-channel-capacity.md for the full analysis.
+    {
+        const sc_cap = stream_ch.capacity;
+        if (peak_watermark * 4 >= sc_cap * 3) {
+            ai.log.log(
+                .warn, "loop", "stream_channel_high_watermark",
+                "peak={d}/{d} ({d}%) — producer out-paced drain; see docs/limits/stream-channel-capacity.md",
+                .{ peak_watermark, sc_cap, peak_watermark * 100 / sc_cap },
+            );
+        } else {
+            ai.log.log(
+                .debug, "loop", "stream_channel_usage",
+                "peak={d}/{d} ({d}%)",
+                .{ peak_watermark, sc_cap, peak_watermark * 100 / sc_cap },
+            );
+        }
     }
 
     if (provider_error) |pe| {
@@ -1380,28 +1416,79 @@ fn runToolsParallel(
 }
 
 fn streamChannel(allocator: std.mem.Allocator) !ai.channel.Channel(ai.stream.StreamEvent) {
-    // Provider-to-reducer buffer. The provider's streamFn pushes every
-    // SSE delta synchronously (whole response is buffered first) and the
-    // drain loop runs on the same thread — so this ring must fit the
-    // entire turn's event stream without ever blocking on push, because
-    // blocking = deadlock.
+    // Provider-to-reducer buffer. The provider's `streamFn` pushes every
+    // SSE delta into this ring while `runTurn` drains it concurrently on
+    // the main loop thread (vFIX — previously both ran on the same thread,
+    // so a large response filled the ring and deadlocked in `push`; see the
+    // `runTurn` comment for the full history).
     //
+    // With a concurrent drain the ring only needs to hold the events in
+    // flight (producer ahead of consumer), not the whole turn's stream.
     // Event budget per turn (worst observed: DeepSeek-v4-flash:cloud):
     //   ~1 000 thinking_delta  (reasoning phase)
     //   ~4 000 text_delta      (content phase, ~4 K tokens)
     //   + start / done / diagnostic + misc overhead
     //   ≈ 5 300 events total
     //
-    // 16 384 gives a 3× safety margin over the observed ~5 300 event
-    // peak. Interactive mode uses 4 096 without blocking, confirming
-    // the consumer side is fast enough; 16 384 is conservative.
-    // Memory cost is ~5.5 MB at 352 B/slot vs 22 MB at 65 536.
+    // 65 536 gives a 12× safety margin over the observed ~5 300 event
+    // peak. Under the concurrent drain the steady-state in-flight depth is
+    // far lower (the consumer keeps pace), so the cap only matters for brief
+    // producer bursts; 65 536 is generous headroom kept from the prior partial
+    // workaround (bumping the cap alone did NOT fix the deadlock — the
+    // concurrent producer in `runTurn` does). Memory cost is transient
+    // (per-turn arena): ~3.5 MB at 54 B/slot.
     return try ai.channel.Channel(ai.stream.StreamEvent).initWithDrop(
         allocator,
-        16384,
+        65536,
         ai.stream.StreamEvent.deinit,
         allocator,
     );
+}
+
+/// vFIX — args for the provider-stream worker thread (`streamWorkerMain`).
+/// Mirrors `ai.registry.StreamCtx` but holds a `*const Registry` so the
+/// worker can call `registry.stream(...)` without the caller having to thread
+/// the entry lookup. All fields are borrowed (caller-owned, valid for the
+/// lifetime of `runTurn`'s stack frame), so the worker does no allocation of
+/// its own beyond what `registry.stream` does internally.
+const StreamWorkerArgs = struct {
+    registry: *const ai.registry.Registry,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.types.Model,
+    context: ai.types.Context,
+    options: ai.registry.StreamOptions,
+    out: *ai.channel.Channel(ai.stream.StreamEvent),
+    http_client: ?*anyopaque,
+};
+
+/// vFIX — runs `registry.stream` on a dedicated thread so `runTurn` can drain
+/// the stream channel concurrently and the bounded ring never fills. The
+/// producer closes `out` (via the provider's `closeWithFinal`/`close`) on
+/// return — natural or error — which unblocks the drain loop's final
+/// `stream_ch.next` with `null`. If the drain side errors out and returns
+/// early, `runTurn`'s defer closes the channel, which makes any blocked `push`
+/// in this thread return `error.Closed` so it exits promptly; `runTurn` then
+/// joins this thread. Any error from `registry.stream` is logged here; the
+/// provider is expected to push an `error_ev` terminal onto `out` before
+/// returning, which the drain loop surfaces as `provider_error`.
+fn streamWorkerMain(args: StreamWorkerArgs) void {
+    args.registry.stream(.{
+        .allocator = args.allocator,
+        .io = args.io,
+        .model = args.model,
+        .context = args.context,
+        .options = args.options,
+        .out = args.out,
+        .http_client = args.http_client,
+    }) catch |e| {
+        ai.log.log(.warn, "loop", "stream_worker_error", "err={s}", .{@errorName(e)});
+        // Best-effort: ensure the channel is closed so the drain loop's
+        // `next` unblocks. `close` is idempotent; the provider normally closes
+        // itself, but if it threw before reaching its close path this prevents
+        // the drain side from waiting forever on an empty, open channel.
+        args.out.close(args.io);
+    };
 }
 
 fn findTool(tools: []const at.AgentTool, name: []const u8) ?at.AgentTool {
