@@ -34,6 +34,7 @@ const permissions_mod = franky.coding.permissions;
 const compression_mod = franky.coding.compression;
 const config_mod = franky.coding.config.resolver;
 const memory_mod = franky.coding.memory;
+const memory_guard_mod = franky.agent.guardrails;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -145,12 +146,22 @@ const Session = struct {
     /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
     ccr_ctx: compression_mod.CcrContext = undefined,
 
+    /// v3.2 — memory state owning the SQLite store. `null` when memory
+    /// is disabled or the store failed to open (degraded mode). Owned
+    /// by `role_arena`; deinit'd in `deinit`.
+    memory_state: ?*memory_mod.MemoryState = null,
+    /// v3.2 — memory nudge guardrail. `null` when nudge is off or
+    /// memory is disabled. Owned by `role_arena`.
+    memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+
     fn deinit(self: *Session) void {
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
         self.bash_state.deinit();
         self.guardrail_state.deinit();
         self.ccr_store.deinit();
+        // v3.2 — memory state (allocated on role_arena).
+        if (self.memory_state) |ms| ms.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -314,6 +325,32 @@ fn initSession(
     errdefer session.guardrail_state.deinit();
     session.guardrail_state.setupAutoCommitBranch(allocator, io);
 
+    // v3.2 — memory state + nudge guardrail. RPC mode (like proxy)
+    // builds the session by hand and doesn't call config_mod.resolve(),
+    // so it constructs the MemoryState itself via the shared
+    // `initMemoryFromEnv` helper. On degraded mode (store open failure)
+    // `memory_state` stays null; we flip `cfg.memory_enabled` off so
+    // `buildSystemPromptIo` suppresses the Memory Tools hint.
+    //
+    // The pointers are allocated on `session.role_arena` and deinit'd
+    // in `Session.deinit`.
+    {
+        const ra = session.role_arena.allocator();
+        const mem = try config_mod.initMemoryFromEnv(
+            ra,
+            allocator,
+            io,
+            cfg,
+            environ_map,
+        );
+        session.memory_state = mem.state;
+        session.memory_guardrail = mem.guardrail;
+        if (mem.guardrail) |mg| {
+            session.guardrail_state.memory_guardrail = mg;
+        }
+        if (mem.state == null) cfg.memory_enabled = false;
+    }
+
     session.provider = try print_mode.resolveProviderIo(allocator, io, environ, cfg);
 
     // v0.30.0 — expose session metadata to the bash tool's child env.
@@ -405,6 +442,7 @@ fn initSession(
         .preset_registry = preset_reg,
         .guardrail_state = &session.guardrail_state,
         .ccr_ctx = &session.ccr_ctx,
+        .memory_state = session.memory_state,
     });
     session.tools = final_tools;
 

@@ -857,6 +857,61 @@ fn initMemoryState(
     return mem;
 }
 
+/// v3.2 — Bundle returned by `initMemoryFromEnv`. Both pointers are
+/// allocated on `arena_alloc` and owned by the caller (deinit via
+/// `MemoryState.deinit` + `arena_alloc.destroy`). Either may be null:
+/// `state` is null when memory is disabled or the store failed to open
+/// (degraded mode); `guardrail` is additionally null when `memory_nudge`
+/// is off or `state` is null.
+pub const MemoryInit = struct {
+    state: ?*memory_mod.MemoryState = null,
+    guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+};
+
+/// v3.2 — Resolve the memory db + data-dir paths from the environment
+/// (mirroring `resolve()`'s Step 12.5), open the SQLite store, and
+/// optionally build the nudge guardrail. Returns a bundle with `state`
+/// null in degraded mode (alloc failure or store init failure), after
+/// logging a warning. The nudge guardrail is only built when both
+/// `cfg.memory_nudge` is true and the store opened successfully.
+///
+/// Both pointers are allocated on `arena_alloc`; the caller owns them.
+/// This is the shared entry point used by `resolve()` (print mode) and
+/// the proxy/rpc mode drivers so all three modes wire memory identically.
+pub fn initMemoryFromEnv(
+    arena_alloc: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *cli_mod.Config,
+    environ_map: *std.process.Environ.Map,
+) !MemoryInit {
+    if (!cfg.memory_enabled) return .{};
+
+    const franky_home = environ_map.get("FRANKY_HOME") orelse blk: {
+        if (environ_map.get("HOME")) |h| break :blk h;
+        break :blk null;
+    };
+    const db_path = if (franky_home) |h|
+        try std.fs.path.join(arena_alloc, &.{ h, "memory.db" })
+    else
+        try arena_alloc.dupe(u8, "./memory.db");
+    const data_dir = if (franky_home) |h|
+        try std.fs.path.join(arena_alloc, &.{ h, "memory" })
+    else
+        try arena_alloc.dupe(u8, "./memory");
+    // Ensure the data dir exists for L2/L3 markdown files.
+    std.Io.Dir.cwd().createDirPath(io, data_dir) catch {};
+
+    var out: MemoryInit = .{};
+    out.state = initMemoryState(arena_alloc, allocator, io, db_path, data_dir);
+    if (out.state != null and cfg.memory_nudge) {
+        const mg = try arena_alloc.create(memory_guard_mod.MemoryGuardrail);
+        mg.* = memory_guard_mod.MemoryGuardrail.init(.{ .enabled = true });
+        out.guardrail = mg;
+    }
+    return out;
+}
+
 fn authJsonPathFrom(
     arena_alloc: std.mem.Allocator,
     franky_home: ?[]const u8,
@@ -1278,28 +1333,11 @@ pub fn resolve(
     // prompt hint is omitted. Everything else works normally.
     var memory_state: ?*memory_mod.MemoryState = null;
     var memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null;
-    if (cfg.memory_enabled) {
-        const franky_home = environ_map.get("FRANKY_HOME") orelse blk: {
-            if (environ_map.get("HOME")) |h| break :blk h;
-            break :blk null;
-        };
-        const db_path = if (franky_home) |h|
-            try std.fs.path.join(a, &.{ h, "memory.db" })
-        else
-            try a.dupe(u8, "./memory.db");
-        const data_dir = if (franky_home) |h|
-            try std.fs.path.join(a, &.{ h, "memory" })
-        else
-            try a.dupe(u8, "./memory");
-        // Ensure the data dir exists for L2/L3 markdown files.
-        std.Io.Dir.cwd().createDirPath(io, data_dir) catch {};
-
-        memory_state = initMemoryState(a, allocator, io, db_path, data_dir);
-        if (memory_state != null and cfg.memory_nudge) {
-            const mg = try a.create(memory_guard_mod.MemoryGuardrail);
-            errdefer a.destroy(mg);
-            mg.* = memory_guard_mod.MemoryGuardrail.init(.{ .enabled = true });
-            memory_guardrail = mg;
+    {
+        const mem = try initMemoryFromEnv(a, allocator, io, cfg, environ_map);
+        memory_state = mem.state;
+        memory_guardrail = mem.guardrail;
+        if (memory_guardrail) |mg| {
             // Wire the guardrail into the GuardrailState so the loop's
             // afterToolCall + betweenTurns forward to it.
             guardrail_state.memory_guardrail = mg;
