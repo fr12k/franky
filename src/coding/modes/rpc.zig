@@ -32,6 +32,8 @@ const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
 const compression_mod = franky.coding.compression;
+const config_mod = franky.coding.config.resolver;
+const memory_mod = franky.coding.memory;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -173,18 +175,8 @@ fn initSession(
     const role_gate = role_mod.RoleGate.init(active_role);
     var role_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer role_arena.deinit();
-    const all_tools = [_]at.AgentTool{
-        tools_mod.read.tool(),
-        tools_mod.write.tool(),
-        tools_mod.edit.tool(),
-        tools_mod.bash.tool(),
-        tools_mod.ls.tool(),
-        tools_mod.find.tool(),
-        tools_mod.grep.tool(),
-        tools_mod.web_search.tool(),
-        tools_mod.web_fetch.tool(),
-    };
-    const filtered = try role_mod.filterTools(role_arena.allocator(), &all_tools, role_gate.set);
+    // Tools are built after session init (need &session.bash_state).
+    const filtered: []const at.AgentTool = &.{};
     // v1.24.0 — subagent wiring deferred until after permission_store
     // is built (we need its address). See the `final_tools` block below.
 
@@ -303,22 +295,14 @@ fn initSession(
         }
     }
 
-    // v1.27.3 — rebuild the filtered tool list with `bash.toolWithState`
-    // now that `&session.bash_state` is at a stable address. Same
-    // pattern as proxy.zig.
+    // v1.27.3 — build the filtered tool list with session-owned
+    // state now that `&session.bash_state` is at a stable address.
     {
-        const all_tools_with_state = [_]at.AgentTool{
-            tools_mod.read.tool(),
-            tools_mod.write.tool(),
-            tools_mod.edit.tool(),
-            tools_mod.bash.toolWithState(&session.bash_state),
-            tools_mod.ls.tool(),
-            tools_mod.find.tool(),
-            tools_mod.grep.tool(),
-            tools_mod.web_search.toolWithCtx(&session.web_search_ctx),
-            tools_mod.web_fetch.toolWithCtx(&session.web_search_ctx),
-        };
-        session.tools = try role_mod.filterTools(session.role_arena.allocator(), &all_tools_with_state, session.role_gate.set);
+        session.web_search_ctx = .{ .environ_map = session.environ_map };
+        session.tools = try config_mod.buildBaseToolSet(session.role_arena.allocator(), active_role, .{
+            .bash_state = &session.bash_state,
+            .web_search_ctx = &session.web_search_ctx,
+        });
     }
 
     // §6.10 — harness-enforced guardrails (stuck detection, compilation guard, finish_task).
@@ -415,12 +399,13 @@ fn initSession(
         .progress_fn = subagentProgressForward,
         .progress_userdata = session,
     };
-    const final_tools = try ra.alloc(at.AgentTool, session.tools.len + 3);
-    @memcpy(final_tools[0..session.tools.len], session.tools);
-    final_tools[session.tools.len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-    final_tools[session.tools.len + 1] = tools_mod.subagent.listPresetsToolWithCtx(preset_reg);
-    // v3.0 — ccr_retrieve tool for reversible compression
-    final_tools[session.tools.len + 2] = tools_mod.ccr_retrieve.toolWithCtxAndStats(&session.ccr_ctx);
+    const final_tools = try config_mod.finalizeToolSet(ra, .{
+        .base_tools = session.tools,
+        .subagent_ctx = subagent_ctx,
+        .preset_registry = preset_reg,
+        .guardrail_state = &session.guardrail_state,
+        .ccr_ctx = &session.ccr_ctx,
+    });
     session.tools = final_tools;
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
@@ -693,13 +678,8 @@ fn runPrompt(
 
     session.cancel = .{}; // reset per-prompt
 
-    // §6.10 — extend tools with finish_task guardrail tool.
-    {
-        const tools_with_guardrail = try allocator.alloc(at.AgentTool, session.tools.len + 1);
-        @memcpy(tools_with_guardrail[0..session.tools.len], session.tools);
-        tools_with_guardrail[session.tools.len] = session.guardrail_state.finishTaskTool();
-        session.tools = tools_with_guardrail;
-    }
+    // §6.10 — finish_task tool is already in session.tools (added by
+    // finalizeToolSet at session init).
 
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
