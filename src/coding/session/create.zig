@@ -53,6 +53,12 @@ pub const SessionState = struct {
     compression_stats: compression_mod.CompressionStats = .{},
     /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
     ccr_ctx: compression_mod.CcrContext = undefined,
+    /// v3.0 — compression injection context for the agent loop.
+    /// Bundles `CompressionConfig` + `ccr_store` + `compression_stats`
+    /// so the loop can call `compressToolResultInjected` via an opaque
+    /// pointer (dependency inversion — the loop doesn't import
+    /// `coding/compression.zig`).
+    compression_ctx: compression_mod.CompressionContext = .{ .config = .{} },
 
     /// Initialise a `SessionState` from a parsed CLI config.
     ///
@@ -131,6 +137,8 @@ pub const SessionState = struct {
                 .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator),
             };
             state.ccr_ctx = .{ .store = &state.ccr_store, .stats = &state.compression_stats };
+            state.compression_ctx.ccr_store = &state.ccr_store;
+            state.compression_ctx.stats = &state.compression_stats;
             return state;
         }
 

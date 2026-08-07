@@ -10,7 +10,7 @@
 //!   - `role`                  → role + permitted tools + sandbox flag
 //!   - `prompt({text})`        → runs one agent turn; streams each
 //!     `AgentEvent` as a `event` notification (`method: "event"`)
-//!     with the JSON payload from `agent.proxy.encodeEventJson`.
+//!     with the JSON payload from `agent.wire.encodeEventJson`.
 //!     Replies with `{"done":true}` when the turn ends.
 //!   - `abort`                 → fires the cancel flag (best-effort;
 //!     only interrupts between turns in this pass).
@@ -145,6 +145,8 @@ const Session = struct {
     compression_stats: compression_mod.CompressionStats = .{},
     /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
     ccr_ctx: compression_mod.CcrContext = undefined,
+    /// v3.0 — compression injection context for the agent loop (DI).
+    compression_ctx: compression_mod.CompressionContext = .{ .config = .{} },
 
     /// v3.2 — memory state owning the SQLite store. `null` when memory
     /// is disabled or the store failed to open (degraded mode). Owned
@@ -262,6 +264,8 @@ fn initSession(
         .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
+    session.compression_ctx.ccr_store = &session.ccr_store;
+    session.compression_ctx.stats = &session.compression_stats;
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.session_gates = .{
         .role = &session.role_gate,
@@ -481,7 +485,7 @@ fn subagentProgressForward(
     } };
     defer ev.deinit(allocator);
 
-    const payload = agent.proxy.encodeEventJson(allocator, ev) catch return;
+    const payload = agent.wire.encodeEventJson(allocator, ev) catch return;
     defer allocator.free(payload);
 
     const notif = std.fmt.allocPrint(
@@ -756,9 +760,9 @@ fn runPrompt(
                     .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
                 },
             };
-            // v3.0 — wire compression into the agent loop
+            // v3.0 — wire compression into the agent loop via DI.
             if (session.cfg.compress) {
-                lc.compression = compression_mod.CompressionConfig{
+                session.compression_ctx.config = .{
                     .enabled = true,
                     .min_bytes_to_compress = session.cfg.compress_min_bytes,
                     .smart_crusher_enabled = session.cfg.compress_json,
@@ -769,8 +773,8 @@ fn runPrompt(
                     .plain_text_compressor_enabled = session.cfg.compress_plain_text,
                     .ccr_enabled = session.cfg.compress_ccr,
                 };
-                lc.ccr_store = &session.ccr_store;
-                lc.compression_stats = &session.compression_stats;
+                lc.compress_fn = compression_mod.compressToolResultInjected;
+                lc.compress_ctx = @ptrCast(&session.compression_ctx);
             }
             break :blk lc;
         },
@@ -794,7 +798,7 @@ fn runPrompt(
         switch (ch.tryNext(io)) {
             .closed => break :drain,
             .event => |ev| {
-                const payload = agent.proxy.encodeEventJson(allocator, ev) catch {
+                const payload = agent.wire.encodeEventJson(allocator, ev) catch {
                     ev.deinit(allocator);
                     continue;
                 };

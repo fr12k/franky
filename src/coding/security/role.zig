@@ -26,7 +26,11 @@
 
 const std = @import("std");
 const at = @import("../../agent/types.zig");
-const agent_loop = @import("../../agent/loop.zig");
+// RoleDenial / HookDecision contract types now live in
+// agent/types.zig (the contract module). Previously this file
+// imported agent/loop.zig (the 2800-line runtime) just to reach
+// RoleDenial — a leaking abstraction that pulled the entire
+// loop implementation into the security module's dependency graph.
 
 pub const Role = enum {
     read,
@@ -170,7 +174,7 @@ pub fn filterTools(
 }
 
 /// Runtime role gate. Bound to the active role + ToolSet at
-/// session init; passed into `agent_loop.Config` as
+/// session init; passed into the agent loop's `Config` as
 /// `hook_userdata` + the `role_denied` callback below. Lives
 /// at a stable address for the session's lifetime so the
 /// agent-loop worker thread can dereference it safely.
@@ -182,12 +186,12 @@ pub const RoleGate = struct {
         return .{ .role = role, .set = ToolSet.forRole(role) };
     }
 
-    /// Callback for `agent_loop.Config.role_denied`. Returns a
+    /// Callback for the agent loop's `Config.role_denied`. Returns a
     /// non-null `RoleDenial` only when `tool_name` is a known
     /// franky built-in disabled by the active role; otherwise
     /// `null` so the loop falls through to its existing
     /// "unknown tool" path.
-    pub fn check(userdata: ?*anyopaque, tool_name: []const u8) ?agent_loop.RoleDenial {
+    pub fn check(userdata: ?*anyopaque, tool_name: []const u8) ?at.RoleDenial {
         const self: *RoleGate = @ptrCast(@alignCast(userdata.?));
         if (!self.set.isKnownButDisabled(tool_name)) return null;
         const min = if (minRoleFor(tool_name)) |r| r.toString() else null;

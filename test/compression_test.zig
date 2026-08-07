@@ -116,6 +116,15 @@ test "compression: large JSON array is compressed in tool result" {
 
     var ccr_store = compression_mod.CcrSessionStore.init(gpa);
     defer ccr_store.deinit();
+    var compression_stats = compression_mod.CompressionStats{};
+    var compression_ctx = compression_mod.CompressionContext{
+        .config = .{
+            .enabled = true,
+            .min_bytes_to_compress = 1, // compress everything
+        },
+        .ccr_store = &ccr_store,
+        .stats = &compression_stats,
+    };
 
     const large_tool = at.AgentTool{
         .name = "large_json",
@@ -129,11 +138,8 @@ test "compression: large JSON array is compressed in tool result" {
         .tools = &[_]at.AgentTool{large_tool},
         .registry = &reg,
         .cancel = &cancel,
-        .compression = compression_mod.CompressionConfig{
-            .enabled = true,
-            .min_bytes_to_compress = 1, // compress everything
-        },
-        .ccr_store = &ccr_store,
+        .compress_fn = compression_mod.compressToolResultInjected,
+        .compress_ctx = @ptrCast(&compression_ctx),
     }, &ch);
 
     while (ch.next(io)) |ev| ev.deinit(gpa);
@@ -184,6 +190,15 @@ test "compression: small result passes through unchanged" {
 
     var ccr_store = compression_mod.CcrSessionStore.init(gpa);
     defer ccr_store.deinit();
+    var compression_stats = compression_mod.CompressionStats{};
+    var compression_ctx = compression_mod.CompressionContext{
+        .config = .{
+            .enabled = true,
+            .min_bytes_to_compress = 100, // larger than "small result"
+        },
+        .ccr_store = &ccr_store,
+        .stats = &compression_stats,
+    };
 
     const small_tool = at.AgentTool{
         .name = "small",
@@ -197,11 +212,8 @@ test "compression: small result passes through unchanged" {
         .tools = &[_]at.AgentTool{small_tool},
         .registry = &reg,
         .cancel = &cancel,
-        .compression = compression_mod.CompressionConfig{
-            .enabled = true,
-            .min_bytes_to_compress = 100, // larger than "small result"
-        },
-        .ccr_store = &ccr_store,
+        .compress_fn = compression_mod.compressToolResultInjected,
+        .compress_ctx = @ptrCast(&compression_ctx),
     }, &ch);
 
     while (ch.next(io)) |ev| ev.deinit(gpa);
@@ -249,8 +261,7 @@ test "compression: disabled config skips compression" {
         .tools = &[_]at.AgentTool{large_tool},
         .registry = &reg,
         .cancel = &cancel,
-        .compression = compression_mod.CompressionConfig{ .enabled = false },
-        .ccr_store = null,
+        .compress_fn = null, // compression disabled
     }, &ch);
 
     while (ch.next(io)) |ev| ev.deinit(gpa);
@@ -291,6 +302,15 @@ test "compression: ccr_store retains original content for retrieval" {
 
     var ccr_store = compression_mod.CcrSessionStore.init(gpa);
     defer ccr_store.deinit();
+    var compression_stats = compression_mod.CompressionStats{};
+    var compression_ctx = compression_mod.CompressionContext{
+        .config = .{
+            .enabled = true,
+            .min_bytes_to_compress = 1,
+        },
+        .ccr_store = &ccr_store,
+        .stats = &compression_stats,
+    };
 
     const large_tool = at.AgentTool{
         .name = "large_json",
@@ -304,11 +324,8 @@ test "compression: ccr_store retains original content for retrieval" {
         .tools = &[_]at.AgentTool{large_tool},
         .registry = &reg,
         .cancel = &cancel,
-        .compression = compression_mod.CompressionConfig{
-            .enabled = true,
-            .min_bytes_to_compress = 1,
-        },
-        .ccr_store = &ccr_store,
+        .compress_fn = compression_mod.compressToolResultInjected,
+        .compress_ctx = @ptrCast(&compression_ctx),
     }, &ch);
 
     while (ch.next(io)) |ev| ev.deinit(gpa);

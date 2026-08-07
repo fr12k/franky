@@ -60,6 +60,84 @@ pub const AgentMessage = ai.types.Message;
 
 pub const AgentChannel = ai.channel.Channel(AgentEvent);
 
+// ─── Compression injection contract ──────────────────────────────
+//
+// The agent loop compresses tool results before they enter the
+// transcript, but the compression *strategy* (zompress config, CCR
+// store, stats collector) is a coding-layer concern. To avoid a
+// cycle (`agent → coding → agent`), the loop holds an opaque
+// function pointer + context. The coding layer provides the
+// concrete implementation (`coding/compression.zig::compressToolResult`
+// wrapped in a thin adapter) and bundles its config/store/stats
+// into the context struct.
+//
+// The function is infallible from the loop's perspective — on
+// internal failure the implementation returns a passthrough copy.
+
+/// Compress a tool result's text content blocks. Returns a NEW
+/// `ToolResult`; the caller frees the original. Non-text blocks
+/// pass through unchanged. `ctx` is the opaque bundle the coding
+/// layer allocated (typically `*CompressionContext` from
+/// `coding/compression.zig`).
+pub const CompressToolResultFn = *const fn (
+    allocator: std.mem.Allocator,
+    result: *const ToolResult,
+    ctx: ?*anyopaque,
+) ToolResult;
+
+// ─── Loop hook contract types ───────────────────────────────────
+//
+// These types form the contract between the agent loop and its
+// callers (mode drivers, security gates, permission prompters).
+// They live here — in the contract module — rather than in
+// `loop.zig` so that downstream packages (`coding/security/*`,
+// `coding/session/compaction.zig`) can depend on `agent/types.zig`
+// alone without pulling the 2800-line loop implementation. This
+// keeps the `ai → agent → coding` layering one-way: the loop is
+// runtime, these are contract.
+
+/// Decision returned by `before_tool_call` hooks. `block = true`
+/// prevents the tool from executing; `reason_text` is surfaced to
+/// the model in the tool-result message.
+pub const HookDecision = struct {
+    block: bool = false,
+    reason_text: ?[]const u8 = null,
+};
+
+/// Decision from the runtime role gate. The mode-level driver
+/// provides a callback that returns non-null when a tool name
+/// (not present in this session's registered tools) is a known
+/// built-in disabled by the active role. The loop then emits a
+/// structured `role_denied` `tool_execution_end` instead of the
+/// generic "unknown tool" path — catches the case where the
+/// model emits a `tool_call` from prior-conversation memory or
+/// training data for a tool that exists only in higher roles.
+pub const RoleDenial = struct {
+    current_role: []const u8,
+    /// Lowest role that would re-enable this tool, when known.
+    /// E.g. `bash` → `code`. Surfaces as a remedy hint.
+    min_role: ?[]const u8 = null,
+};
+
+pub const RoleDeniedFn = *const fn (
+    userdata: ?*anyopaque,
+    tool_name: []const u8,
+) ?RoleDenial;
+
+pub const BeforeToolCallFn = *const fn (
+    userdata: ?*anyopaque,
+    tool: *const AgentTool,
+    call_id: []const u8,
+    args_json: []const u8,
+) HookDecision;
+
+pub const AfterToolCallFn = *const fn (
+    userdata: ?*anyopaque,
+    tool: *const AgentTool,
+    call_id: []const u8,
+    result: *ToolResult,
+) void;
+
 /// Ordered sequence of messages that forms the conversation context.
 ///
 /// Callers seed it with prior history; the loop appends assistant and
