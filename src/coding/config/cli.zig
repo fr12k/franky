@@ -724,6 +724,10 @@ pub const usage_text: []const u8 =
     \\  --ask-tools LIST             CSV; demote default-auto_allow tools to "ask"
     \\                               (e.g. read,find or "all" for every tool)
     \\  --remember-permissions       Persist always-allow/deny to permissions.json
+    \\  --memory                     Enable persistent memory tools (default on)
+    \\  --no-memory                  Disable persistent memory tools
+    \\  --memory-nudge               Nudge agent to save memory before finish_task (default off)
+    \\  --no-memory-nudge            Disable memory save nudge
     \\  --verbose                    Extra logging to stderr
     \\  -h, --help                   Show this help
     \\      --version                Print version and exit
