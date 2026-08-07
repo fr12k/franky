@@ -362,22 +362,32 @@ get patched after session init. Verify each mode does this.
 
 ---
 
-## 9. Summary
+## 9. Summary — Actual Results
 
-| Metric | Value |
-|---|---|
-| **Interactive mode removal** | **−~6,234 lines** (interactive.zig + tui/ + terminal.zig) |
-| Tool consolidation (rpc + proxy) | −~165 lines |
-| New helper code in config.zig | ~145 lines |
-| **Total net reduction** | **~6,400 lines** (~9% of codebase) |
-| Modes | 4 → 3 (print, proxy, rpc) |
-| Files deleted | 11 (interactive.zig, 9 TUI files, terminal.zig) |
-| Feature gaps fixed (bonus) | rpc: extensions, memory; proxy: memory |
-| Risk level | Low (Phase 1) → Low–Medium (Phase 2) → Medium (Phases 3–4) |
-| Phases | 4 (extract → remove interactive → rpc → proxy) |
+**All 4 phases completed and committed. All tests pass.**
 
-The refactoring achieves the goal of **dramatically less code in total**
-(~6,400 lines removed, ~9% of the codebase) by removing the untested,
-highest-complexity mode and consolidating the remaining tool management
-into a single source of truth, while also **closing latent feature gaps**
-(rpc/proxy missing extensions/memory tools).
+| Metric | Planned | Actual |
+|---|---|---|
+| Interactive mode removal | −~6,234 lines | −6,320 lines |
+| Tool consolidation (rpc + proxy) | −~165 lines | −63 lines (rpc −20, proxy −23) |
+| New helper code in config.zig | ~145 lines | +76 lines net (config.zig 1409→1485) |
+| **Total net reduction** | **~6,400 lines** | **6,189 lines** |
+| Codebase before | 72,214 lines / 114 files | |
+| Codebase after | ~65,800 lines / ~103 files | **66,025 lines / 103 files** |
+| Modes | 4 → 3 | ✅ 4 → 3 (print, proxy, rpc) |
+| Files deleted | 11 | ✅ 11 (interactive.zig, 9 TUI files, terminal.zig) |
+| Risk level | Low → Medium | ✅ No issues encountered |
+| Phases | 4 | ✅ All 4 completed |
+
+### Commits
+
+1. `a5815c1` — `refactor(config): extract buildBaseToolSet + finalizeToolSet helpers`
+2. `bca4bb4` — `refactor(modes): remove interactive mode entirely (-6320 lines)`
+3. `37e87c6` — `refactor(rpc): consolidate tool building via buildBaseToolSet + finalizeToolSet`
+4. `ae26ca3` — `refactor(proxy): consolidate tool building via buildBaseToolSet + finalizeToolSet`
+
+The refactoring achieved **~8.6% codebase reduction** by removing the
+untested, highest-complexity mode and consolidating the remaining tool
+management into a single source of truth. A latent bug was also fixed
+in rpc.zig (per-prompt finishTask append growing session.tools every
+turn — now added once at init via finalizeToolSet).
