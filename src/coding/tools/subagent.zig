@@ -635,7 +635,7 @@ pub const Ctx = struct {
     /// inside flips per-turn (proxy/rpc set it during runPrompt
     /// and clear it after). Reading at sub-agent spawn time gets
     /// whatever is current then.
-    /// - Set in proxy/rpc/interactive to `&session.current_prompter`.
+    /// - Set in proxy/rpc to `&session.current_prompter`.
     /// - Null in print mode (no interactive prompter exists).
     /// When the slot derefs to null, the sub-agent's
     /// `permission_store` is dropped too (no path to resolve
@@ -954,7 +954,7 @@ fn runSubagent(
 
     // Allocate a fresh RoleGate for the sub-agent (per design §3.5
     // option C). Resolve the parent's LIVE prompter via the
-    // pointer-to-slot — proxy/rpc/interactive set their session's
+    // pointer-to-slot — proxy/rpc set their session's
     // `current_prompter` per-turn; we want whatever is current
     // RIGHT NOW (the parent is mid-prompt while we're spawning).
     // Print mode has no slot wired → live_prompter stays null.
@@ -1412,8 +1412,7 @@ fn successResult(
     /// sub-agent's full transcript is persisted to this path. The
     /// parent agent can `read` it for full conversation details
     /// without burning context on the round-trip back. Null in
-    /// `--no-session` runs and in interactive mode (in-memory
-    /// transcripts only).
+    /// `--no-session` runs (in-memory transcripts only).
     transcript_path: ?[]const u8,
     /// v1.30.0 — stable spawn id echoed back in the result envelope
     /// so the UI panel can match a result row to its spawn by key

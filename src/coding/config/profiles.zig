@@ -610,7 +610,6 @@ fn parseThinking(s: []const u8) !ait.ThinkingLevel {
 
 fn parseMode(s: []const u8) !cli.Mode {
     if (std.mem.eql(u8, s, "print")) return .print;
-    if (std.mem.eql(u8, s, "interactive")) return .interactive;
     if (std.mem.eql(u8, s, "rpc")) return .rpc;
     if (std.mem.eql(u8, s, "proxy")) return .proxy;
     return error.UnknownMode;
@@ -1351,7 +1350,6 @@ test "parseThinking: covers all variants" {
 
 test "parseMode: covers all variants" {
     try testing.expectEqual(cli.Mode.print, try parseMode("print"));
-    try testing.expectEqual(cli.Mode.interactive, try parseMode("interactive"));
     try testing.expectEqual(cli.Mode.rpc, try parseMode("rpc"));
     try testing.expectEqual(cli.Mode.proxy, try parseMode("proxy"));
     try testing.expectError(error.UnknownMode, parseMode("bogus"));

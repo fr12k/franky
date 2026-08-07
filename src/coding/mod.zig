@@ -21,12 +21,9 @@ pub const tools = struct {
 
 pub const modes = struct {
     pub const print = @import("modes/print.zig");
-    pub const interactive = @import("modes/interactive.zig");
     pub const rpc = @import("modes/rpc.zig");
     pub const proxy = @import("modes/proxy.zig");
 };
-
-pub const terminal = @import("terminal.zig");
 
 pub const session = @import("session/mod.zig");
 
@@ -105,10 +102,8 @@ test {
     _ = tools.common;
     _ = tools.truncate;
     _ = modes.print;
-    _ = modes.interactive;
     _ = modes.rpc;
     _ = modes.proxy;
-    _ = terminal;
     _ = session;
     _ = cli; // backward compat alias
     _ = settings; // backward compat alias

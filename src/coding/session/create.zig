@@ -1,8 +1,7 @@
 //! Session factory — §3.2 of the A2A core-boundary design.
 //!
 //! Extracts the common session-identity setup that was previously
-//! duplicated across mode drivers (print.zig, proxy.zig, rpc.zig,
-//! interactive.zig). Every mode that needs a session calls
+//! duplicated across mode drivers (print.zig, proxy.zig, rpc.zig). Every mode that needs a session calls
 //! `session.SessionState.init()` instead of inlining the same
 //! 200-line init sequence.
 //!

@@ -10,7 +10,7 @@
 //!
 //! For v1.11.0 the gate decides without pausing — the "ask"
 //! branch falls through to deny with a helpful message in
-//! non-interactive contexts (print/RPC/proxy/interactive in this
+//! non-interactive contexts (print/RPC/proxy in this
 //! pass). The pause+prompt protocol (`tool_permission_request`
 //! event, `Agent.resolvePermission`) is v1.11.1+.
 
@@ -589,7 +589,7 @@ pub const SessionGates = struct {
                 if (self.prompter) |p| return waitForPrompt(p, store, tool.name, call_id, args_json);
                 return .{
                     .block = true,
-                    .reason_text = "permission gate: tool requires explicit approval (use --yes, --allow-tools, or run a mode that supports interactive prompts)",
+                    .reason_text = "permission gate: tool requires explicit approval (use --yes, --allow-tools, or run --mode proxy for interactive prompts)",
                 };
             },
         }

@@ -1,7 +1,7 @@
 //! Unified config resolver — v2.22 design.
 //!
 //! Single entry point `resolve()` that the four mode entry points
-//! (print, interactive, rpc, proxy) call with their CLI config and
+//! (print, rpc, proxy) call with their CLI config and
 //! get back a fully-resolved, ready-to-use `ResolvedConfig` bundle.
 //!
 //! The resolver is the **only** place where layering precedence is

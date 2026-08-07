@@ -188,12 +188,6 @@ pub fn run(
         const proxy_mode = @import("proxy.zig");
         return proxy_mode.run(allocator, io, environ, environ_map, &cfg, argv);
     }
-    if (cfg.mode == .interactive) {
-        // Interactive mode doesn't require a prompt — the REPL
-        // collects input from the terminal.
-        const interactive = @import("interactive.zig");
-        return interactive.run(allocator, io, environ, environ_map, &cfg);
-    }
     if (cfg.prompt.len == 0 and cfg.resume_id == null) {
         return exitWithMessage(io, "no prompt given; try: franky \"hello\"\n", 2);
     }

@@ -1,6 +1,6 @@
 //! Shared multi-model review prompt builder.
 //!
-//! The `/review` slash command (proxy + interactive modes) needs a
+//! The `/review` slash command (proxy mode) needs a
 //! self-contained prompt that embeds the review instructions so the
 //! feature works without requiring the `multimodel-review` skill to be
 //! active. This module provides the shared prompt text — identical

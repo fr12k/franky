@@ -28,7 +28,7 @@ pub const parameters_json: []const u8 =
     \\    },
     \\    "restart": {
     \\      "type": "boolean",
-    \\      "description": "When true, after committing, the process will restart itself (spawn a fresh binary and exit). Only works in proxy and interactive modes."
+    \\      "description": "When true, after committing, the process will restart itself (spawn a fresh binary and exit). Only works in proxy mode."
     \\    }
     \\  },
     \\  "additionalProperties": false

@@ -319,7 +319,7 @@ pub const Roots = struct {
     }
 };
 
-/// Resolve the three skill roots from an `Environ.Map` (proxy + interactive).
+/// Resolve the three skill roots from an `Environ.Map` (proxy).
 pub fn resolveRootsFromMap(
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
@@ -346,7 +346,7 @@ pub fn resolveRootsFromMap(
 
 /// Render a human-readable listing of every loaded skill, marking
 /// each one ACTIVE / idle along with the reason. Used by the
-/// `/skills` slash command in interactive + proxy.
+/// `/skills` slash command in proxy.
 pub fn buildListingFromMap(
     allocator: std.mem.Allocator,
     io: std.Io,

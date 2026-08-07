@@ -16,7 +16,7 @@ Version: 2.3.0 (library root), built on Zig 0.17-dev (master), zero external dep
 | Tests | 881 (unit + integration) |
 | Providers | 6 (Anthropic, OpenAI Chat, OpenAI Responses, OpenAI Gateway, Google Gemini, Google Vertex, + Faux for testing) |
 | Built-in tools | 13 (read/write/edit/bash/ls/find/grep/ast_grep/subagent/web_search/web_fetch/truncate/workspace) |
-| Run modes | 4 (print/interactive/rpc/proxy) |
+| Run modes | 3 (print/rpc/proxy) |
 | Capability roles | 4 (read/plan/code/full) |
 | Guardrails | 3 (stuck detector, compilation guard, finish_task) |
 
@@ -157,10 +157,9 @@ Tools provide multiple construction functions:
     toolWithWorkspace(ws) — workspace-scoped (path safety enforced)
     toolWithCtx(ctx) — with additional runtime context overlays
 
-Modes (4 modes)
+Modes (3 modes)
 Mode	Purpose
 print	One-shot prompt → streamed output → exit. Default.
-interactive	Full TUI with scrollback, slash commands (/help, /role, /tools, /branch, /compact, /retry, /export, /permissions)
 rpc	JSON-RPC over stdio for programmatic clients
 proxy	HTTP/SSE listener on 127.0.0.1:8787/ with built-in web UI
 Infrastructure Highlights
@@ -191,24 +190,7 @@ Session Persistence
   logs/                # auto-diverted logs
 
 ---
-5. TUI Layer — Terminal UI
-
-Files: 9 modules in src/tui/
-
-    buffer.zig: Terminal screen buffer with double-buffering for efficient rendering
-    cell.zig: Screen cell representation (character, style attributes)
-    editor.zig: Text editing widget with cursor management
-    text_buffer.zig: Line-based text storage with insert/delete operations
-    key_decoder.zig: Terminal input parsing (escape sequences, function keys)
-    region.zig: Screen region management for layout
-    keybindings.zig: Configurable key binding system
-    diff_renderer.zig: Side-by-side diff display
-    mod.zig: Module root exporting all components
-
-Used exclusively by interactive mode for the full TUI experience.
-
----
-6. SDK Facade (src/sdk.zig)
+5. SDK Facade (src/sdk.zig)
 
 Programmatic entry point for embedding franky in other Zig programs. Re-exports the stable public surface (ai, agent, coding modules) with versioned API stability guarantees.
 
@@ -316,8 +298,8 @@ The following findings were surfaced by an automated deep-code audit of every mo
    - **Fix needed:** Use compile-time reflection to deinit all string fields automatically, or add a `comptime` assertion that verifies every field is freed.
 
 6. **No end-to-end tests for the four run modes**
-   - **Location:** `src/coding/modes/` — `print.zig`, `interactive.zig`, `rpc.zig`, `proxy.zig`
-   - **Gap:** CLI parsing is tested, but the mode drivers (print/interactive/rpc/proxy) have zero integration tests. The RPC framer is tested in `kitchen_sink_test.zig` but not the full request/response lifecycle.
+   - **Location:** `src/coding/modes/` — `print.zig`, `rpc.zig`, `proxy.zig`
+   - **Gap:** CLI parsing is tested, but the mode drivers (print/rpc/proxy) have zero integration tests. The RPC framer is tested in `kitchen_sink_test.zig` but not the full request/response lifecycle.
    - **Risk:** Mode-specific bugs (e.g. the proxy subscriber leak) escape detection until they manifest in production.
 
 ---
