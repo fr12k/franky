@@ -1329,6 +1329,9 @@ pub fn resolve(
         .permission_store = if (prompts_enabled) permission_store else null,
         .permission_prompter_slot = null,
         .parent_session_dir = null,
+        // v1.31.0 — wire the workspace so `context_file` paths get
+        // canonicalized with the same path-safety as the `read` tool.
+        .workspace = workspace_state,
     };
     const all_final_tools = try finalizeToolSet(a, .{
         .base_tools = role_filtered_tools,
