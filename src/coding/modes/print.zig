@@ -30,6 +30,7 @@ const auth_mod = franky.coding.auth;
 const settings_mod = franky.coding.settings;
 const models_mod = franky.coding.models;
 const branching_mod = franky.coding.branching;
+const compression_mod = franky.coding.compression;
 const skills_mod = franky.coding.skills;
 const instructions_mod = franky.coding.instructions;
 const diagnostics_mod = franky.coding.diagnostics;
@@ -269,6 +270,11 @@ fn runPrint(
         }
     }
 
+    // v3.0 — seed the compression injection context with the resolved
+    // config. The store + stats pointers were already wired in
+    // `SessionState.init`; the mode driver fills in the config field.
+    session_state.compression_ctx.config = resolved.compression;
+
     if (!cfg.no_session) {
         ai.log.log(.info, "session", "init", "id={s} dir={s}", .{
             session_state.id(),
@@ -369,6 +375,11 @@ fn runPrint(
     );
     defer ch.deinit();
 
+    // Validate that resolve() populated all required pointers before
+    // wiring them into the agent loop. Catches wiring errors at startup
+    // rather than as a use-after-free mid-loop.
+    try resolved.validate();
+
     var loop_cfg: agent.loop.Config = .{
         .model = model,
         .system_prompt = system_prompt,
@@ -385,9 +396,8 @@ fn runPrint(
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
         .text_tool_call_fallback = cfg.text_tool_call_fallback,
         .reducer_dump_dir = events_dir_path,
-        .compression = if (resolved.compression.enabled) resolved.compression else null,
-        .ccr_store = &session_state.ccr_store,
-        .compression_stats = &session_state.compression_stats,
+        .compress_fn = if (resolved.compression.enabled) compression_mod.compressToolResultInjected else null,
+        .compress_ctx = if (resolved.compression.enabled) @ptrCast(&session_state.compression_ctx) else null,
         // v3.2 — L0 capture: persist each turn's messages to the raw
         // conversation store. Best-effort; disabled when memory is off.
         .capture_turn = if (resolved.memory_state != null) captureTurnHook else null,

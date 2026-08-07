@@ -6,12 +6,12 @@
 //! across modes so the same `GET /events` client works for both.
 //!
 //! Wire format: `event: <kind>\ndata: <json>\n\n` with an `id: <n>\n`
-//! prefix for replay. Matches `agent.proxy.encodeEventJson` for the
+//! prefix for replay. Matches `agent.wire.encodeEventJson` for the
 //! JSON payload.
 
 const std = @import("std");
-const agent = @import("../agent/mod.zig");
-const at = agent.types;
+const at = @import("../agent/types.zig");
+const wire = @import("../agent/wire.zig");
 
 pub const max_subs: usize = 32;
 pub const replay_ring_capacity: usize = 4096;
@@ -340,10 +340,10 @@ pub fn handleSseRequest(
 }
 
 /// Render one `AgentEvent` as a complete SSE frame (without `id:` prefix).
-/// Uses `agent.proxy.encodeEventJson` for the JSON payload — same wire
+/// Uses `agent.wire.encodeEventJson` for the JSON payload — same wire
 /// format the proxy mode emits. Owned by the caller.
 pub fn renderFrame(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
-    const json = try agent.proxy.encodeEventJson(allocator, ev);
+    const json = try wire.encodeEventJson(allocator, ev);
     defer allocator.free(json);
     const kind = @tagName(ev);
     return std.fmt.allocPrint(allocator, "event: {s}\ndata: {s}\n\n", .{ kind, json });

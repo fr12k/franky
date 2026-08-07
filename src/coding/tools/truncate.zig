@@ -29,13 +29,17 @@
 
 const std = @import("std");
 
+// Agent-layer truncation primitives (tool_result_max_bytes, formatSize)
+// now live in `agent/truncate.zig` so the agent loop doesn't have to
+// import this coding-layer module. Re-exported here for backward
+// compatibility with tools that still reference `truncate.formatSize`.
+const agent_truncate = @import("../../agent/truncate.zig");
+pub const tool_result_max_bytes = agent_truncate.tool_result_max_bytes;
+pub const formatSize = agent_truncate.formatSize;
+
 pub const default_max_lines: usize = 2000;
 pub const default_max_bytes: usize = 50 * 1024;
 pub const grep_max_line_length: usize = 500;
-/// Cap applied to each tool result text block before it enters the
-/// conversation history. Keeps large file reads from inflating every
-/// subsequent turn's input token count.
-pub const tool_result_max_bytes: usize = 8 * 1024;
 
 pub const TruncatedBy = enum { lines, bytes };
 
@@ -262,21 +266,6 @@ pub fn truncateLine(line: []const u8, max_chars: usize) LineResult {
     return .{ .text = line[0..max_chars], .was_truncated = true };
 }
 
-/// Human-readable size: `512B` / `1.5KB` / `3.2MB`. Caller frees.
-pub fn formatSize(allocator: std.mem.Allocator, bytes: usize) ![]u8 {
-    if (bytes < 1024) return std.fmt.allocPrint(allocator, "{d}B", .{bytes});
-    if (bytes < 1024 * 1024) return std.fmt.allocPrint(
-        allocator,
-        "{d:.1}KB",
-        .{@as(f64, @floatFromInt(bytes)) / 1024.0},
-    );
-    return std.fmt.allocPrint(
-        allocator,
-        "{d:.1}MB",
-        .{@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)},
-    );
-}
-
 // ─── helpers ─────────────────────────────────────────────────────
 
 /// Count lines: number of `\n` characters + 1 if the content has any
@@ -395,18 +384,4 @@ test "truncateLine: oversized clipped to max_chars" {
     try testing.expectEqualStrings("aaaa", r.text);
 }
 
-test "formatSize: bytes / KB / MB" {
-    const gpa = testing.allocator;
 
-    const a = try formatSize(gpa, 512);
-    defer gpa.free(a);
-    try testing.expectEqualStrings("512B", a);
-
-    const b = try formatSize(gpa, 1536);
-    defer gpa.free(b);
-    try testing.expectEqualStrings("1.5KB", b);
-
-    const c = try formatSize(gpa, 3 * 1024 * 1024);
-    defer gpa.free(c);
-    try testing.expectEqualStrings("3.0MB", c);
-}

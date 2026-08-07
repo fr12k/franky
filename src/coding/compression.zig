@@ -153,6 +153,62 @@ pub const CompressionConfig = struct {
     diff_max_context_lines: usize = 2,
 };
 
+/// Bundle of everything `compressToolResultInjected` needs. The mode
+/// drivers allocate one of these (or use a `SessionState`-embedded
+/// field), set its fields from the resolved config + session state,
+/// then pass `&ctx` as `Config.compress_ctx` and `compressToolResultInjected`
+/// as `Config.compress_fn` to the agent loop. This is the dependency-
+/// inversion seam: the loop holds an opaque `?*anyopaque` + function
+/// pointer, not a `coding/compression.zig` import.
+pub const CompressionContext = struct {
+    config: CompressionConfig,
+    ccr_store: ?*CcrSessionStore = null,
+    stats: ?*CompressionStats = null,
+};
+
+/// Adapter matching `agent.types.CompressToolResultFn`. Unpacks the
+/// opaque `ctx` into a `*CompressionContext` and delegates to
+/// `compressToolResult`. When `config.enabled` is false, returns a
+/// passthrough copy (dupe of the original) so the loop's caller can
+/// unconditionally set `compress_fn` without a separate enabled check.
+pub fn compressToolResultInjected(
+    allocator: std.mem.Allocator,
+    result: *const at.ToolResult,
+    ctx: ?*anyopaque,
+) at.ToolResult {
+    if (ctx) |raw| {
+        const cctx: *const CompressionContext = @ptrCast(@alignCast(raw));
+        if (!cctx.config.enabled) {
+            // Passthrough: dupe the original so the caller can free the old.
+            return dupeToolResult(allocator, result);
+        }
+        return compressToolResult(allocator, result, cctx.config, cctx.ccr_store, cctx.stats);
+    }
+    // No context — passthrough.
+    return dupeToolResult(allocator, result);
+}
+
+/// Allocate a copy of a `ToolResult` (deep-copy of content blocks).
+/// Used by `compressToolResultInjected` for the passthrough path.
+fn dupeToolResult(allocator: std.mem.Allocator, result: *const at.ToolResult) at.ToolResult {
+    var new_content = allocator.alloc(ai.ContentBlock, result.content.len) catch {
+        // Allocation failure — return an empty result (best-effort,
+        // infallible contract). The loop will emit it as-is.
+        return .{ .content = &.{}, .is_error = result.is_error, .tool_code = null, .terminate = result.terminate };
+    };
+    for (result.content, 0..) |cb, i| {
+        new_content[i] = cb.dupe(allocator) catch {
+            // Free what we've duped so far and return empty.
+            for (new_content[0..i]) |d| d.deinit(allocator);
+            allocator.free(new_content);
+            return .{ .content = &.{}, .is_error = result.is_error, .tool_code = null, .terminate = result.terminate };
+        };
+    }
+    var tool_code: ?[]const u8 = null;
+    if (result.tool_code) |tc| tool_code = allocator.dupe(u8, tc) catch null;
+    return .{ .content = new_content, .is_error = result.is_error, .tool_code = tool_code, .terminate = result.terminate };
+}
+
 /// Compress a tool result's text content blocks.
 ///
 /// Returns a NEW ToolResult with compressed text + CCR markers.

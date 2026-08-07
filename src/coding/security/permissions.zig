@@ -19,7 +19,11 @@ const ai = struct {
     pub const stream = @import("../../ai/stream.zig");
 };
 const at = @import("../../agent/types.zig");
-const agent_loop = @import("../../agent/loop.zig");
+// RoleDenial / HookDecision / AgentChannel contract types now live
+// in agent/types.zig (the contract module). Previously this file
+// imported agent/loop.zig (the 2800-line runtime) just to reach
+// these types — a leaking abstraction that pulled the entire
+// loop implementation into the security module's dependency graph.
 const role_mod = @import("role.zig");
 
 /// Per-call decision returned by `Store.check`.
@@ -446,7 +450,7 @@ pub const PermissionPrompter = struct {
     /// Channel the agent loop pushes events to — also where the
     /// `tool_permission_request` event lands. The mode driver
     /// already owns this; the prompter borrows it.
-    channel: *agent_loop.AgentChannel,
+    channel: *at.AgentChannel,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     pending: std.StringHashMapUnmanaged(*PendingPrompt) = .empty,
@@ -454,7 +458,7 @@ pub const PermissionPrompter = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
-        channel: *agent_loop.AgentChannel,
+        channel: *at.AgentChannel,
     ) PermissionPrompter {
         return .{ .allocator = allocator, .io = io, .channel = channel };
     }
@@ -549,8 +553,16 @@ pub const PermissionPrompter = struct {
 /// Combined hook-userdata struct. The agent loop passes a single
 /// `hook_userdata` pointer to `before_tool_call` AND
 /// `role_denied`; both callbacks downcast to this struct so the
-/// gates can coexist. Stable address required (worker thread
-/// dereferences it).
+/// gates can coexist.
+///
+/// **Lifetime invariant**: `SessionGates` must live at a stable
+/// address for the entire agent-loop run — the worker thread
+/// dereferences `userdata` (which points here) on every tool call.
+/// Construct it before starting the loop and keep it alive until
+/// the loop terminates. `ResolvedConfig` arena-allocates it and
+/// frees it in `deinit()`; mode drivers pass `&resolved.session_gates`
+/// as `hook_userdata`. `ResolvedConfig.validate()` checks that the
+/// pointer is non-null before the loop starts.
 pub const SessionGates = struct {
     role: ?*role_mod.RoleGate = null,
     permissions: ?*Store = null,
@@ -560,22 +572,22 @@ pub const SessionGates = struct {
     /// CI-friendly hint.
     prompter: ?*PermissionPrompter = null,
 
-    /// Adapter for `agent_loop.Config.role_denied`. Forwards to
+    /// Adapter for `Config.role_denied` (agent loop). Forwards to
     /// the role gate; when no role gate is configured the loop's
     /// existing "unknown tool" path handles it.
-    pub fn roleDenied(userdata: ?*anyopaque, tool_name: []const u8) ?agent_loop.RoleDenial {
+    pub fn roleDenied(userdata: ?*anyopaque, tool_name: []const u8) ?at.RoleDenial {
         const self: *SessionGates = @ptrCast(@alignCast(userdata.?));
         const gate = self.role orelse return null;
         return role_mod.RoleGate.check(@ptrCast(gate), tool_name);
     }
 
-    /// Adapter for `agent_loop.Config.before_tool_call`.
+    /// Adapter for `Config.before_tool_call` (agent loop).
     pub fn beforeToolCall(
         userdata: ?*anyopaque,
         tool: *const at.AgentTool,
         call_id: []const u8,
         args_json: []const u8,
-    ) agent_loop.HookDecision {
+    ) at.HookDecision {
         const self: *SessionGates = @ptrCast(@alignCast(userdata.?));
         const store = self.permissions orelse return .{ .block = false };
         const decision = store.check(tool.name, args_json);
@@ -602,7 +614,7 @@ fn waitForPrompt(
     tool_name: []const u8,
     call_id: []const u8,
     args_json: []const u8,
-) agent_loop.HookDecision {
+) at.HookDecision {
     const resolution = prompter.requestAndWait(tool_name, call_id, args_json) catch {
         // Allocation / push failure is rare; fail closed.
         return .{
@@ -1353,7 +1365,7 @@ const PromptTestWorker = struct {
     tool_name: []const u8,
     args_json: []const u8,
     call_id: []const u8,
-    result: agent_loop.HookDecision = .{ .block = false },
+    result: at.HookDecision = .{ .block = false },
     done: std.Io.Mutex = .init,
 
     fn run(self: *PromptTestWorker) void {
@@ -1376,7 +1388,7 @@ const PromptTestWorker = struct {
 /// then call resolve with `decision`. Returns the call_id seen
 /// in the event (caller compares).
 fn drainAndResolve(
-    ch: *agent_loop.AgentChannel,
+    ch: *at.AgentChannel,
     io: std.Io,
     gpa: std.mem.Allocator,
     prompter: *PermissionPrompter,
@@ -1404,7 +1416,7 @@ test "PermissionPrompter: allow_once round-trip pushes event and lets call throu
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var ch = try agent_loop.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
+    var ch = try at.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
     defer ch.deinit();
     var store = Store.init(gpa);
     defer store.deinit();
@@ -1431,7 +1443,7 @@ test "PermissionPrompter: always_allow promotes to store" {
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var ch = try agent_loop.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
+    var ch = try at.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
     defer ch.deinit();
     var store = Store.init(gpa);
     defer store.deinit();
@@ -1463,7 +1475,7 @@ test "PermissionPrompter: deny_once blocks with user-denied reason" {
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var ch = try agent_loop.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
+    var ch = try at.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
     defer ch.deinit();
     var store = Store.init(gpa);
     defer store.deinit();
@@ -1491,7 +1503,7 @@ test "PermissionPrompter.resolve on stale call_id returns NotPending" {
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = testing.allocator;
-    var ch = try agent_loop.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
+    var ch = try at.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
     defer ch.deinit();
     var prompter = PermissionPrompter.init(gpa, io, &ch);
     defer prompter.deinit();

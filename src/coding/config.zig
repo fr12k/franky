@@ -47,6 +47,7 @@ pub const ResolveError = error{
     UnknownRole,
     UnknownThinkingLevel,
     UnknownMode,
+    UnresolvedConfig,
 } || std.mem.Allocator.Error || std.Io.File.WriteError;
 
 // ─── ResolvedConfig ──────────────────────────────────────────────
@@ -192,6 +193,30 @@ pub const ResolvedConfig = struct {
         }
         // Free everything on the resolver arena.
         self.arena.deinit();
+    }
+
+    /// Validate that `resolve()` produced a usable config bundle.
+    /// Call this before starting the agent loop to catch wiring
+    /// errors at startup rather than as a use-after-free mid-loop.
+    ///
+    /// The raw pointers in `ResolvedConfig` (`permission_store`,
+    /// `session_gates`, `guardrail_state`, `subagent_ctx`, etc.)
+    /// are non-optional `*T` types — Zig's type system guarantees
+    /// they are non-null once `resolve()` returns. This method
+    /// checks the things the type system *can't* guarantee: that
+    /// the tools slice is populated (unless `full` role), the
+    /// provider was resolved, and the registry has at least one
+    /// entry. The mode driver is responsible for keeping
+    /// `ResolvedConfig` alive until the loop terminates and
+    /// calling `deinit()` only after.
+    pub fn validate(self: *const ResolvedConfig) error{UnresolvedConfig}!void {
+        // Tools may be empty only in `full` role (no filtering).
+        if (self.tools.len == 0 and !self.active_role.atLeast(.full)) return error.UnresolvedConfig;
+        // Provider must have been resolved.
+        if (self.provider_name.len == 0) return error.UnresolvedConfig;
+        if (self.model_id.len == 0) return error.UnresolvedConfig;
+        // Registry must have at least the faux provider.
+        if (self.registry.entries.items.len == 0) return error.UnresolvedConfig;
     }
 };
 

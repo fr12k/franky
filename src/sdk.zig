@@ -93,7 +93,7 @@ pub const ToolResult = agent.types.ToolResult;
 pub const ExecutionMode = agent.types.ExecutionMode;
 pub const agentLoop = agent.loop.agentLoop;
 pub const defaultConvertToLlm = agent.loop.defaultConvertToLlm;
-pub const encodeEventJson = agent.proxy.encodeEventJson;
+pub const encodeEventJson = agent.wire.encodeEventJson;
 
 // ─── coding layer (tools, compaction, persistence) ───────────────
 const coding = @import("coding/mod.zig");
@@ -148,6 +148,10 @@ pub fn createSession(
     // Step 1: Resolve config (providers, tools, permissions, etc.).
     var resolved = try config_resolver.resolve(allocator, io, cfg, environ, environ_map, argv);
     errdefer resolved.deinit();
+
+    // Validate that resolve() populated all required pointers before
+    // the caller wires them into an agent loop.
+    try resolved.validate();
 
     // Step 2: Session identity + transcript.
     var session_state = try SessionState.init(allocator, io, environ, cfg);

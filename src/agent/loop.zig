@@ -31,9 +31,8 @@ pub const AgentChannel = at.AgentChannel;
 pub const AgentMessage = at.AgentMessage;
 
 const guardrails_mod = @import("guardrails/guardrails.zig");
-const truncate = @import("../coding/tools/truncate.zig");
-const tool_common = @import("../coding/tools/common.zig");
-const compression_mod = @import("../coding/compression.zig");
+const truncate = @import("truncate.zig");
+const json_repair = @import("json_repair.zig");
 
 pub const ConvertToLlmFn = *const fn (
     allocator: std.mem.Allocator,
@@ -124,44 +123,16 @@ pub fn defaultConvertToLlm(
     return out.toOwnedSlice(allocator);
 }
 
-pub const HookDecision = struct {
-    block: bool = false,
-    reason_text: ?[]const u8 = null,
-};
-
-/// Decision from the runtime role gate. The mode-level driver
-/// provides a callback that returns non-null when a tool name
-/// (not present in this session's registered tools) is a known
-/// built-in disabled by the active role. The loop then emits a
-/// structured `role_denied` `tool_execution_end` instead of the
-/// generic "unknown tool" path — catches the case where the
-/// model emits a `tool_call` from prior-conversation memory or
-/// training data for a tool that exists only in higher roles.
-pub const RoleDenial = struct {
-    current_role: []const u8,
-    /// Lowest role that would re-enable this tool, when known.
-    /// E.g. `bash` → `code`. Surfaces as a remedy hint.
-    min_role: ?[]const u8 = null,
-};
-
-pub const RoleDeniedFn = *const fn (
-    userdata: ?*anyopaque,
-    tool_name: []const u8,
-) ?RoleDenial;
-
-pub const BeforeToolCallFn = *const fn (
-    userdata: ?*anyopaque,
-    tool: *const at.AgentTool,
-    call_id: []const u8,
-    args_json: []const u8,
-) HookDecision;
-
-pub const AfterToolCallFn = *const fn (
-    userdata: ?*anyopaque,
-    tool: *const at.AgentTool,
-    call_id: []const u8,
-    result: *at.ToolResult,
-) void;
+// Hook contract types live in `agent/types.zig` (the contract
+// module) so downstream packages don't have to import this 2800-line
+// runtime file just to get `HookDecision`/`RoleDenial`. Re-exported
+// here for backward compatibility with existing call sites that use
+// `agent_loop.HookDecision` etc.
+pub const HookDecision = at.HookDecision;
+pub const RoleDenial = at.RoleDenial;
+pub const RoleDeniedFn = at.RoleDeniedFn;
+pub const BeforeToolCallFn = at.BeforeToolCallFn;
+pub const AfterToolCallFn = at.AfterToolCallFn;
 
 /// §4.3 between-turn hook. Called after `runTurn` returns
 /// `keep_going=false` (the assistant stopped). Implementations
@@ -349,16 +320,17 @@ pub const Config = struct {
     /// nowhere). Mode drivers populate this with
     /// `<session_dir>/offloaded-tool-results` or similar.
     offload_dir: ?[]const u8 = null,
-    /// v3.0 — optional compression config. When non-null, tool results
-    /// are compressed through zompress before entering the transcript.
-    /// Embedded by value to avoid lifetime issues.
-    compression: ?compression_mod.CompressionConfig = null,
-    /// CCR store for reversible compression. Must outlive the loop.
-    /// Passed in from the session — never created per turn.
-    ccr_store: ?*compression_mod.CcrSessionStore = null,
-    /// v3.0 — optional stats collector for compression metrics.
-    /// Updated by `compressToolResult` when non-null.
-    compression_stats: ?*compression_mod.CompressionStats = null,
+    /// v3.0 — optional tool-result compression. When non-null, the
+    /// loop calls `compress_fn` on each tool result before it enters
+    /// the transcript. The compression strategy (zompress config,
+    /// CCR store, stats) is bundled into `compress_ctx` by the coding
+    /// layer — the agent layer holds only an opaque function pointer,
+    /// avoiding a dependency on `coding/compression.zig`.
+    compress_fn: ?at.CompressToolResultFn = null,
+    /// Opaque context for `compress_fn`. The coding layer allocates
+    /// this (typically `*coding.compression.CompressionContext`)
+    /// and it must outlive the loop run.
+    compress_ctx: ?*anyopaque = null,
 };
 
 pub const Transcript = at.Transcript;
@@ -1096,11 +1068,14 @@ fn runTurn(
 
         if (config.guardrails) |gr| gr.afterToolCall(&tool_def, tc.id, &call_res);
 
-        // v3.0 — compress tool result before emitting to transcript
-        if (config.compression) |cc| {
-            if (cc.enabled and call_res.content.len > 0 and !tool_def.skip_compression) {
+        // v3.0 — compress tool result before emitting to transcript.
+        // The compression strategy is injected via `compress_fn` +
+        // `compress_ctx` (dependency inversion) so the loop doesn't
+        // import `coding/compression.zig`.
+        if (config.compress_fn) |compress| {
+            if (call_res.content.len > 0 and !tool_def.skip_compression) {
                 var old = call_res;
-                call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
+                call_res = compress(allocator, &old, config.compress_ctx);
                 old.deinit(allocator);
             }
         }
@@ -1299,11 +1274,12 @@ fn runToolsParallel(
             }
             if (config.guardrails) |gr| gr.afterToolCall(&w.tool_def, w.tc.id, &call_res);
 
-            // v3.0 — compress tool result before emitting to transcript
-            if (config.compression) |cc| {
-                if (cc.enabled and call_res.content.len > 0 and !w.tool_def.skip_compression) {
+            // v3.0 — compress tool result before emitting to transcript.
+            // Injected via `compress_fn` + `compress_ctx` (DI).
+            if (config.compress_fn) |compress| {
+                if (call_res.content.len > 0 and !w.tool_def.skip_compression) {
                     var old = call_res;
-                    call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
+                    call_res = compress(allocator, &old, config.compress_ctx);
                     old.deinit(allocator);
                 }
             }
@@ -1338,10 +1314,10 @@ fn runToolsParallel(
                         hook(config.hook_userdata, &w.tool_def, w.tc.id, &call_res);
                     }
                     if (config.guardrails) |gr| gr.afterToolCall(&w.tool_def, w.tc.id, &call_res);
-                    if (config.compression) |cc| {
-                        if (cc.enabled and call_res.content.len > 0 and !w.tool_def.skip_compression) {
+                    if (config.compress_fn) |compress| {
+                        if (call_res.content.len > 0 and !w.tool_def.skip_compression) {
                             var old = call_res;
-                            call_res = compression_mod.compressToolResult(allocator, &old, cc, config.ccr_store, config.compression_stats);
+                            call_res = compress(allocator, &old, config.compress_ctx);
                             old.deinit(allocator);
                         }
                     }
@@ -1729,7 +1705,7 @@ fn repairToolCallArgsInMessage(
             .tool_call => |*tc| {
                 var arena = std.heap.ArenaAllocator.init(allocator);
                 defer arena.deinit();
-                if (tool_common.repairConcatJson(arena.allocator(), tc.arguments_json)) |fixed| {
+                if (json_repair.repairConcatJson(arena.allocator(), tc.arguments_json)) |fixed| {
                     ai.log.log(.debug, "loop", "repair_tool_args", "name={s} orig_bytes={d} fixed_bytes={d}", .{
                         tc.name, tc.arguments_json.len, fixed.len,
                     });

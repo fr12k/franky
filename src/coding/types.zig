@@ -17,7 +17,4 @@ pub const ai = struct {
 
 pub const agent = struct {
     pub const types = @import("../agent/types.zig");
-    pub const mod = @import("../agent/mod.zig");
-    pub const loop = @import("../agent/loop.zig");
-    pub const agent = @import("../agent/agent.zig");
 };

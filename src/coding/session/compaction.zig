@@ -27,7 +27,12 @@
 
 const std = @import("std");
 const branching = @import("branching.zig");
-const agent_loop = @import("../../agent/loop.zig");
+const at = @import("../../agent/types.zig");
+// Transcript / AgentMessage contract types now live in
+// agent/types.zig (the contract module). Previously this file
+// imported agent/loop.zig (the 2800-line runtime) just to reach
+// these re-exported types — a leaking abstraction that pulled
+// the entire loop implementation into the session module.
 const types = @import("../../ai/types.zig");
 const registry_mod = @import("../../ai/registry.zig");
 const stream_mod = @import("../../ai/stream.zig");
@@ -326,7 +331,7 @@ pub const CompactError = error{
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
-    transcript: *agent_loop.Transcript,
+    transcript: *at.Transcript,
     tree: *branching.Tree,
     config: CompactConfig,
 ) !CompactResult {
@@ -522,7 +527,7 @@ pub fn runSummarizer(
 /// single `compaction_summary` custom-role message at `start`.
 fn replaceSpanWithSummary(
     allocator: std.mem.Allocator,
-    transcript: *agent_loop.Transcript,
+    transcript: *at.Transcript,
     start: u32,
     end: u32,
     summary_text: []u8, // taken ownership of on success
@@ -569,7 +574,7 @@ fn replaceSpanWithSummary(
             std.debug.assert(dst_start <= dst_end);
             std.debug.assert(dst_end - dst_start == src_end - src_start);
             std.mem.copyForwards(
-                agent_loop.AgentMessage,
+                at.AgentMessage,
                 transcript.messages.items[start + 1 .. len - drop_count],
                 transcript.messages.items[end..len],
             );
@@ -772,7 +777,7 @@ test "run: forks a pre-compact branch and splices compaction_summary in" {
     // preserved. Each message is ~30 bytes → ~9 tokens. Context
     // window 100 → tail budget ~15 tokens → roughly 1-2 messages
     // of tail preserved. Span should land in the middle.
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
     var i: u32 = 0;
     while (i < 12) : (i += 1) {
@@ -852,7 +857,7 @@ test "run: proceed=false when the span is too short, no mutation" {
     const gpa = testing.allocator;
 
     // Only 3 messages — §E.2 aborts when the compactable span is < 4.
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
     for (0..3) |i| {
         const content = try gpa.alloc(types.ContentBlock, 1);
@@ -900,7 +905,7 @@ test "run: empty summarizer output → EmptySummary error" {
     const io = threaded.io();
     const gpa = testing.allocator;
 
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
     var i: u32 = 0;
     while (i < 12) : (i += 1) {
@@ -988,7 +993,7 @@ fn buildMsg(gpa: std.mem.Allocator, text: []const u8, role: types.Role, ts: i64)
 
 test "replaceSpanWithSummary: replaces first N messages (start=0)" {
     const gpa = testing.allocator;
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
 
     try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
@@ -1018,7 +1023,7 @@ test "replaceSpanWithSummary: replaces first N messages (start=0)" {
 
 test "replaceSpanWithSummary: replaces last N messages (end=len)" {
     const gpa = testing.allocator;
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
 
     try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
@@ -1044,7 +1049,7 @@ test "replaceSpanWithSummary: replaces last N messages (end=len)" {
 
 test "replaceSpanWithSummary: replaces a middle span" {
     const gpa = testing.allocator;
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
 
     try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
@@ -1075,7 +1080,7 @@ test "replaceSpanWithSummary: replaces a middle span" {
 
 test "replaceSpanWithSummary: replaces a single message" {
     const gpa = testing.allocator;
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
 
     try transcript.append(try buildMsg(gpa, "user 0", .user, 100));
@@ -1095,7 +1100,7 @@ test "replaceSpanWithSummary: replaces a single message" {
 
 test "replaceSpanWithSummary: zero-length span (start == end) inserts without removal" {
     const gpa = testing.allocator;
-    var transcript = agent_loop.Transcript.init(gpa);
+    var transcript = at.Transcript.init(gpa);
     defer transcript.deinit();
 
     try transcript.append(try buildMsg(gpa, "user 0", .user, 100));

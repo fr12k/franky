@@ -41,7 +41,7 @@
 //! mutex (the agent loop is not reentrant).
 //!
 //! Wire format: each SSE frame is `event: <kind>\ndata: <json>\n\n`,
-//! produced by `agent.proxy.encodeEventJson` + `writeEvent`. The
+//! produced by `agent.wire.encodeEventJson` + `writeEvent`. The
 //! same payloads the in-process loop already emits — no semantic
 //! translation. A `close` event with an empty `{}` payload is sent
 //! when the session shuts down so clients know to stop reconnecting.
@@ -374,6 +374,10 @@ const Session = struct {
     compression_stats: compression_mod.CompressionStats = .{},
     /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
     ccr_ctx: compression_mod.CcrContext = undefined,
+    /// v3.0 — compression injection context for the agent loop.
+    /// Bundles config + store + stats so the loop calls
+    /// `compressToolResultInjected` via an opaque pointer (DI).
+    compression_ctx: compression_mod.CompressionContext = .{ .config = .{} },
 
     /// v3.2 — memory state owning the SQLite store. `null` when memory
     /// is disabled (--no-memory / settings.json) or the store failed to
@@ -724,6 +728,8 @@ fn initSession(
         .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
+    session.compression_ctx.ccr_store = &session.ccr_store;
+    session.compression_ctx.stats = &session.compression_stats;
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(
         allocator,
@@ -2331,9 +2337,11 @@ fn runOneTurnInternal(
                     .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
                 },
             };
-            // v3.0 — wire compression into the agent loop
+            // v3.0 — wire compression into the agent loop via DI.
+            // The loop holds an opaque fn pointer + ctx; the coding
+            // layer provides the concrete implementation.
             if (session.cfg.compress) {
-                lc.compression = compression_mod.CompressionConfig{
+                session.compression_ctx.config = .{
                     .enabled = true,
                     .min_bytes_to_compress = session.cfg.compress_min_bytes,
                     .smart_crusher_enabled = session.cfg.compress_json,
@@ -2344,8 +2352,8 @@ fn runOneTurnInternal(
                     .plain_text_compressor_enabled = session.cfg.compress_plain_text,
                     .ccr_enabled = session.cfg.compress_ccr,
                 };
-                lc.ccr_store = &session.ccr_store;
-                lc.compression_stats = &session.compression_stats;
+                lc.compress_fn = compression_mod.compressToolResultInjected;
+                lc.compress_ctx = @ptrCast(&session.compression_ctx);
             }
             break :blk lc;
         },
@@ -3779,6 +3787,8 @@ fn initSessionForTestWithDir(
         .ccr_store = compression_mod.CcrSessionStore.init(allocator),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
+    session.compression_ctx.ccr_store = &session.ccr_store;
+    session.compression_ctx.stats = &session.compression_stats;
     session.web_search_ctx = .{ .environ_map = session.environ_map };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(allocator, .{ .workspace_dir = "." }, io);
     session.session_gates = .{ .role = &session.role_gate };
