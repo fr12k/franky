@@ -7,13 +7,14 @@ with a complete coding-agent CLI out of the box — seven LLM providers
 (Anthropic, OpenAI Chat, OpenAI Responses, OpenAI-compatible gateways,
 Google Gemini, Google Vertex, plus a scripted fake), a stateful agent
 loop with parallel tool execution, built-in `read` / `write` / `edit` /
-`bash` / `ls` / `find` / `grep` tools (with regex, gitignore, atomic
+`bash` / `ls` / `find` / `grep` / `subagent` / `web_search` / `web_fetch` /
+`workspace` / `memory_save` / `memory_search` / `ccr_retrieve` tools (with regex, gitignore, atomic
 edits, and §R workspace path-safety), session persistence + branching
 on disk, **three run modes** (`print` / `rpc` / `proxy`),
 a built-in web UI served by proxy mode, capability roles, a per-tool
 permission overlay, bearer-token auth (`--auth-token` /
 `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`) for subscription /
-gateway flows, and per-phase HTTP timeouts. **881 tests** pass at the
+gateway flows, and per-phase HTTP timeouts. **~1016 tests** pass at the
 current cut.
 
 ## Quick start
@@ -118,7 +119,7 @@ and the `sbx secret set-custom` commands that go with each.
 | **Run mode** | `print` (one prompt → output → exit) | `--mode rpc` (JSON-RPC over stdio) / `--mode proxy` (HTTP/SSE + web UI) | n/a — explicit choice per run |
 | **Capability role** | `plan` (read + workspace writes, no shell) | `--role read` / `--role plan` / `--role code` (adds bash) / `--role full` (no §R restrictions) | n/a — always bound at session init |
 | **Permission overlay** | off | `--prompts` toggles the gate. Pair with `--yes` (CI), `--allow-tools <csv>`, `--deny-tools <csv>`, or `--ask-tools <csv>` (or `--ask-tools all` for ask-on-every-call) | omit `--prompts` |
-| **Sandbox** | host process (auto-detected) | run in a container (see `docs/sandbox.md` recipes) | n/a — recommendation, not enforced |
+| **Sandbox** | host process (auto-detected) | run in a container (see `SANDBOX.md` recipes) | n/a — recommendation, not enforced |
 | **Reasoning** | off | `--thinking minimal\|low\|medium\|high\|xhigh` | `--thinking off` |
 | **Session persistence** | on (writes to `~/.franky/sessions/<ulid>/`) | default | `--no-session` |
 | **Resume / branching** | new session per run | `--continue` (most recent) or `--resume <id>`; `--fork <name>` / `--checkout <name>` | n/a |
@@ -150,7 +151,7 @@ explicitly to override. Each provider has its own env-var fallback —
 
 # OpenAI-compatible local gateway (Ollama, LM Studio, vLLM, …)
 ./zig-out/bin/franky --provider openai_gateway \
-    --base-url http://localhost:11434/v1/messages \
+    --base-url http://localhost:11434/v1/chat/completions \
     --model llama3 "summarize"
 ```
 
@@ -345,7 +346,7 @@ Full list: `franky --help`. Highlights:
 | `--extensions LIST` | Opt-in Tier-1 extensions |
 | `--offline` | Force faux provider even when a key is set |
 | `--log-level LEVEL` / `--verbose` | `error` / `warn` / `info` / `debug` / `trace` |
-| `--log-file PATH` | Route logs to PATH instead of stderr (env: `FRANKY_LOG_FILE`). Interactive mode auto-diverts above `warn` to a default path so the TUI stays clean. |
+| `--log-file PATH` | Route logs to PATH instead of stderr (env: `FRANKY_LOG_FILE`). Proxy mode auto-diverts above `warn` to a default path so the web UI stays clean. |
 | `-h` / `--help`, `--version` | Help + version |
 
 ### Environment variables
@@ -407,12 +408,12 @@ prompts. Zerobox-style process isolation or Docker are the canonical
 wrappers:
 
 ```sh
-# Using Docker (see docs/sandbox.md for recipes)
+# Using Docker (see SANDBOX.md for recipes)
 docker run --rm -v "$(pwd):/workspace" ...
 ```
 
 Recipes for Docker, devcontainer, Lima, and the Slack-bot
-(`franky-do`) pattern live in [`docs/sandbox.md`](docs/sandbox.md).
+(`franky-do`) pattern live in [`SANDBOX.md`](SANDBOX.md).
 
 ### Sessions on disk
 
@@ -511,9 +512,12 @@ src/
       ls.zig           # Directory listing (recursive, gitignore-aware)
       find.zig         # Glob-based file search
       grep.zig         # Literal-substring + regex search
-      subagent.zig     # Sub-agent delegation
+      subagent.zig     # Sub-agent delegation (supports context_file for large payloads)
       web_search.zig   # Web search
       web_fetch.zig    # Full page content fetch
+      memory_save.zig  # Save fact/decision to persistent memory
+      memory_search.zig # Search persistent memory across sessions
+      ccr_retrieve.zig # Retrieve compressed tool output
       truncate.zig     # Output truncation utility
       workspace.zig    # Workspace context tool
       common.zig       # Shared tool utilities
@@ -763,6 +767,13 @@ const bash_tool = franky.coding.tools.bash.tool();
 const ls_tool = franky.coding.tools.ls.tool();
 const find_tool = franky.coding.tools.find.tool();
 const grep_tool = franky.coding.tools.grep.tool();
+const subagent_tool = franky.coding.tools.subagent.tool();
+const web_search_tool = franky.coding.tools.web_search.tool();
+const web_fetch_tool = franky.coding.tools.web_fetch.tool();
+const workspace_tool = franky.coding.tools.workspace.tool();
+const memory_save_tool = franky.coding.tools.memory_save.tool();
+const memory_search_tool = franky.coding.tools.memory_search.tool();
+const ccr_retrieve_tool = franky.coding.tools.ccr_retrieve.tool();
 ```
 
 | Tool | Schema (abbrev.) |
@@ -774,6 +785,13 @@ const grep_tool = franky.coding.tools.grep.tool();
 | `ls` | `{path?, recursive?, maxDepth?, respectGitignore?}` — directory listing |
 | `find` | `{pattern, cwd?, limit?, respectGitignore?}` — glob-based file search |
 | `grep` | `{pattern, path?, filesGlob?, caseSensitive?, maxMatches?, contextBefore?, contextAfter?}` — literal substring search |
+| `subagent` | `{preset, prompt, context_file?, profile?, ...}` — delegate to an isolated sub-agent; `context_file` for large payloads (>10 KB) |
+| `web_search` | `{query, max_results?}` — web search |
+| `web_fetch` | `{url}` — full page content fetch |
+| `workspace` | workspace context |
+| `memory_save` | `{content, type, priority?, scene_name?}` — save a durable fact to persistent memory |
+| `memory_search` | `{query, limit?}` — search persistent memory across sessions |
+| `ccr_retrieve` | `{key}` — retrieve compressed tool output by hash |
 
 ## Design principles
 
@@ -800,11 +818,11 @@ const grep_tool = franky.coding.tools.grep.tool();
 | `ai` | types, errors, sse, partial_json, channel, stream, registry, http (per-phase timeouts + retries), log | ✅ |
 | `ai` providers | faux, anthropic, openai_chat, openai_responses, openai_gateway, google_gemini, google_vertex | ✅ (7 providers, full wire format + SSE) |
 | `agent` | low-level loop (sequential + parallel-homogeneous), stateful `Agent` (worker thread + subscribers + steer/followUp drain) | ✅ |
-| `coding` tools | read, write, edit (atomic), bash (cwd-locked + env-denylist + §R), ls, find, grep (regex + gitignore) | ✅ |
+| `coding` tools | read, write, edit (atomic), bash (cwd-locked + env-denylist + §R), ls, find, grep (regex + gitignore), subagent (context_file), web_search, web_fetch, workspace, memory_save, memory_search, ccr_retrieve | ✅ |
 | `coding` modes | print, rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
 | `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, bearer-token auth (`--auth-token` + `auth.json` round-trip), Tier-1 extensions | ✅ |
 
-**881 tests** pass at the current cut across one library binary and the
+**~1016 tests** pass at the current cut across one library binary and the
 integration binaries (`agent_loop`, `agent_class`, `gitignore`,
 `parallel_tools`, `kitchen_sink`). The `franky login` minting flow
 shipped in v1.2.* and was removed in v1.30.0 — bearer tokens are now
@@ -887,7 +905,7 @@ to chat-completion-compatible ids by default (drops `dall-e-*`,
 Ollama uses its native `GET /api/tags` endpoint (not OpenAI-compat);
 override the base URL with `--ollama-url` or `OLLAMA_HOST`. Entries
 are mapped to `api: "openai-compatible-gateway"` so franky can drive
-them via `--base-url http://localhost:11434/v1` at runtime. After
+them via `--base-url http://localhost:11434/v1/chat/completions` at runtime. After
 `/api/tags`, gen-models follows up with `POST /api/show` per model
 to extract the real context window (from
 `model_info.<arch>.context_length`) and capability flags (tools,
@@ -901,7 +919,7 @@ The complete deferred-work catalog lives in
 
 - **`franky-do` Slack-bot** sibling project (post-1.0 per §O).
   Pattern + `--role plan` posture documented in
-  [`docs/reference/sandbox.md`](docs/reference/sandbox.md).
+  [`SANDBOX.md`](SANDBOX.md).
 - **`franky-pods` vLLM CLI** sibling project.
 - **Extension Tier-2 / Tier-3** (`.so`/`.dylib` / Wasm). Tier-1
   static-module loading ships; Tier-2/3 need a versioned ABI + sandbox.
@@ -1012,7 +1030,7 @@ A comprehensive automated audit of every module in the source tree was performed
 - **Permission system** with 4 role tiers, tool-level gates, bash verb fingerprinting.
 - **Spec-driven development** with automated cross-reference checking.
 - **7 LLM providers** with unified streaming interface.
-- **881 tests with leak detection** on every run.
+- **~1016 tests with leak detection** on every run.
 - **Guardrails** for unattended operation (stuck detection, compilation check, finish_task).
 
 ### Recommended next steps

@@ -6,7 +6,7 @@ The whole map.
 
 | File | Purpose |
 |---|---|
-| [`spec/v2.md`](spec/v2.md) | **Active v2.x spec — start here for current work.** Open backlog + new v2.x rows. The v2.x line opened 2026-05-01 at 2.0.0. Items in §1–§4 are the carry-over backlog from the v1.x line; new shipped work moves into [`../CHANGELOG.md`](../CHANGELOG.md) under the matching v2.x entry. |
+| [`spec/v2.md`](spec/v2.md) | **Active v2.x spec — start here for current work.** Open backlog + new v2.x rows. The v2.x line opened 2026-05-01 at 2.0.0. Items in §1–§4 are the carry-over backlog from the v1.x line; new shipped work is logged in the §6 "items shipped after the v1.0.0 cut" row table. |
 | [`spec/v1.md`](spec/v1.md) | **Concluded v1 spec — historical reference.** Architecture (§1-§14), implementation reference (§A-§S), per-version row table for v1.0.0 → v1.31.0. Most rows ✅; rows for features that shipped earlier in v1.x and were later removed carry `❌ removed in vX.Y.Z`. Read-only as of 2026-05-01 — edits are limited to factual fixes + `❌` flips when a v1.x feature is later removed. Source code `§` markers continue to point here for v1-introduced subsystems. |
 | [`spec/v0.md`](spec/v0.md) | Frozen v0.* development history. Read for "when and how did feature X land in v0.*?" — append-only from here. |
 | [`spec/v3.md`](spec/v3.md) | Open spec for next-major work past v2.x. Items here imply user-visible UX surface or extend a v1/v2 primitive substantially enough to need spec-level design before implementation. |
@@ -18,16 +18,11 @@ The whole map.
 | [`design/open/`](design/open/) | Pending review or partial implementation. Each file marks decisions with `✓ accept` / `→ <override>` / `?`. |
 | [`design/decided/`](design/decided/) | Historical record of resolved designs. The shipped behavior lives in `spec/v1.md`'s row table — these docs are the *paper trail* of how those rows came to be. |
 
-## reference/ — long-form docs
+## limits/ — capacity & design-parameter notes
 
 | File | Topic |
 |---|---|
-| [`reference/diagnostics.md`](reference/diagnostics.md) | Per-turn anomaly report behind the `/diagnostics` slash command. |
-| [`reference/self-improvement.md`](reference/self-improvement.md) | Cross-session analyzer behind `/improve` and `franky doctor`. Mines `summary.json` files into a feature-request-shaped backlog. |
-| [`reference/spec-management.md`](reference/spec-management.md) | How to manage spec docs over time — research synthesis + applied principles for v1.md / v2.md / archive. |
-| [`reference/sandbox.md`](reference/sandbox.md) | Sandbox / `franky-zerobox` setup recipes for `--role code` / `full`. |
-| [`reference/tui-roadmap.md`](reference/tui-roadmap.md) | Open UX/UI work for `--mode interactive`. |
-| [`reference/learning-zig.md`](reference/learning-zig.md) | 12-chapter tutorial that teaches Zig by reading + modifying franky's source. |
+| [`limits/stream-channel-capacity.md`](limits/stream-channel-capacity.md) | The provider→reducer stream channel: capacity choice, the single-thread deadlock history, and how to read the `stream_channel_high_watermark` log line. |
 
 ## archive/ — stale snapshots
 
@@ -38,14 +33,13 @@ Not consulted day-to-day; kept so `git log --follow` works for old PRs.
 | [`archive/refactor-v0.md`](archive/refactor-v0.md) | v0 era refactoring plan. |
 | [`archive/refactor-v1.3.md`](archive/refactor-v1.3.md) | v1.3.0 internal refactoring plan. |
 | [`archive/refactor-v1.15.md`](archive/refactor-v1.15.md) | v1.15.2 audit decisions. |
-| [`archive/code-analyse.md`](archive/code-analyse.md) | v1.15ish codebase analysis. |
-| [`archive/coverage-report.md`](archive/coverage-report.md) | Test-coverage snapshot (regenerable). |
-| [`archive/session-recording.md`](archive/session-recording.md) | Literal Claude session transcript. |
+| [`archive/profiling_guide.md`](archive/profiling_guide.md) | Profiling guide (CPU flamegraph, memory dimensions). |
+| [`archive/design/`](archive/design/) | Archived design RFCs (presets, subagent, web UI, guardrails, etc.). |
 
-## CHANGELOG.md
+## Per-version history
 
-[`CHANGELOG.md`](../CHANGELOG.md) at the repo root carries per-version
-history in [Keep a Changelog](https://keepachangelog.com/) format.
-The implementation-status table at the top of `spec/v1.md` is the
-spec-level view (each row marks current ✅/❌ state); the changelog is
-the chronological view (dates, prose, rationale).
+Per-version history lives in the spec row tables themselves:
+the implementation-status table at the top of [`spec/v1.md`](spec/v1.md)
+is the spec-level view for the v1.x line (each row marks current ✅/❌
+state), and [`spec/v2.md`](spec/v2.md) §6 is the chronological view for
+items shipped after the v1.0.0 cut.

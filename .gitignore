@@ -5,3 +5,5 @@ zig-out/
 zig-pkg/
 jobs/
 memory.db
+memory.db-shm
+memory.db-wal

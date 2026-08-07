@@ -1,21 +1,21 @@
 Franky Codebase Analysis — Complete Report
 
-**Generated:** 2026-07-03 — analysis of the full source tree at v2.3.0.
+**Generated:** 2026-07-03 — analysis of the full source tree at spec v2.3.0 (library v0.29.0).
 
 ## Overview
 
-Franky is a provider-agnostic, streaming LLM agent framework written in Zig 0.17-dev. It's a mature, layered runtime (~881 passing tests) for building tool-using AI agents, shipping with a complete coding-agent CLI out of the box.
+Franky is a provider-agnostic, streaming LLM agent framework written in Zig 0.17-dev. It's a mature, layered runtime (~1016 passing tests) for building tool-using AI agents, shipping with a complete coding-agent CLI out of the box.
 
-Version: 2.3.0 (library root), built on Zig 0.17-dev (master), zero external dependencies.
+Version: 0.29.0 (library root), built on Zig 0.17-dev (master), two vendored dependencies (zompress, agent_memory/SQLite 3.53.4).
 
 ## Codebase at a glance
 
 | Metric | Value |
 |---|---|
 | Lines of code | ~50k+ across 100+ files |
-| Tests | 881 (unit + integration) |
-| Providers | 6 (Anthropic, OpenAI Chat, OpenAI Responses, OpenAI Gateway, Google Gemini, Google Vertex, + Faux for testing) |
-| Built-in tools | 13 (read/write/edit/bash/ls/find/grep/ast_grep/subagent/web_search/web_fetch/truncate/workspace) |
+| Tests | ~1016 (unit + integration) |
+| Providers | 7 (Anthropic, OpenAI Chat, OpenAI Responses, OpenAI Gateway, Google Gemini, Google Vertex, + Faux for testing) |
+| Built-in tools | 14 (read/write/edit/bash/ls/find/grep/subagent/web_search/web_fetch/workspace/memory_save/memory_search/ccr_retrieve) |
 | Run modes | 3 (print/rpc/proxy) |
 | Capability roles | 4 (read/plan/code/full) |
 | Guardrails | 3 (stuck detector, compilation guard, finish_task) |
@@ -197,7 +197,7 @@ Programmatic entry point for embedding franky in other Zig programs. Re-exports 
 ---
 7. Test Suite
 
-881 tests across:
+~1016 tests across:
 
     Unit tests: Inline in every source file (types, channels, errors, tools, gitignore, etc.)
     Integration tests (test/):
@@ -225,7 +225,7 @@ Build (build.zig)
     6 integration test binaries
     LLVM/LLD opt-in for macOS compatibility
 
-Dependencies: Zero (build.zig.zon has empty .dependencies)
+Dependencies: Two vendored — zompress (v0.1.1) and agent_memory (SQLite 3.53.4 via franky-memory v0.0.2)
 CI/CD
 
     GitHub Actions workflows
@@ -237,14 +237,13 @@ Documentation
 
     docs/spec/v1.md, docs/spec/v2.md — Versioned specification documents
     docs/design/ — Design decisions and rationale
-    docs/reference/ — Reference material (sandbox, spec management)
     docs/archive/ — Historical docs
     docs/todos/ — TODO tracking
     Spec anchor discipline: every source §-reference cross-checks against spec headings at build time
 
 Skills
 
-    skills/zig.md — Zig 0.16+/0.17-dev programming reference loaded as a skill bundle
+    skills/zig-merged-kb.md — Zig 0.16+/0.17-dev programming reference loaded as a skill bundle
 
 ---
 9. Key Design Principles
@@ -297,7 +296,7 @@ The following findings were surfaced by an automated deep-code audit of every mo
    - **Symptom:** Adding a new owning-string field to `SessionHeader` will silently leak unless `freeSessionHeader` is also updated.
    - **Fix needed:** Use compile-time reflection to deinit all string fields automatically, or add a `comptime` assertion that verifies every field is freed.
 
-6. **No end-to-end tests for the four run modes**
+6. **No end-to-end tests for the three run modes**
    - **Location:** `src/coding/modes/` — `print.zig`, `rpc.zig`, `proxy.zig`
    - **Gap:** CLI parsing is tested, but the mode drivers (print/rpc/proxy) have zero integration tests. The RPC framer is tested in `kitchen_sink_test.zig` but not the full request/response lifecycle.
    - **Risk:** Mode-specific bugs (e.g. the proxy subscriber leak) escape detection until they manifest in production.
@@ -341,14 +340,14 @@ The following findings were surfaced by an automated deep-code audit of every mo
 
 ### ✅ Notable Strengths (reinforced by deep audit)
 
-- **Zero external dependencies** — entire framework is pure Zig.
+- **Two vendored dependencies** — zompress (compression) and agent_memory (SQLite 3.53.4); otherwise pure Zig.
 - **Mature threading model** with three-level cancellation (abort/interrupt/stop_requested).
 - **Comprehensive error taxonomy** with retryability metadata and structured ErrorDetails.
 - **Atomic file operations** throughout session persistence and tool execution (tempfile + rename).
 - **Permission system** with role tiers (4 levels), tool-level gates, bash verb fingerprinting, and persistent allow/deny.
 - **Spec-driven development** with automated cross-reference checking (spec anchors + doc links).
 - **7 LLM providers** with unified streaming interface.
-- **881 tests with leak detection** on every run via `std.testing.allocator`.
+- **~1016 tests with leak detection** on every run via `std.testing.allocator`.
 - **Thorough memory management** — every allocation paired with `defer`/`errdefer`, arena allocators for session-scoped data.
 - **Guardrails** for unattended operation: stuck detection, compilation checking, finish_task enforcement.
 
