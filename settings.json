@@ -17,7 +17,7 @@
         },
         "memory": {
             "enabled": true,
-            "nudge": false
+            "nudge": true
         }
     },
     "review": {

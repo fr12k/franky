@@ -274,12 +274,13 @@ pub const Config = struct {
     /// registered and the system prompt contains no memory guidance.
     memory_enabled: bool = true,
 
-    /// v3.2 — `--memory-nudge` — opt-in memory save nudge. When true and
-    /// the agent calls `finish_task` without having called `memory_save`
-    /// this session, the guardrail injects a synthetic user message
-    /// reminding it to save important facts. Default off. Requires
-    /// `--memory` (no-op when memory is disabled).
-    memory_nudge: bool = false,
+    /// v3.2 — `--memory-nudge` — memory save nudge (default on). When
+    /// true and the agent calls `finish_task` without having called
+    /// `memory_save` this session, the guardrail injects a synthetic
+    /// user message reminding it to save important facts. Requires
+    /// `--memory` (no-op when memory is disabled). Use `--no-memory-nudge`
+    /// to disable.
+    memory_nudge: bool = true,
 
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
@@ -726,7 +727,7 @@ pub const usage_text: []const u8 =
     \\  --remember-permissions       Persist always-allow/deny to permissions.json
     \\  --memory                     Enable persistent memory tools (default on)
     \\  --no-memory                  Disable persistent memory tools
-    \\  --memory-nudge               Nudge agent to save memory before finish_task (default off)
+    \\  --memory-nudge               Nudge agent to save memory before finish_task (default on)
     \\  --no-memory-nudge            Disable memory save nudge
     \\  --verbose                    Extra logging to stderr
     \\  -h, --help                   Show this help

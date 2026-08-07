@@ -96,7 +96,7 @@ pub const Settings = struct {
     /// system-prompt section. `null` = no setting (CLI default on applies).
     memory_enabled: ?bool = null,
     /// v3.2 — `tools.memory.nudge` — settings-layer toggle for the
-    /// memory save nudge guardrail. `null` = no setting (CLI default off).
+    /// memory save nudge guardrail. `null` = no setting (CLI default on).
     memory_nudge: ?bool = null,
 
     /// `permissions.ask_all` — settings-layer default for the
