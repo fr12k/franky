@@ -828,6 +828,19 @@ fn initSession(
 
         const params_json = try tools_mod.subagent.buildParametersJson(ra, preset_reg);
 
+        // v1.31.0 — workspace for `context_file` path-safety. Proxy
+        // mode doesn't pass a workspace to `buildBaseToolSet` (its
+        // `read` tool is the plain variant), but the subagent's
+        // `context_file` loader still wants path canonicalization. We
+        // allocate a Workspace on the session arena rooted at $PWD so
+        // `context_file` paths are confined to the workspace root.
+        const subagent_workspace: ?*tools_mod.workspace.Workspace = blk: {
+            const root = environ.getPosix("PWD") orelse break :blk null;
+            const ws = try ra.create(tools_mod.workspace.Workspace);
+            ws.* = .{ .root = root, .host_env = environ_map };
+            break :blk ws;
+        };
+
         const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
         var parent_session_dir: ?[]const u8 = null;
         if (session.parent_dir) |parent| {
@@ -849,6 +862,8 @@ fn initSession(
             // the session struct so its address is stable.
             .permission_prompter_slot = &session.current_prompter,
             .parent_session_dir = parent_session_dir,
+            // v1.31.0 — workspace for `context_file` path-safety.
+            .workspace = subagent_workspace,
             // §6.6 — forward sub-agent events to SSE subscribers.
             .progress_fn = subagentProgressForward,
             .progress_userdata = session,

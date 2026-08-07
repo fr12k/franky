@@ -55,7 +55,22 @@ Activate on `/review --multimodel` or `franky --skill multimodel-review` with th
    > 6. **Keep the response under 300 lines total.** Be concise.
    >
    > Include only real issues; omit style nits and formatting comments."
-   > [paste full diff]
+   > <diff-instruction>
+
+   **Passing the diff to the sub-agent (IMPORTANT):**
+   `diff-review` has no file tools, so the diff must reach it via the
+   `prompt` or `context_file` parameter of the `subagent` tool call.
+   Inlining a large diff (>~10 KB) directly into `prompt` is unreliable
+   — the JSON string gets truncated or dropped. Instead:
+   - Write the diff to a temp file with `bash` (e.g.
+     `git diff HEAD > /tmp/review-diff.patch`).
+   - Pass `context_file: "/tmp/review-diff.patch"` on each `subagent` call;
+     the tool reads it server-side and appends it to the prompt, so the
+     sub-agent sees the full diff without the parent having to inline it.
+   - Keep the `prompt` itself short: just the review instruction above.
+   For small diffs (under ~10 KB) inlining into `prompt` is fine —
+   replace `<diff-instruction>` with the diff text directly. In both
+   cases the sub-agent must end up seeing the diff content.
 
    Use `timeout_ms` from the Review configuration (default 180000).
    Use `preset: "diff-review"` and `profile: "<profile-name>"` for each call.

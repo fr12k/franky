@@ -53,6 +53,7 @@ const permissions_mod = @import("../security/permissions.zig");
 const session_mod = @import("../session/mod.zig");
 const truncate_mod = @import("truncate.zig");
 const common = @import("common.zig");
+const workspace_mod = @import("workspace.zig");
 
 pub const tool_name: []const u8 = "subagent";
 
@@ -494,7 +495,8 @@ pub fn buildParametersJson(
         \\"timeout_ms":{"type":"integer","minimum":1000,"maximum":7200000,"description":"Wall-clock timeout (default 1800000 = 30 min, max 7200000 = 2 h)."},
         \\"max_turns":{"type":"integer","minimum":1,"description":"Hard cap on agent-loop turns (default 20)."},
         \\"role":{"type":"string","enum":["read","plan","code","full"],"description":"Capability role override (defaults to preset's default_role; demotion only)."},
-        \\"system_prompt":{"type":"string","description":"Optional override for the sub-agent's system prompt."}
+        \\"system_prompt":{"type":"string","description":"Optional override for the sub-agent's system prompt."},
+        \\"context_file":{"type":"string","description":"Optional path to a file whose contents are appended to `prompt` server-side before spawning the sub-agent. Use this for large content (e.g. a diff > ~10 KB) instead of inlining it into `prompt` — the parent's JSON string emission is unreliable for long payloads. Path is resolved against the workspace root with the same path-safety as the `read` tool; max 256 KB."}
         \\}}
     );
     return buf.toOwnedSlice(allocator);
@@ -645,6 +647,14 @@ pub const Ctx = struct {
     /// transcripts under `<parent_session_dir>/subagents/<call_id>/`.
     /// When null, persistence is skipped (e.g. `--no-session`).
     parent_session_dir: ?[]const u8,
+    /// v1.31.0 — workspace root for `context_file` path-safety.
+    /// When set, `context_file` paths are canonicalized against this
+    /// root (same `workspace.canonicalizeOrError` the `read` tool
+    /// uses). When null, `context_file` paths are read directly
+    /// against CWD (degraded safety — for back-compat with mode
+    /// drivers not yet wired). Borrowed pointer; must outlive any
+    /// in-flight subagent execute call.
+    workspace: ?*const workspace_mod.Workspace = null,
     /// Faux provider for tests — the sub-agent's registry needs
     /// `userdata` matching what the parent's `faux` registration
     /// uses. v1.24.0 just passes the same registry through; this
@@ -741,12 +751,21 @@ const ParsedArgs = struct {
     max_turns: u32,
     role: ?role_mod.Role,
     system_prompt: ?[]const u8,
+    /// v1.31.0 — optional path to a file whose contents are appended
+    /// to `prompt` server-side before spawning the sub-agent. Lets the
+    /// parent pass a large diff/context by path instead of inlining
+    /// tens of KB into the JSON `prompt` string (which LLMs emit
+    /// unreliably — truncating, dropping, or leaving the placeholder).
+    /// The file is read with the same workspace path-safety + 256 KB
+    /// cap as the `read` tool. See `loadContextFile`.
+    context_file: ?[]const u8,
 
     fn deinit(self: *ParsedArgs, alloc: std.mem.Allocator) void {
         alloc.free(self.preset);
         if (self.profile) |p| alloc.free(p);
         alloc.free(self.prompt);
         if (self.system_prompt) |s| alloc.free(s);
+        if (self.context_file) |c| alloc.free(c);
     }
 };
 
@@ -1062,12 +1081,45 @@ fn runSubagent(
         return errorResult(allocator, .agent_error, msg, .{ .spawn_id = call_id });
     };
 
+    // v1.31.0 — load `context_file` (if provided) server-side and append
+    // its contents to the prompt before spawning. This is the fix for
+    // the large-diff-to-subagent failure mode: the parent passes a
+    // small instruction + a file path instead of inlining tens of KB
+    // into the JSON `prompt` string (which LLMs emit unreliably —
+    // truncating, dropping, or leaving the placeholder). The loaded
+    // bytes are appended after a separator so the diff-review preset
+    // (which has NO file tools) sees the full content in its prompt.
+    // Ownership: `effective_prompt_owned` is the joined buffer we hand
+    // to `sub_agent.prompt`; null means we borrow `parsed.prompt`
+    // directly (no alloc, no free).
+    var effective_prompt_owned: ?[]u8 = null;
+    defer if (effective_prompt_owned) |b| allocator.free(b);
+    const effective_prompt: []const u8 = blk: {
+        const cf = parsed.context_file orelse break :blk parsed.prompt;
+        const content = loadContextFile(allocator, io, ctx, cf) catch |e| {
+            const msg = switch (e) {
+                ContextFileError.NotFound => std.fmt.allocPrint(allocator, "context_file not found: {s}", .{cf}) catch unreachable,
+                ContextFileError.TooLarge => std.fmt.allocPrint(allocator, "context_file too large (exceeds {d} bytes): {s}", .{ context_file_max_bytes, cf }) catch unreachable,
+                ContextFileError.Binary => std.fmt.allocPrint(allocator, "context_file appears binary (contains NUL): {s}", .{cf}) catch unreachable,
+                ContextFileError.ReadFailed => std.fmt.allocPrint(allocator, "context_file read failed: {s}", .{cf}) catch unreachable,
+            };
+            defer allocator.free(msg);
+            return errorResult(allocator, .invalid_args, msg, .{ .spawn_id = call_id });
+        };
+        // content is caller-owned (loadContextFile allocates); join it
+        // with the prompt and free the intermediate content buffer.
+        defer allocator.free(content);
+        const joined = try std.fmt.allocPrint(allocator, "{s}\n\n--- context_file: {s} ---\n\n{s}", .{ parsed.prompt, cf, content });
+        effective_prompt_owned = joined;
+        break :blk joined;
+    };
+
     // Run the sub-agent. Buffered: we wait until idle and read
     // the final assistant text from its transcript.
     ai.log.log(.info, "subagent", "spawn", "preset={s} profile={s} call_id={s} model={s} role={s} timeout_ms={d} max_turns={d}", .{
         preset.name, effective_profile, call_id, provider_info.model_id, sub_role.toString(), parsed.timeout_ms, parsed.max_turns,
     });
-    sub_agent.prompt(parsed.prompt) catch |e| {
+    sub_agent.prompt(effective_prompt) catch |e| {
         supervisor_done.store(true, .release);
         supervisor.join();
         const msg = std.fmt.allocPrint(allocator, "agent.prompt failed: {s}", .{@errorName(e)}) catch unreachable;
@@ -1242,6 +1294,95 @@ const ParseError = error{
     MaxTurnsOutOfRange,
 };
 
+/// v1.31.0 — errors specific to `context_file` loading. Surfaced
+/// via `errorResult(.invalid_args, ...)` so the parent agent gets
+/// an actionable message instead of a raw tool failure.
+const ContextFileError = error{
+    NotFound,
+    TooLarge,
+    Binary,
+    ReadFailed,
+};
+
+/// v1.31.0 — soft cap on `context_file` size. Matches the `read`
+/// tool's `max_bytes_without_limit` (256 KB). Diffs and source
+/// listings the parent passes in are well under this; going higher
+/// risks blowing the sub-agent's context window for no benefit.
+const context_file_max_bytes: usize = 256 * 1024;
+
+/// v1.31.0 — read `path` from disk with the same workspace
+/// path-safety + size cap as the `read` tool. Returns a
+/// caller-owned byte slice. Errors are mapped to `ContextFileError`
+/// so the caller can surface an actionable `invalid_args` result.
+///
+/// Why this exists: the `diff-review` preset has NO file-reading
+/// tools, so the parent agent must pass the diff text inside the
+/// `prompt` JSON string. For diffs > tens of KB, LLMs emit the
+/// string unreliably (truncating, dropping, or leaving the
+/// `[paste full diff]` placeholder). `context_file` lets the
+/// parent pass a path instead; this loader reads it server-side
+/// and the caller appends it to the prompt before spawning.
+///
+/// `ctx.workspace` is optional — when null (older mode drivers
+/// not yet wired), the raw `path` is read directly against CWD
+/// without path-safety. This keeps the field opt-in for mode
+/// drivers while degrading safely.
+fn loadContextFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: *const Ctx,
+    path: []const u8,
+) ContextFileError![]u8 {
+    // Resolve the path to an absolute filesystem path, then open+read
+    // once. When a workspace is configured we canonicalize through it
+    // (same path-safety as the `read` tool); otherwise we fall back to
+    // the raw path against CWD.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const abs_path: []const u8 = blk: {
+        const ws = ctx.workspace orelse break :blk path;
+        // canonicalizeOrError returns `!CanonResult` (error union).
+        // On success `.ok` holds an owned CanonPath (caller must
+        // deinit); on error `.err` holds a code+message. We map any
+        // path-safety failure to NotFound so the parent gets an
+        // actionable `context_file not found` message.
+        const r = workspace_mod.canonicalizeOrError(aalloc, ws, path) catch return error.NotFound;
+        switch (r) {
+            .ok => |c| break :blk c.abs,
+            .err => return error.NotFound,
+        }
+    };
+
+    const file = std.Io.Dir.cwd().openFile(io, abs_path, .{}) catch return error.NotFound;
+    defer file.close(io);
+    return readCapped(allocator, io, file);
+}
+
+/// Read up to `context_file_max_bytes` from an open file. Refuses
+/// binary content (NUL in the first 8 KB) and files exceeding the cap.
+/// The caller owns the returned slice.
+fn readCapped(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+) ContextFileError![]u8 {
+    const len = file.length(io) catch return error.ReadFailed;
+    if (len > context_file_max_bytes) return error.TooLarge;
+    const buf = allocator.alloc(u8, @intCast(len)) catch return error.ReadFailed;
+    errdefer allocator.free(buf);
+    const n = file.readPositionalAll(io, buf, 0) catch return error.ReadFailed;
+    const bytes = buf[0..n];
+    // Binary sniff — same heuristic as the `read` tool.
+    const sniff_len = @min(bytes.len, 8192);
+    if (std.mem.indexOfScalar(u8, bytes[0..sniff_len], 0) != null) {
+        allocator.free(buf);
+        return error.Binary;
+    }
+    return buf;
+}
+
 fn parseArgs(allocator: std.mem.Allocator, args_json: []const u8) ParseError!ParsedArgs {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1268,6 +1409,7 @@ fn parseArgs(allocator: std.mem.Allocator, args_json: []const u8) ParseError!Par
         .max_turns = default_max_turns,
         .role = null,
         .system_prompt = null,
+        .context_file = null,
     };
     errdefer out.deinit(allocator);
 
@@ -1288,6 +1430,14 @@ fn parseArgs(allocator: std.mem.Allocator, args_json: []const u8) ParseError!Par
     };
     if (obj.get("system_prompt")) |v| if (v == .string) {
         out.system_prompt = try allocator.dupe(u8, v.string);
+    };
+    // v1.31.0 — optional context_file path. Read server-side so the
+    // parent doesn't have to inline large content into the JSON prompt
+    // string (the failure mode that prompted this field).
+    if (obj.get("context_file")) |v| if (v == .string) {
+        if (v.string.len > 0) {
+            out.context_file = try allocator.dupe(u8, v.string);
+        }
     };
 
     return out;
@@ -1586,6 +1736,108 @@ test "parseArgs: required fields + defaults" {
     try testing.expectEqual(default_max_turns, p.max_turns);
     try testing.expect(p.role == null);
     try testing.expect(p.system_prompt == null);
+    // v1.31.0 — context_file defaults to null when not provided.
+    try testing.expect(p.context_file == null);
+}
+
+test "parseArgs: context_file parsed when provided" {
+    const gpa = testing.allocator;
+    var p = try parseArgs(gpa, "{\"preset\":\"diff-review\",\"prompt\":\"review this\",\"context_file\":\"/tmp/diff.patch\"}");
+    defer p.deinit(gpa);
+    try testing.expectEqualStrings("diff-review", p.preset);
+    try testing.expectEqualStrings("review this", p.prompt);
+    try testing.expectEqualStrings("/tmp/diff.patch", p.context_file.?);
+}
+
+test "parseArgs: empty context_file string treated as null" {
+    // An empty `context_file` string is a no-op — the loader skips it.
+    // Models sometimes emit `""` for optional string fields; treating
+    // that as "no file" avoids a spurious not-found error.
+    const gpa = testing.allocator;
+    var p = try parseArgs(gpa, "{\"preset\":\"diff-review\",\"prompt\":\"y\",\"context_file\":\"\"}");
+    defer p.deinit(gpa);
+    try testing.expect(p.context_file == null);
+}
+
+test "loadContextFile: reads a workspace file and returns its bytes" {
+    const gpa = testing.allocator;
+    var threaded = @import("../../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Create a temp dir + file inside it.
+    const tmp = "/tmp/franky_ctx_file_test_";
+    _ = std.Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, tmp);
+    const file_path = tmp ++ "/diff.patch";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n" });
+
+    var ws: workspace_mod.Workspace = .{ .root = tmp };
+    var ctx: Ctx = .{
+        .registry = undefined,
+        .environ = undefined,
+        .environ_map = undefined,
+        .parent_tools = &.{},
+        .parent_role = .read,
+        .presets = undefined,
+        .parameters_json_owned = "",
+        .permission_store = null,
+        .parent_session_dir = null,
+        .workspace = &ws,
+    };
+    const content = try loadContextFile(gpa, io, &ctx, "diff.patch");
+    defer gpa.free(content);
+    try testing.expect(std.mem.indexOf(u8, content, "-old") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "+new") != null);
+}
+
+test "loadContextFile: not-found maps to NotFound error" {
+    const gpa = testing.allocator;
+    var threaded = @import("../../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ws: workspace_mod.Workspace = .{ .root = "/tmp" };
+    var ctx: Ctx = .{
+        .registry = undefined,
+        .environ = undefined,
+        .environ_map = undefined,
+        .parent_tools = &.{},
+        .parent_role = .read,
+        .presets = undefined,
+        .parameters_json_owned = "",
+        .permission_store = null,
+        .parent_session_dir = null,
+        .workspace = &ws,
+    };
+    try testing.expectError(error.NotFound, loadContextFile(gpa, io, &ctx, "franky_nonexistent_file_xyz.patch"));
+}
+
+test "loadContextFile: workspace escape maps to NotFound" {
+    // Paths that escape the workspace root are rejected by
+    // canonicalizeOrError; the loader maps that to NotFound so the
+    // parent agent gets an actionable message.
+    const gpa = testing.allocator;
+    var threaded = @import("../../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ws: workspace_mod.Workspace = .{ .root = "/tmp" };
+    var ctx: Ctx = .{
+        .registry = undefined,
+        .environ = undefined,
+        .environ_map = undefined,
+        .parent_tools = &.{},
+        .parent_role = .read,
+        .presets = undefined,
+        .parameters_json_owned = "",
+        .permission_store = null,
+        .parent_session_dir = null,
+        .workspace = &ws,
+    };
+    // /etc/passwd escapes /tmp.
+    try testing.expectError(error.NotFound, loadContextFile(gpa, io, &ctx, "/etc/passwd"));
 }
 
 test "parseArgs: explicit timeout_ms + max_turns + role" {
