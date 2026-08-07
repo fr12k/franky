@@ -1,9 +1,10 @@
-# Refactoring Plan — Tool Management Consolidation
+# Refactoring Plan — Tool Management Consolidation + Interactive Mode Removal
 
-**Goal:** Eliminate redundant tool-management code across the four run modes
-(`print`, `interactive`, `proxy`, `rpc`) by routing all modes through the
-existing `config.resolve()` pipeline (or a shared helper extracted from it).
-**Primary outcome:** less code in total.
+**Goal:** Eliminate redundant tool-management code AND remove interactive
+mode entirely, reducing the codebase from 4 run modes to 3 (`print`,
+`proxy`, `rpc`) and routing all remaining modes through the existing
+`config.resolve()` pipeline. **Primary outcome:** significantly less code
+in total.
 
 **Assessment conducted by 3 models (ollama-cloud):**
 - `deepseek-v4-flash` — redundancy analysis
@@ -24,73 +25,88 @@ base 9 tools → workspace/plain variant → role filter → extension merge
                       memory_search, memory_save]
 ```
 
-**Only `print.zig` (line 220) calls `config.resolve()`.** The other three
-modes — `rpc.zig`, `proxy.zig`, `interactive.zig` — each re-implement the
-same pipeline independently, resulting in ~300 lines of duplicated
-tool-construction logic spread across 3 files.
+**Only `print.zig` (line 220) calls `config.resolve()`.** The other two
+tool-bearing modes — `rpc.zig`, `proxy.zig` — each re-implement the same
+pipeline independently, resulting in ~200 lines of duplicated
+tool-construction logic spread across 2 files.
 
-### 1.1 Where the duplication lives
+**Additionally**, the `interactive` mode (a raw-terminal TUI REPL,
+`src/coding/modes/interactive.zig`, 3,559 lines) will be **removed
+entirely**. It is the most complex, highest-risk mode to maintain, is the
+sole consumer of the entire `src/tui/` library (2,380 lines) and
+`src/coding/terminal.zig` (265 lines), and has zero mode-level integration
+tests. Its functionality (multi-turn conversation with a UI) is fully
+covered by `proxy` mode (web UI served by the built-in HTTP server).
 
-| Block | `config.zig` (canonical) | `rpc.zig` | `proxy.zig` | `interactive.zig` |
-|---|---|---|---|---|
-| Base-9 tool array | 1055–1114 | 176–186 | 634–644 | 1887–1907 |
-| Role filtering | 1116–1124 | 187 | 645 | 1913–1914 |
-| Extension merge | 1156–1162, 1244–1254 | ❌ missing | 843–847, 878–882 | 281–330 (two-phase) |
-| Preset registry + subagent ctx | 1224–1243 | 386–417 | 830–877 | 2068–2093 |
-| Final tool append | 1244–1265 | 418–424 | 878–889 | 2096–2107 |
-| Memory tools | 1260–1262 | ❌ missing | ❌ missing | 2103–2105 |
-| Settings overlay | internal to resolve | 196+ | 651–660 | 1846 |
-| finishTask tool | 1257 | 696–701 (per-prompt) | 886 | 2100 |
+### 1.1 Where the tool-building duplication lives (post-interactive-removal)
 
-### 1.2 What each mode duplicates vs. what it uniquely needs
-
-| Aspect | rpc | proxy | interactive |
+| Block | `config.zig` (canonical) | `rpc.zig` | `proxy.zig` |
 |---|---|---|---|
-| Same base-9 tools | ✅ identical set | ✅ identical set | ✅ identical set |
-| Workspace variants | ❌ always plain | ❌ always plain | ✅ full if/else |
-| Role filtering | ✅ same `filterTools` | ✅ same | ✅ same |
-| Extensions | ❌ not loaded | ✅ loaded | ✅ loaded (2-phase) |
-| `subagent` tool | ✅ | ✅ | ✅ |
-| `listPresets` tool | ✅ | ✅ | ✅ |
-| `finishTask` tool | ✅ (per-prompt, 696) | ✅ | ✅ |
-| `ccr_retrieve` tool | ✅ | ✅ | ✅ |
-| `memory_search/save` | ❌ **missing** | ❌ **missing** | ✅ |
-| **Unique need** | `progress_fn` for JSON-RPC event forwarding; per-prompt `finishTask` append | per-prompt `prompter` slot in subagent ctx | per-turn re-bind of tools; memory tools |
+| Base-9 tool array | 1055–1114 | 176–186 | 634–644 |
+| Role filtering | 1116–1124 | 187 | 645 |
+| Extension merge | 1156–1162, 1244–1254 | ❌ missing | 843–847, 878–882 |
+| Preset registry + subagent ctx | 1224–1243 | 386–417 | 830–877 |
+| Final tool append | 1244–1265 | 418–424 | 878–889 |
+| Memory tools | 1260–1262 | ❌ missing | ❌ missing |
+| Settings overlay | internal to resolve | 196+ | 651–660 |
+| finishTask tool | 1257 | 696–701 (per-prompt) | 886 |
 
-**Key finding (minimax-m3):** rpc and proxy are **missing features** that
-`config.resolve()` provides (extensions in rpc; memory tools in rpc+proxy).
-This is not just cosmetic duplication — it's a latent feature gap.
+### 1.2 What each remaining mode duplicates vs. what it uniquely needs
+
+| Aspect | rpc | proxy |
+|---|---|---|
+| Same base-9 tools | ✅ identical set | ✅ identical set |
+| Workspace variants | ❌ always plain | ❌ always plain |
+| Role filtering | ✅ same `filterTools` | ✅ same |
+| Extensions | ❌ not loaded | ✅ loaded |
+| `subagent` tool | ✅ | ✅ |
+| `listPresets` tool | ✅ | ✅ |
+| `finishTask` tool | ✅ (per-prompt, 696) | ✅ |
+| `ccr_retrieve` tool | ✅ | ✅ |
+| `memory_search/save` | ❌ **missing** | ❌ **missing** |
+| **Unique need** | `progress_fn` for JSON-RPC event forwarding; per-prompt `finishTask` | per-prompt `prompter` slot in subagent ctx |
+
+**Key finding:** rpc and proxy are **missing features** that
+`config.resolve()` already provides (extensions in rpc; memory tools in
+both). Consolidating fixes these latent gaps.
 
 ---
 
 ## 2. Root Cause: The "Stable Address" Problem
 
-The fundamental blocker preventing the other 3 modes from calling
-`config.resolve()` is **pointer stability**. `config.resolve()` allocates
-tools on its own arena and wires ctx pointers to its own internal state
-(`bash_ctx`, `read_ctx`, `web_search_ctx`, `subagent_ctx`). But rpc/proxy/
-interactive need tool ctx pointers to reference **session-owned state**
-(`session.bash_state`, `session.ccr_ctx`, `session.permission_store`),
-which is initialized *after* config resolution would run.
+The fundamental blocker preventing rpc/proxy from calling `config.resolve()`
+is **pointer stability**. `config.resolve()` allocates tools on its own arena
+and wires ctx pointers to its own internal state (`bash_ctx`, `read_ctx`,
+`web_search_ctx`, `subagent_ctx`). But rpc/proxy need tool ctx pointers to
+reference **session-owned state** (`session.bash_state`, `session.ccr_ctx`,
+`session.permission_store`), which is initialized *after* config resolution
+would run.
 
 Additionally:
-- **rpc** needs a `progress_fn` (`subagentProgressForward`) in its
-  subagent ctx for JSON-RPC event forwarding.
+- **rpc** needs a `progress_fn` (`subagentProgressForward`) in its subagent
+  ctx for JSON-RPC event forwarding.
 - **proxy** needs a `permission_prompter_slot` pointing at
   `session.current_prompter` (set per-prompt).
-- **interactive** re-binds tools every turn to ensure the current prompter
-  is injected; it also wires memory tools (which config.resolve does too).
 
 These are **late-binding** concerns, not fundamental architectural
 incompatibilities.
+
+> **Note on ctx pointers:** Each `AgentTool` carries a `ctx: ?*anyopaque`
+> field — a type-erased pointer to session-owned state (workspace path-safety,
+> bash cwd tracking, subagent session handle, CCR store, memory DB, etc.).
+> These pointers are genuinely needed (the workspace ctx is the sandbox
+> safety switch; the subagent ctx is the entire parent-session handle). What
+> is *not* needed is the duplicated code that wires them up — that's what
+> this refactoring eliminates. The pointers stay; the 2 independent copies
+> of the wiring code go away.
 
 ---
 
 ## 3. Proposed Structure: Two-Phase Tool Builder
 
 Extract the tool pipeline from `config.resolve()` into reusable pieces
-that all 4 modes can call, with late-binding hooks for the mode-specific
-parts.
+that all 3 remaining modes can call, with late-binding hooks for the
+mode-specific parts.
 
 ### 3.1 `buildBaseToolSet` (static phase)
 
@@ -109,7 +125,7 @@ pub fn buildBaseToolSet(
 - Builds the base 9 tools with workspace-or-plain variants.
 - Applies role filtering.
 - Returns the filtered slice.
-- **Replaces:** rpc.zig 176–187, proxy.zig 634–645, interactive.zig 1887–1914,
+- **Replaces:** rpc.zig 176–187, proxy.zig 634–645,
   config.zig 1055–1124 (internal callers use this too).
 
 ### 3.2 `finalizeToolSet` (late-binding phase)
@@ -134,8 +150,7 @@ pub fn finalizeToolSet(
 - Copies `base_tools` + `ext_tools` into a new slice.
 - Appends `subagent`, `listPresets`, `finishTask`, `ccr_retrieve`.
 - Appends `memory_search` + `memory_save` when `memory_state != null`.
-- **Replaces:** rpc.zig 418–424, proxy.zig 878–889, interactive.zig 2096–2107,
-  config.zig 1244–1265.
+- **Replaces:** rpc.zig 418–424, proxy.zig 878–889, config.zig 1244–1265.
 
 ### 3.3 Mode integration
 
@@ -152,67 +167,139 @@ Each mode's flow becomes:
 
 ---
 
-## 4. Estimated Line Reduction
+## 4. Interactive Mode Removal
+
+### 4.1 What gets deleted
+
+Interactive mode is a raw-terminal TUI REPL. It is the **sole consumer** of
+several modules that exist only to serve it:
+
+| Component | File(s) | Lines | Used by any other mode? |
+|---|---|---|---|
+| Interactive mode driver | `src/coding/modes/interactive.zig` | 3,559 | No |
+| TUI library | `src/tui/*.zig` (9 files) | 2,380 | No |
+| Terminal raw-mode wrapper | `src/coding/terminal.zig` | 265 | No |
+| TUI/terminal module exports | `src/root.zig:14,41`, `src/coding/mod.zig:24,29,108,111` | ~6 | No |
+
+**Total lines deleted:** **~6,210 lines**
+
+### 4.2 What stays (shared, used by other modes)
+
+These are referenced by interactive mode comments but are **not**
+interactive-specific — they're used by proxy/rpc too and must stay:
+
+| Component | File | Why it stays |
+|---|---|---|
+| Slash command framework | `src/coding/slash.zig` (262) | Proxy mode uses it (`POST /command` route, 30+ handlers in proxy.zig) |
+| Permission prompter | `src/coding/security/permissions.zig` | Proxy + rpc use `PermissionPrompter` + `current_prompter` slot |
+| Session creation | `src/coding/session/create.zig` | print/rpc/proxy all call `SessionState.init` |
+| Diagnostics | `src/coding/diagnostics.zig` | Uses `mode_name` as a free-form display string, not the Mode enum — only test fixtures pass `"interactive"` |
+| Improvement reports | `src/coding/improvement.zig` | Same — `mode` field is a parsed JSON string, not the enum |
+| Skills | `src/coding/skills.zig` | Comments mention "proxy + interactive" but the code is proxy-shared |
+
+### 4.3 Code changes required for removal
+
+| File | Change |
+|---|---|
+| `src/coding/config/cli.zig:27` | Remove `.interactive` from `pub const Mode = enum { print, interactive, rpc, proxy }` → `enum { print, rpc, proxy }` |
+| `src/coding/config/cli.zig:630` | Remove `else if (std.mem.eql(u8, v, "interactive")) cfg.mode = .interactive` |
+| `src/coding/config/cli.zig:15,695,719` | Update help/usage text: remove `interactive` from mode list |
+| `src/coding/modes/print.zig:191–196` | Remove the `if (cfg.mode == .interactive)` dispatch block |
+| `src/coding/mod.zig:24` | Remove `pub const interactive = @import("modes/interactive.zig")` |
+| `src/coding/mod.zig:108` | Remove `_ = modes.interactive` keepalive |
+| `src/coding/mod.zig:29` | Remove `pub const terminal = @import("terminal.zig")` |
+| `src/coding/mod.zig:111` | Remove `_ = terminal` keepalive |
+| `src/root.zig:14` | Remove `pub const tui = @import("tui/mod.zig")` |
+| `src/root.zig:41` | Remove `_ = tui` keepalive |
+| `src/coding/config/profiles.zig:613` | Remove `if (std.mem.eql(u8, s, "interactive")) return .interactive` |
+| `src/coding/config/profiles.zig:1354` | Remove test `try testing.expectEqual(cli.Mode.interactive, ...)` |
+| `src/coding/skills.zig:322,349` | Update comments: remove "interactive" mentions |
+| `src/coding/review.zig:3` | Update comment: remove "interactive" mention |
+| `src/agent/guardrails/finish_task.zig:31` | Update tool description: remove "and interactive modes" |
+| `src/coding/security/permissions.zig:13,592` | Update comments/error text: remove "interactive" mentions |
+| `src/coding/session/create.zig:5` | Update comment: remove "interactive.zig" mention |
+| `src/agent/loop.zig:204` | Update comment: remove "interactive prompts the user" |
+| `src/coding/tools/subagent.zig:638,957` | Update comments: remove "interactive" from the list of modes that set prompter_slot |
+| `README.md` | Update: "three run modes" instead of "four", remove `interactive` from mode list |
+| `AGENTS.md:19` | Update: "3 (print/rpc/proxy)" instead of "4" |
+| `docs/EXTENSION.md` | Remove interactive-mode examples |
+| Delete files | `src/coding/modes/interactive.zig`, `src/tui/` (9 files), `src/coding/terminal.zig` |
+
+### 4.4 Behavioral impact
+
+- Users who ran `franky --mode interactive` (the TUI REPL) will get an
+  `UnknownMode` error. **Mitigation:** the CLI error message should suggest
+  `--mode proxy` (web UI) as the replacement for interactive multi-turn
+  sessions.
+- `franky` with no `--mode` flag still defaults to `print` — unchanged.
+- No test coverage is lost: `interactive.zig` has 0 mode-level integration
+  tests (confirmed: `grep -c "test \"" src/coding/modes/interactive.zig` = 0).
+
+---
+
+## 5. Estimated Line Reduction
+
+### 5.1 Interactive mode removal
+
+| Component | Lines |
+|---|---|
+| `src/coding/modes/interactive.zig` | −3,559 |
+| `src/tui/*.zig` (9 files) | −2,380 |
+| `src/coding/terminal.zig` | −265 |
+| Module-export + dispatch cleanup | −~30 |
+| **Subtotal** | **−~6,234** |
+
+### 5.2 Tool consolidation (remaining 3 modes)
 
 | File | Current LOC | Lines removed | Lines added (calls) | Net |
 |---|---|---|---|---|
-| `config.zig` | 1409 | ~70 (extracted to helpers) | ~90 (new `buildBaseToolSet` + `finalizeToolSet` + `ToolBindingCtx`) | +20 |
-| `print.zig` | 3097 | ~10 (use helpers internally) | ~5 | −5 |
-| `rpc.zig` | 954 | ~120 (base tools 176–186, filter 187, settings 196+, subagent 386–417, final 418–424, per-prompt finishTask 696–701) | ~25 | −95 |
-| `proxy.zig` | 5712 | ~110 (base 634–644, filter 645, subagent 830–877, final 878–889) | ~25 | −85 |
-| `interactive.zig` | 3559 | ~100 (base 1887–1907, filter, subagent 2068–2093, final 2096–2107, ext merge 313–327) | ~25 | −75 |
-| **Total** | 14731 | **~410** | **~150** | **−260** |
+| `config.zig` | 1409 | ~70 (extracted to helpers) | ~90 (new helpers) | +20 |
+| `print.zig` | 3097 | ~10 | ~5 | −5 |
+| `rpc.zig` | 954 | ~120 | ~25 | −95 |
+| `proxy.zig` | 5712 | ~110 | ~25 | −85 |
+| **Subtotal** | | **~240** | **~145** | **−165** |
 
-**Conservative estimate: ~250 lines net reduction.**
-**Optimistic estimate (if memory/extension gaps in rpc/proxy are treated as
-"just call resolve" rather than feature additions): ~300+ lines.**
+### 5.3 Grand total
 
-Additional benefit: rpc and proxy **gain** extension + memory tool support
-they're currently missing — a feature win, not just code reduction.
-
----
-
-## 5. Risk + Effort Assessment (per mode)
-
-### rpc.zig — Difficulty: Medium
-
-| Risk | Severity | Mitigation |
-|---|---|---|
-| `progress_fn` in subagent ctx (JSON-RPC event forwarding) | Medium | Add `progress_fn` + `progress_userdata` fields to `ToolBindingCtx` / subagent ctx factory |
-| Per-prompt `finishTask` append (696–701) | Low | Move into `finalizeToolSet` (called once at session init, not per-prompt — check if per-prompt is truly needed) |
-| No workspace variant (always plain) | Low | `buildBaseToolSet` handles both; rpc passes `null` workspace |
-| Missing extensions | Low (feature gap) | Fixing this adds extensions to rpc — verify no test breaks |
-| Missing memory tools | Low (feature gap) | Same as above |
-
-### proxy.zig — Difficulty: Medium
-
-| Risk | Severity | Mitigation |
-|---|---|---|
-| Per-prompt `current_prompter` slot in subagent ctx | Medium | Subagent ctx is built once at session init; `permission_prompter_slot` is a `?*Prompter` pointer field that's updated per-prompt — already works via pointer-to-slot |
-| Missing memory tools | Low (feature gap) | Adding them is a feature improvement |
-| Session-owned `bash_state` / `web_search_ctx` | Low | Build base tools with `null` ctx, then patch ctx pointers post-session-init (same as print's ccr patching at 271–276) |
-
-### interactive.zig — Difficulty: High
-
-| Risk | Severity | Mitigation |
-|---|---|---|
-| Per-turn tool re-binding | High | This is the hardest — interactive rebuilds `final_tools` every turn (2096–2107). If `finalizeToolSet` is called once at session init, the per-turn rebind must be preserved. **Solution:** call `finalizeToolSet` once; per-turn changes only affect `subagent_ctx` fields (prompter slot), not the tool array itself. Verify the tool array is stable across turns. |
-| Two-phase extension merge (281–330) | Medium | Extensions loaded outside `SessionBinding.init`, then appended. Consolidate into `buildBaseToolSet` + `finalizeToolSet` flow. |
-| Memory state init duplicated (1984–2015 ≈ config 1190–1221) | Medium | Extract memory init into a shared helper too (bonus deduplication) |
+| Metric | Value |
+|---|---|
+| Interactive mode removal | −~6,234 lines |
+| Tool consolidation (3 modes) | −~165 lines |
+| **Total net reduction** | **~6,400 lines** |
+| Codebase before | ~72,214 lines (114 Zig files) |
+| Codebase after | **~65,800 lines (~103 files)** |
+| Modes | 4 → 3 |
+| Feature gaps fixed (bonus) | rpc: extensions, memory; proxy: memory |
 
 ---
 
-## 6. Recommended Refactoring Order
+## 6. Risk + Effort Assessment (per phase)
 
-Based on risk levels (lowest first):
-
-### Phase 1 — Extract helpers from `config.zig` (Low risk, no behavior change)
+### Phase 1 — Extract helpers from `config.zig` (Low risk)
 1. Extract `buildBaseToolSet()` from config.zig 1055–1124.
 2. Extract `finalizeToolSet()` + `ToolBindingCtx` from config.zig 1244–1265.
 3. Have `config.resolve()` internally call these helpers.
-4. **Validate:** all 881 tests pass, print mode unchanged.
+4. **Validate:** all tests pass, print mode unchanged.
 
-### Phase 2 — Consolidate `rpc.zig` (Medium risk, feature gain)
+### Phase 2 — Remove interactive mode (Low–Medium risk)
+1. Delete `interactive.zig`, `src/tui/`, `terminal.zig`.
+2. Remove `.interactive` from the `Mode` enum + parser + help text.
+3. Remove the interactive dispatch block in `print.zig:191–196`.
+4. Clean up module exports in `root.zig` + `coding/mod.zig`.
+5. Update comments/doc strings in ~10 files (mechanical, no behavior change).
+6. Update `README.md`, `AGENTS.md`, `docs/EXTENSION.md`.
+7. **Validate:** `zig build test` — no test references interactive mode's
+   `Mode.interactive` enum value except `profiles.zig:1354` (remove that
+   test line). All other `interactive` references are comment strings or
+   free-form display labels in diagnostics/improvement tests (unaffected).
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| Breaking users who rely on `--mode interactive` | Medium | CLI error message suggests `--mode proxy`; proxy's web UI covers the use case |
+| Orphaned import in `mod.zig` / `root.zig` | Low | Remove the `_ = modes.interactive` / `_ = tui` keepalive lines |
+| Hidden TUI dependency in another file | Low | Verified: `grep -rln "tui" src` outside `src/tui/` and `interactive.zig` returns only `root.zig` (the export) |
+
+### Phase 3 — Consolidate `rpc.zig` (Medium risk, feature gain)
 1. Replace rpc.zig 176–187 with `buildBaseToolSet()`.
 2. Replace rpc.zig 418–424 with `finalizeToolSet()`.
 3. Add `progress_fn` hook to `ToolBindingCtx` for JSON-RPC forwarding.
@@ -220,42 +307,54 @@ Based on risk levels (lowest first):
 5. **Bonus:** rpc gains extension support + memory tools (if desired).
 6. **Validate:** run rpc mode tests.
 
-### Phase 3 — Consolidate `proxy.zig` (Medium risk, feature gain)
+### Phase 4 — Consolidate `proxy.zig` (Medium risk, feature gain)
 1. Replace proxy.zig 634–645 with `buildBaseToolSet()`.
 2. Replace proxy.zig 878–889 with `finalizeToolSet()`.
 3. Verify `permission_prompter_slot` pointer stability (already pointer-to-slot).
 4. **Bonus:** proxy gains memory tool support.
 5. **Validate:** run proxy mode tests + manual web UI smoke test.
 
-### Phase 4 — Consolidate `interactive.zig` (High risk, preserve per-turn semantics)
-1. Replace interactive.zig 1887–1914 with `buildBaseToolSet()`.
-2. Replace interactive.zig 2096–2107 with `finalizeToolSet()`.
-3. Verify the tool array is stable across turns (subagent ctx fields are
-   updated per-turn via pointer, not the array itself).
-4. Consolidate the two-phase extension merge (281–330) into the standard flow.
-5. **Bonus:** extract shared memory-init helper (1984–2015 ≈ config 1190–1221).
-6. **Validate:** run interactive mode tests + manual TUI smoke test.
+---
+
+## 7. Recommended Refactoring Order
+
+Based on risk levels (lowest first):
+
+```
+Phase 1: Extract helpers in config.zig        (Low risk, no behavior change)
+Phase 2: Remove interactive mode entirely     (Low–Medium, -6,234 lines)
+Phase 3: Consolidate rpc.zig                  (Medium, +features, -95 lines)
+Phase 4: Consolidate proxy.zig                (Medium, +features, -85 lines)
+```
+
+**Phase 2 (interactive removal) before Phase 3/4 (tool consolidation)**
+is intentional: removing interactive first eliminates the highest-risk
+consolidation target (the minimax-m3 model rated interactive "High"
+difficulty due to per-turn tool re-binding). Once it's gone, the
+remaining consolidation is just rpc + proxy — both Medium difficulty.
 
 ---
 
-## 7. Validation Strategy
+## 8. Validation Strategy
 
 The repo has ~881 tests. Relevant test coverage:
 
 ```bash
 # Find mode-specific tests
 grep -rln 'test "' src/coding/modes/
-grep -rn 'test "' src/coding/modes/rpc.zig      # rpc tests
-grep -rn 'test "' src/coding/modes/proxy.zig    # proxy tests
-grep -rn 'test "' src/coding/modes/interactive.zig # interactive tests
-grep -rn 'test "' src/coding/config.zig        # config resolver tests
+grep -rn 'test "' src/coding/config.zig
+# Check no test depends on Mode.interactive (except the one profiles test line)
+grep -rn 'interactive' src/coding/config/profiles.zig  # line 613, 1354
 ```
 
 **Per-phase validation:**
-1. After Phase 1: `zig build test` — all 881 tests must pass (no behavior change).
-2. After Phase 2: `zig build test` + manual rpc smoke test (`echo '{"method":"ping"}' | franky --mode rpc`).
-3. After Phase 3: `zig build test` + manual proxy smoke test (`franky --mode proxy` + curl).
-4. After Phase 4: `zig build test` + manual interactive smoke test (`franky --mode interactive` + type a prompt).
+1. After Phase 1: `zig build test` — all tests pass (no behavior change).
+2. After Phase 2: `zig build test` — confirm compilation succeeds with
+   interactive removed; verify `--mode interactive` gives a clean error.
+3. After Phase 3: `zig build test` + manual rpc smoke test
+   (`echo '{"method":"ping"}' | franky --mode rpc`).
+4. After Phase 4: `zig build test` + manual proxy smoke test
+   (`franky --mode proxy` + curl `/health` + `/prompt`).
 
 **Regression watch:** the `ccr_retrieve` ctx late-binding (config.zig 1259,
 print.zig 271–276) must be preserved in all modes — tools with `null` ctx
@@ -263,18 +362,22 @@ get patched after session init. Verify each mode does this.
 
 ---
 
-## 8. Summary
+## 9. Summary
 
 | Metric | Value |
 |---|---|
-| Duplicated tool-building lines across 3 modes | ~410 |
-| New helper code in config.zig | ~150 |
-| **Net line reduction** | **~260 lines** |
-| Modes consolidated | 4 of 4 (print already done) |
+| **Interactive mode removal** | **−~6,234 lines** (interactive.zig + tui/ + terminal.zig) |
+| Tool consolidation (rpc + proxy) | −~165 lines |
+| New helper code in config.zig | ~145 lines |
+| **Total net reduction** | **~6,400 lines** (~9% of codebase) |
+| Modes | 4 → 3 (print, proxy, rpc) |
+| Files deleted | 11 (interactive.zig, 9 TUI files, terminal.zig) |
 | Feature gaps fixed (bonus) | rpc: extensions, memory; proxy: memory |
-| Risk level | Medium (rpc, proxy) / High (interactive) |
-| Phases | 4 (extract → rpc → proxy → interactive) |
+| Risk level | Low (Phase 1) → Low–Medium (Phase 2) → Medium (Phases 3–4) |
+| Phases | 4 (extract → remove interactive → rpc → proxy) |
 
-The refactoring achieves the goal of **less code in total** while also
-**closing feature gaps** (rpc/proxy missing extensions/memory tools) and
-**establishing a single source of truth** for tool management.
+The refactoring achieves the goal of **dramatically less code in total**
+(~6,400 lines removed, ~9% of the codebase) by removing the untested,
+highest-complexity mode and consolidating the remaining tool management
+into a single source of truth, while also **closing latent feature gaps**
+(rpc/proxy missing extensions/memory tools).
