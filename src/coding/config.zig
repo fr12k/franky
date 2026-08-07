@@ -904,7 +904,15 @@ pub fn initMemoryFromEnv(
 
     var out: MemoryInit = .{};
     out.state = initMemoryState(arena_alloc, allocator, io, db_path, data_dir);
-    if (out.state != null and cfg.memory_nudge) {
+    // v3.2 — degraded mode: store failed to open. Flip the config flag
+    // off so buildSystemPromptIo suppresses the Memory Tools hint
+    // (otherwise the LLM would see the hint but have no tools). Doing it
+    // here means all three mode drivers get it for free.
+    if (out.state == null) {
+        cfg.memory_enabled = false;
+        return out;
+    }
+    if (cfg.memory_nudge) {
         const mg = try arena_alloc.create(memory_guard_mod.MemoryGuardrail);
         mg.* = memory_guard_mod.MemoryGuardrail.init(.{ .enabled = true });
         out.guardrail = mg;

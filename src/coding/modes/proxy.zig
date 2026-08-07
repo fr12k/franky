@@ -735,13 +735,13 @@ fn initSession(
     // v3.2 — memory state + nudge guardrail. Proxy mode builds the
     // session by hand (it doesn't call config_mod.resolve()), so it
     // must construct the MemoryState itself via the shared
-    // `initMemoryFromEnv` helper. On degraded mode (store open
-    // failure) `memory_state` stays null; we flip `cfg.memory_enabled`
-    // off so `buildSystemPromptIo` suppresses the Memory Tools hint
-    // (otherwise the LLM would see the hint but have no tools).
+    // `initMemoryFromEnv` helper. The helper flips `cfg.memory_enabled`
+    // off in degraded mode (store open failure) so `buildSystemPromptIo`
+    // suppresses the Memory Tools hint.
     //
-    // The pointers are allocated on `session.role_arena` and deinit'd
-    // in `Session.deinit`.
+    // The pointers are allocated on `session.role_arena`; `MemoryState`
+    // is deinit'd in `Session.deinit` (closes the SQLite handle opened on
+    // `allocator`, not the arena — so we must errdefer it here too).
     {
         const ra = session.role_arena.allocator();
         const mem = try config_mod.initMemoryFromEnv(
@@ -756,8 +756,8 @@ fn initSession(
         if (mem.guardrail) |mg| {
             session.guardrail_state.memory_guardrail = mg;
         }
-        if (mem.state == null) cfg.memory_enabled = false;
     }
+    errdefer if (session.memory_state) |ms| ms.deinit();
 
     session.session_gates = .{
         .role = &session.role_gate,
