@@ -75,6 +75,8 @@ const review_mod = @import("../review.zig");
 const sse_mod = @import("../sse.zig");
 const compression_mod = franky.coding.compression;
 const config_mod = franky.coding.config.resolver;
+const memory_mod = franky.coding.memory;
+const memory_guard_mod = franky.agent.guardrails;
 
 pub const default_port: u16 = 8787;
 // pub const default_host: []const u8 = "127.0.0.1";
@@ -373,6 +375,14 @@ const Session = struct {
     /// v3.0 — CCR context bundling store + stats for ccr_retrieve tool.
     ccr_ctx: compression_mod.CcrContext = undefined,
 
+    /// v3.2 — memory state owning the SQLite store. `null` when memory
+    /// is disabled (--no-memory / settings.json) or the store failed to
+    /// open (degraded mode). Owned by `role_arena`; deinit'd in `deinit`.
+    memory_state: ?*memory_mod.MemoryState = null,
+    /// v3.2 — memory nudge guardrail. `null` when `--no-memory-nudge` or
+    /// memory is disabled. Owned by `role_arena`.
+    memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
     tool_usage: std.StringHashMap(u32) = undefined,
@@ -437,6 +447,8 @@ const Session = struct {
         }
         self.guardrail_state.deinit();
         self.ccr_store.deinit();
+        // v3.2 — memory state + guardrail (allocated on role_arena).
+        if (self.memory_state) |ms| ms.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -719,6 +731,34 @@ fn initSession(
         io,
     );
     errdefer session.guardrail_state.deinit();
+
+    // v3.2 — memory state + nudge guardrail. Proxy mode builds the
+    // session by hand (it doesn't call config_mod.resolve()), so it
+    // must construct the MemoryState itself via the shared
+    // `initMemoryFromEnv` helper. The helper flips `cfg.memory_enabled`
+    // off in degraded mode (store open failure) so `buildSystemPromptIo`
+    // suppresses the Memory Tools hint.
+    //
+    // The pointers are allocated on `session.role_arena`; `MemoryState`
+    // is deinit'd in `Session.deinit` (closes the SQLite handle opened on
+    // `allocator`, not the arena — so we must errdefer it here too).
+    {
+        const ra = session.role_arena.allocator();
+        const mem = try config_mod.initMemoryFromEnv(
+            ra,
+            allocator,
+            io,
+            cfg,
+            environ_map,
+        );
+        session.memory_state = mem.state;
+        session.memory_guardrail = mem.guardrail;
+        if (mem.guardrail) |mg| {
+            session.guardrail_state.memory_guardrail = mg;
+        }
+    }
+    errdefer if (session.memory_state) |ms| ms.deinit();
+
     session.session_gates = .{
         .role = &session.role_gate,
         .permissions = if (session.prompts_enabled) &session.permission_store else null,
@@ -877,6 +917,7 @@ fn initSession(
             .preset_registry = preset_reg,
             .guardrail_state = &session.guardrail_state,
             .ccr_ctx = &session.ccr_ctx,
+            .memory_state = session.memory_state,
         });
         session.tools = final_tools;
     }
