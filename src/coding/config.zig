@@ -929,6 +929,133 @@ fn buildReviewConfigBlock(
     );
 }
 
+// ─── Shared tool-building helpers ─────────────────────────────────
+//
+// Extracted from `resolve()` so that print, rpc, and proxy modes can all
+// build the same base tool set + final tool list without duplicating the
+// ~50-line pipeline. `resolve()` itself calls these internally.
+
+/// Inputs for the base (always-present) tool set. When `workspace` is
+/// non-null, the path-taking tools get workspace-scoped variants; otherwise
+/// they get the plain (no-safety-check) variants. `bash_ctx` and
+/// `web_search_ctx` carry session-owned state when available.
+pub const BaseToolInputs = struct {
+    workspace: ?*const tools_mod.workspace.Workspace = null,
+    bash_ctx: ?*tools_mod.bash.BashCtx = null,
+    bash_state: ?*tools_mod.bash.SessionBashState = null,
+    read_ctx: ?*const tools_mod.read.ReadCtx = null,
+    web_search_ctx: ?*const tools_mod.web_search.WebSearchCtx = null,
+};
+
+/// Build the 9 base tools (read/write/edit/bash/ls/find/grep/web_search/
+/// web_fetch) with workspace-or-plain variants, then filter by `role`.
+/// Returns a caller-owned slice allocated on `allocator`.
+///
+/// `resolve()` calls this internally; rpc/proxy can call it directly when
+/// they need session-owned ctx pointers (build with null ctx first, then
+/// patch the tool.ctx field after the session struct is initialized).
+pub fn buildBaseToolSet(
+    allocator: std.mem.Allocator,
+    role: role_mod.Role,
+    inputs: BaseToolInputs,
+) ![]at.AgentTool {
+    var all_tools: [9]at.AgentTool = undefined;
+    {
+        var i: usize = 0;
+        if (inputs.workspace) |ws| {
+            all_tools[i] = if (inputs.read_ctx) |rc| tools_mod.read.toolWithCtx(rc) else tools_mod.read.tool();
+            i += 1;
+            all_tools[i] = tools_mod.write.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.edit.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = if (inputs.bash_ctx) |bc| tools_mod.bash.toolWithStateAndWorkspace(bc) else tools_mod.bash.toolWithState(inputs.bash_state.?);
+            i += 1;
+            all_tools[i] = tools_mod.ls.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.find.toolWithWorkspace(ws);
+            i += 1;
+            all_tools[i] = tools_mod.grep.toolWithWorkspace(ws);
+            i += 1;
+        } else {
+            all_tools[i] = if (inputs.read_ctx) |rc| tools_mod.read.toolWithCtx(rc) else tools_mod.read.tool();
+            i += 1;
+            all_tools[i] = tools_mod.write.tool();
+            i += 1;
+            all_tools[i] = tools_mod.edit.tool();
+            i += 1;
+            all_tools[i] = if (inputs.bash_state) |bs| tools_mod.bash.toolWithState(bs) else tools_mod.bash.tool();
+            i += 1;
+            all_tools[i] = tools_mod.ls.tool();
+            i += 1;
+            all_tools[i] = tools_mod.find.tool();
+            i += 1;
+            all_tools[i] = tools_mod.grep.tool();
+            i += 1;
+        }
+        if (inputs.web_search_ctx) |wsc| {
+            all_tools[i] = tools_mod.web_search.toolWithCtx(wsc);
+            i += 1;
+            all_tools[i] = tools_mod.web_fetch.toolWithCtx(wsc);
+            i += 1;
+        } else {
+            all_tools[i] = tools_mod.web_search.tool();
+            i += 1;
+            all_tools[i] = tools_mod.web_fetch.tool();
+            i += 1;
+        }
+    }
+    const role_gate = role_mod.RoleGate.init(role);
+    return try role_mod.filterTools(allocator, &all_tools, role_gate.set);
+}
+
+/// Inputs for `finalizeToolSet` — the mode-specific late-binding pieces
+/// that can't be built by `buildBaseToolSet` because they need the
+/// session struct (subagent ctx, guardrail state, ccr ctx, memory state).
+pub const ToolBindingCtx = struct {
+    /// Role-filtered base tools (from `buildBaseToolSet`).
+    base_tools: []const at.AgentTool,
+    /// Extension-contributed tools (may be empty).
+    ext_tools: []const at.AgentTool = &.{},
+    subagent_ctx: *const tools_mod.subagent.Ctx,
+    preset_registry: *const tools_mod.subagent.PresetRegistry,
+    guardrail_state: *agent.guardrails.GuardrailState,
+    /// CCR context pointer for `ccr_retrieve`. Pass `null` to insert the
+    /// tool with a placeholder ctx that the mode driver patches after
+    /// session init (same pattern as `resolve()` at line 1259).
+    ccr_ctx: ?*compression_mod.CcrContext = null,
+    /// When non-null, appends `memory_search` + `memory_save`.
+    memory_state: ?*memory_mod.MemoryState = null,
+};
+
+/// Assemble the final tool list: base + extensions + the built-in extras
+/// (subagent, listPresets, finishTask, ccr_retrieve) and optionally
+/// memory tools. Returns a caller-owned slice allocated on `allocator`.
+///
+/// `resolve()` calls this internally; rpc/proxy can call it directly to
+/// avoid duplicating the append logic.
+pub fn finalizeToolSet(
+    allocator: std.mem.Allocator,
+    ctx: ToolBindingCtx,
+) ![]at.AgentTool {
+    const base_len = ctx.base_tools.len + ctx.ext_tools.len;
+    const extra: usize = if (ctx.memory_state != null) 6 else 4;
+    const slice = try allocator.alloc(at.AgentTool, base_len + extra);
+    @memcpy(slice[0..ctx.base_tools.len], ctx.base_tools);
+    if (ctx.ext_tools.len > 0) {
+        @memcpy(slice[ctx.base_tools.len..][0..ctx.ext_tools.len], ctx.ext_tools);
+    }
+    slice[base_len] = tools_mod.subagent.toolWithCtx(@constCast(ctx.subagent_ctx));
+    slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(@constCast(ctx.preset_registry));
+    slice[base_len + 2] = ctx.guardrail_state.finishTaskTool();
+    slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithCtx(ctx.ccr_ctx);
+    if (ctx.memory_state) |ms| {
+        slice[base_len + 4] = tools_mod.memory_search.tool(ms);
+        slice[base_len + 5] = tools_mod.memory_save.tool(ms);
+    }
+    return slice;
+}
+
 // ─── Main resolve entry point ───────────────────────────────────
 
 /// Resolve a complete configuration from CLI args, env, and settings.
@@ -1066,52 +1193,6 @@ pub fn resolve(
     };
 
     var startup_warnings: std.ArrayList([]const u8) = .empty;
-    const base_tool_count: usize = 9;
-    var all_tools: [11]at.AgentTool = undefined;
-    {
-        var i: usize = 0;
-        // Common tools (always present)
-        if (workspace_state) |ws| {
-            all_tools[i] = tools_mod.read.toolWithCtx(read_ctx);
-            i += 1;
-            all_tools[i] = tools_mod.write.toolWithWorkspace(ws);
-            i += 1;
-            all_tools[i] = tools_mod.edit.toolWithWorkspace(ws);
-            i += 1;
-            all_tools[i] = tools_mod.bash.toolWithStateAndWorkspace(bash_ctx);
-            i += 1;
-            all_tools[i] = tools_mod.ls.toolWithWorkspace(ws);
-            i += 1;
-            all_tools[i] = tools_mod.find.toolWithWorkspace(ws);
-            i += 1;
-            all_tools[i] = tools_mod.grep.toolWithWorkspace(ws);
-            i += 1;
-            all_tools[i] = tools_mod.web_search.toolWithCtx(web_search_ctx);
-            i += 1;
-            all_tools[i] = tools_mod.web_fetch.toolWithCtx(web_search_ctx);
-            i += 1;
-        } else {
-            all_tools[i] = tools_mod.read.tool();
-            i += 1;
-            all_tools[i] = tools_mod.write.tool();
-            i += 1;
-            all_tools[i] = tools_mod.edit.tool();
-            i += 1;
-            all_tools[i] = tools_mod.bash.toolWithState(bash_state);
-            i += 1;
-            all_tools[i] = tools_mod.ls.tool();
-            i += 1;
-            all_tools[i] = tools_mod.find.tool();
-            i += 1;
-            all_tools[i] = tools_mod.grep.tool();
-            i += 1;
-            all_tools[i] = tools_mod.web_search.toolWithCtx(web_search_ctx);
-            i += 1;
-            all_tools[i] = tools_mod.web_fetch.toolWithCtx(web_search_ctx);
-            i += 1;
-        }
-    }
-    const all_tools_slice = all_tools[0..base_tool_count];
 
     const active_role = if (cfg.role) |s|
         try role_mod.Role.fromString(s)
@@ -1120,7 +1201,15 @@ pub fn resolve(
     const role_gate = try a.create(role_mod.RoleGate);
     errdefer a.destroy(role_gate);
     role_gate.* = role_mod.RoleGate.init(active_role);
-    const role_filtered_tools = try role_mod.filterTools(allocator, all_tools_slice, role_gate.set);
+
+    // ── Step 8: Build base tool set (role-filtered) ─────────────
+    const role_filtered_tools = try buildBaseToolSet(allocator, active_role, .{
+        .workspace = workspace_state,
+        .bash_ctx = bash_ctx,
+        .bash_state = bash_state,
+        .read_ctx = read_ctx,
+        .web_search_ctx = web_search_ctx,
+    });
     defer allocator.free(role_filtered_tools);
 
     // ── Step 9: Permission store ─────────────────────────────────
@@ -1241,28 +1330,15 @@ pub fn resolve(
         .permission_prompter_slot = null,
         .parent_session_dir = null,
     };
-    const all_final_tools = blk: {
-        const base_len = role_filtered_tools.len + ext_tools.len;
-        // v3.2 — +2 for memory tools (memory_search, memory_save)
-        // when memory is enabled. The ccr_retrieve ctx is patched
-        // later by the mode driver.
-        const extra: usize = if (memory_state != null) 6 else 4;
-        const slice = try a.alloc(at.AgentTool, base_len + extra);
-        @memcpy(slice[0..role_filtered_tools.len], role_filtered_tools);
-        if (ext_tools.len > 0) {
-            @memcpy(slice[role_filtered_tools.len..][0..ext_tools.len], ext_tools);
-        }
-        slice[base_len] = tools_mod.subagent.toolWithCtx(subagent_ctx);
-        slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(&preset_registry);
-        slice[base_len + 2] = guardrail_state.finishTaskTool();
-        // ccr_retrieve tool — ctx is set by the mode driver after session creation
-        slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithCtx(null);
-        if (memory_state) |ms| {
-            slice[base_len + 4] = tools_mod.memory_search.tool(ms);
-            slice[base_len + 5] = tools_mod.memory_save.tool(ms);
-        }
-        break :blk slice;
-    };
+    const all_final_tools = try finalizeToolSet(a, .{
+        .base_tools = role_filtered_tools,
+        .ext_tools = ext_tools,
+        .subagent_ctx = subagent_ctx,
+        .preset_registry = &preset_registry,
+        .guardrail_state = guardrail_state,
+        .ccr_ctx = null, // patched by the mode driver after session creation
+        .memory_state = memory_state,
+    });
 
     // ── Step 14: Build review config block ───────────────────────
     const review_block = try buildReviewConfigBlock(a, &settings);
