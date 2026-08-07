@@ -969,7 +969,7 @@ pub fn buildBaseToolSet(
             i += 1;
             all_tools[i] = tools_mod.edit.toolWithWorkspace(ws);
             i += 1;
-            all_tools[i] = if (inputs.bash_ctx) |bc| tools_mod.bash.toolWithStateAndWorkspace(bc) else tools_mod.bash.toolWithState(inputs.bash_state.?);
+            all_tools[i] = if (inputs.bash_ctx) |bc| tools_mod.bash.toolWithStateAndWorkspace(bc) else if (inputs.bash_state) |bs| tools_mod.bash.toolWithState(bs) else tools_mod.bash.tool();
             i += 1;
             all_tools[i] = tools_mod.ls.toolWithWorkspace(ws);
             i += 1;
@@ -1045,10 +1045,10 @@ pub fn finalizeToolSet(
     if (ctx.ext_tools.len > 0) {
         @memcpy(slice[ctx.base_tools.len..][0..ctx.ext_tools.len], ctx.ext_tools);
     }
-    slice[base_len] = tools_mod.subagent.toolWithCtx(@constCast(ctx.subagent_ctx));
-    slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(@constCast(ctx.preset_registry));
+    slice[base_len] = tools_mod.subagent.toolWithCtx(ctx.subagent_ctx);
+    slice[base_len + 1] = tools_mod.subagent.listPresetsToolWithCtx(ctx.preset_registry);
     slice[base_len + 2] = ctx.guardrail_state.finishTaskTool();
-    slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithCtx(ctx.ccr_ctx);
+    slice[base_len + 3] = tools_mod.ccr_retrieve.toolWithCtxAndStats(ctx.ccr_ctx);
     if (ctx.memory_state) |ms| {
         slice[base_len + 4] = tools_mod.memory_search.tool(ms);
         slice[base_len + 5] = tools_mod.memory_save.tool(ms);

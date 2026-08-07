@@ -91,7 +91,7 @@ pub fn run(
 
     var cfg = cli_mod.parse(allocator, argv) catch |e| switch (e) {
         error.MissingValue => return exitWithMessage(io, "missing value for flag; see --help\n", 2),
-        error.UnknownMode => return exitWithMessage(io, "unknown --mode value; use print\n", 2),
+        error.UnknownMode => return exitWithMessage(io, "unknown --mode value; use print, rpc, or proxy\n", 2),
         error.UnknownThinkingLevel => return exitWithMessage(io, "unknown --thinking value; use off|minimal|low|medium|high|xhigh\n", 2),
         else => |err| return err,
     };
