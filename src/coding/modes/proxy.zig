@@ -123,8 +123,6 @@ pub fn run(
         .kernel_backlog = 32,
         .reuse_address = true,
     }) catch return error.BindFailed;
-    // Track whether we already closed the server for restart (to
-    // avoid the deferred deinit double-closing).
     var server_closed: bool = false;
     defer if (!server_closed) server.deinit(io);
 
@@ -592,7 +590,7 @@ const Session = struct {
     }
 };
 
-fn initSession(
+pub fn initSession(
     session: *Session,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2196,7 +2194,7 @@ fn runPrompt(
     runOneTurn(session, allocator, io, text);
 }
 
-fn runOneTurn(
+pub fn runOneTurn(
     session: *Session,
     allocator: std.mem.Allocator,
     io: std.Io,
