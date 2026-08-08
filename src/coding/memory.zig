@@ -113,15 +113,6 @@ pub const MemoryState = struct {
             try buf.appendSlice(self.allocator, "\n");
         }
 
-        // L2 scenarios
-        for (recall.scenario_files) |s| {
-            const header = try std.fmt.allocPrint(self.allocator, "## Scenario: {s}\n", .{s.path});
-            defer self.allocator.free(header);
-            try buf.appendSlice(self.allocator, header);
-            try buf.appendSlice(self.allocator, s.content);
-            try buf.appendSlice(self.allocator, "\n\n");
-        }
-
         try buf.appendSlice(self.allocator, "</memory_context>");
 
         // Enforce character budget (truncate if needed).
