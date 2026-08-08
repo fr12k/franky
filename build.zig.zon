@@ -24,8 +24,8 @@
             .hash = "agent_memory-0.2.1-yf36ft61nQCiCR8_vRuXnKvy6wmsqra6XvSbShAswgiS",
         },
         .franky_box = .{
-            // v0.2.0 — export lightweight client module (franky_box_client) without SQLite.
-            .url = "https://github.com/franky-agent/franky-box/archive/refs/tags/v0.2.0.tar.gz",
+            // v0.2.1 — export lightweight client module (franky_box_client) without SQLite.
+            .url = "https://github.com/fr12k/franky-box/archive/refs/tags/v0.2.1.tar.gz",
             .hash = "agent_memory-0.2.1-yf36fiaEnACUvsDQhh-YNjUGL2O5AhD1I0GVkS5px7BW",
         },
     },
