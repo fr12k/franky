@@ -590,6 +590,7 @@ fn maybeNudge(
     for (last.content) |cb| {
         switch (cb) {
             .text => |t| total_text_len += t.text.len,
+            .thinking => |th| total_text_len += th.thinking.len,
             .tool_call => has_tool_call = true,
             else => {},
         }
@@ -656,6 +657,7 @@ fn maybeNudgeToFinishTask(
     for (last.content) |cb| {
         switch (cb) {
             .text => |t| total_text_len += t.text.len,
+            .thinking => |th| total_text_len += th.thinking.len,
             .tool_call => has_tool_call = true,
             else => {},
         }
@@ -716,6 +718,7 @@ fn maybeNudgeAutoContinue(
     for (last.content) |cb| {
         switch (cb) {
             .text => |t| total_text_len += t.text.len,
+            .thinking => |th| total_text_len += th.thinking.len,
             .tool_call => |tc| {
                 // If the model already called finish_task, skip.
                 if (std.mem.eql(u8, tc.name, "finish_task")) has_finish_task = true;
