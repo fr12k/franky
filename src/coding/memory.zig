@@ -84,7 +84,7 @@ pub const MemoryState = struct {
     pub fn buildContextBlock(self: *MemoryState, query: []const u8) !?[]u8 {
         if (!self.enabled) return null;
 
-        var recall = try self.ctx.recall(self.allocator, query, self.config.recall_top_k);
+        var recall = try self.ctx.recallWithBudget(self.allocator, query, self.config.recall_top_k, self.config.max_context_chars);
         defer recall.deinit(self.allocator);
 
         if (recall.total_chars == 0) return null;
