@@ -123,7 +123,7 @@
         "openrouter": {
             "provider": "gateway",
             "base-url": "https://openrouter.ai/api/v1/chat/completions",
-            "models": ["openrouter/owl-alpha"],
+            "models": ["openrouter/auto"],
             "api-key-env": "OPENROUTER_KEY",
             "role": "full",
             "ask-tools": "all",
