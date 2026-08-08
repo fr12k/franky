@@ -4,16 +4,13 @@
 //! - `MemoryState` — owns the agent_memory.SqliteStore + MemoryContext
 //! - `buildMemoryContext()` — recalls L1/L2/L3 and formats as a bounded
 //!   context block for system prompt injection.
-//! - `captureTurn()` — writes franky messages to L0 (raw conversations).
 //!
 //! This module is the single integration point between franky and the
-//! agent-memory-zig package. It depends on agent_memory (the package)
-//! and franky's ai.types (for Message conversion). It does NOT depend
-//! on franky's LLM registry — the agent drives memory via tools.
+//! agent-memory-zig package. It depends on agent_memory (the package).
+//! It does NOT depend on franky's LLM registry — the agent drives memory via tools.
 
 const std = @import("std");
 const agent_memory = @import("agent_memory");
-const ai = @import("../ai/types.zig");
 
 /// Configuration for the memory integration.
 pub const MemoryConfig = struct {
@@ -143,94 +140,4 @@ pub const MemoryState = struct {
         return try buf.toOwnedSlice(self.allocator);
     }
 
-    /// Capture franky messages to L0 (raw conversations).
-    /// This is a cheap SQLite INSERT — no LLM call.
-    pub fn captureTurn(
-        self: *MemoryState,
-        messages: []const ai.Message,
-    ) !void {
-        if (!self.enabled) return;
-        if (messages.len == 0) return;
-
-        var records = try self.allocator.alloc(agent_memory.L0Record, messages.len);
-        defer self.allocator.free(records);
-
-        const now_ms = nowMillis();
-        const session_id = self.config.iso.session_id orelse "default";
-
-        for (messages, 0..) |msg, i| {
-            // Extract text content from the message.
-            const text = try extractText(self.allocator, msg);
-            records[i] = .{
-                .id = try std.fmt.allocPrint(self.allocator, "msg-{d}-{d}", .{ now_ms, i }),
-                .session_key = session_id,
-                .session_id = session_id,
-                .role = try roleString(msg.role),
-                .message_text = text,
-                .recorded_at = try std.fmt.allocPrint(self.allocator, "{d}", .{now_ms}),
-                .timestamp = now_ms + @as(i64, @intCast(i)),
-            };
-        }
-
-        // Free all allocated strings after the store copies them.
-        defer {
-            for (records) |r| {
-                self.allocator.free(r.id);
-                self.allocator.free(r.message_text);
-                self.allocator.free(r.recorded_at);
-            }
-        }
-
-        try self.store.addConversation(records, self.config.iso);
-    }
 };
-
-// ============================
-// Helpers
-// ============================
-
-/// Current time as millisecond timestamp (epoch).
-/// Matches franky's ai.stream.nowMillis signature.
-fn nowMillis() i64 {
-    const builtin = @import("builtin");
-    if (builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        var ts: linux.timespec = undefined;
-        if (linux.clock_gettime(.REALTIME, &ts) == 0) {
-            return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
-        }
-        return 0;
-    }
-    if (builtin.link_libc) {
-        var ts: std.c.timespec = undefined;
-        if (std.c.clock_gettime(.REALTIME, &ts) == 0) {
-            return @as(i64, ts.sec) * 1000 + @divFloor(@as(i64, ts.nsec), std.time.ns_per_ms);
-        }
-    }
-    return 0;
-}
-
-/// Convert a franky Message role to a string for L0 storage.
-fn roleString(role: ai.Role) ![]const u8 {
-    return switch (role) {
-        .user => "user",
-        .assistant => "assistant",
-        .tool_result => "tool",
-        .custom => "custom",
-    };
-}
-
-/// Extract text content from a franky Message (concatenates all text blocks).
-fn extractText(allocator: std.mem.Allocator, msg: ai.Message) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    for (msg.content) |cb| {
-        switch (cb) {
-            .text => |t| {
-                try buf.appendSlice(allocator, t.text);
-            },
-            else => {},
-        }
-    }
-    return try buf.toOwnedSlice(allocator);
-}
