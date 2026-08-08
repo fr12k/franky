@@ -19,9 +19,6 @@ pub const tools = struct {
     pub const memory_save = @import("tools/memory_save.zig");
 };
 
-pub const box_types = @import("box_types.zig");
-pub const box_client = @import("box_client.zig");
-
 pub const modes = struct {
     pub const print = @import("modes/print.zig");
     pub const rpc = @import("modes/rpc.zig");
