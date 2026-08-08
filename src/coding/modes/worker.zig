@@ -1,9 +1,8 @@
-//! `--mode worker` — unattended task worker for franky-box.
+//! `--mode worker` — franky-box task queue worker.
 //!
-//! Reuses proxy: initSession, runOneTurn, and the HTTP accept loop
-//! (spawned in a background thread) so the web UI + SSE are available
-//! for the entire worker session. The main thread claims tasks via
-//! BoxClient and feeds them to runOneTurn — zero code duplication.
+//! Reuses the proxy listener unchanged — tasks from the queue are
+//! just additional prompts fed into the same session that the web UI
+//! (POST /prompt) uses. Everything serializes on the session mutex.
 
 const std = @import("std");
 const franky = @import("../../root.zig");
@@ -41,8 +40,8 @@ pub fn run(
     const team_id = cfg.inbox_team_id orelse "default";
     const max_failures = cfg.max_consecutive_failures orelse 5;
 
-    if (cfg.web_port) |wp| cfg.proxy_port = wp;
     cfg.mode = .proxy;
+    if (cfg.web_port) |wp| cfg.proxy_port = wp;
 
     var client = try box_client.BoxClient.init(allocator, io, .{
         .base_url = inbox_server,
@@ -56,7 +55,7 @@ pub fn run(
     try proxy.initSession(&session, allocator, io, environ, environ_map, cfg, &.{});
     defer session.deinit();
 
-    const port = cfg.proxy_port orelse 8788;
+    const port = cfg.proxy_port orelse proxy.default_port;
     var addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
     var server = try std.Io.net.IpAddress.listen(&addr, io, .{
         .kernel_backlog = 32,
@@ -69,11 +68,11 @@ pub fn run(
         &session, &server, &server_closed, allocator, io,
     });
 
+    ai.log.log(.info, "worker", "start", "agent={s} team={s} inbox={s} web=:{d}", .{ agent_id, team_id, inbox_server, port });
+
     var failures: u32 = 0;
     var backoff_ms: u64 = 1000;
     var completed: u64 = 0;
-
-    ai.log.log(.info, "worker", "start", "agent={s} team={s} inbox={s} web=:{d}", .{ agent_id, team_id, inbox_server, port });
 
     while (failures < max_failures) {
         const result = client.claim() catch |err| {
@@ -90,7 +89,11 @@ pub fn run(
             defer claimed.deinit(allocator);
             ai.log.log(.info, "worker", "claimed", "task={s} action={s} try={d}", .{ claimed.task_id, claimed.action, claimed.try_count });
 
+            // Same mutex as POST /prompt — user prompts and task
+            // prompts serialize perfectly.
+            session.run_mutex.lockUncancelable(io);
             proxy.runOneTurn(&session, allocator, io, claimed.payload);
+            session.run_mutex.unlock(io);
 
             const output = try std.fmt.allocPrint(allocator, "{{\"status\":\"completed\",\"task_id\":\"{s}\"}}", .{claimed.task_id});
             _ = try client.complete(claimed.task_id, output);
