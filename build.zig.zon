@@ -16,9 +16,12 @@
             .hash = "zompress-0.0.1-hHj4JvKLAQD99DOqFg8rU0NfnwqGflzoPr0m_2A0ZmVG",
         },
         .agent_memory = .{
-            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.0.2).
-            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.0.2.tar.gz",
-            .hash = "agent_memory-0.0.2-yf36fpxOnQAtqcrwEgpw3b6HsgYDxq4lgx4MY8iWalTP",
+            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.3.0).
+            // v0.3.0 adds vector search, checkpoint parsing, scenario prefix filtering,
+            // recallWithBudget (incl. MemoryContext/Store exposure), and a time_start_ms
+            // binding fix.
+            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.3.0.tar.gz",
+            .hash = "agent_memory-0.2.1-yf36ft61nQCiCR8_vRuXnKvy6wmsqra6XvSbShAswgiS",
         },
     },
 }
