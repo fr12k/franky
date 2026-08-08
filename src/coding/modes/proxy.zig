@@ -123,6 +123,8 @@ pub fn run(
         .kernel_backlog = 32,
         .reuse_address = true,
     }) catch return error.BindFailed;
+    // Track whether we already closed the server for restart (to
+    // avoid the deferred deinit double-closing).
     var server_closed: bool = false;
     defer if (!server_closed) server.deinit(io);
 
@@ -234,6 +236,46 @@ pub fn run(
         };
     }
 }
+
+
+/// Accept loop — blocks accepting HTTP connections and dispatching
+/// them to handleConnection. Made public so --mode worker can spawn
+/// it in a background thread with zero code duplication.
+pub fn runAcceptLoop(
+    session: *Session,
+    server: *std.Io.net.Server,
+    server_closed: *bool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) void {
+    while (true) {
+        if (session.restart_requested.load(.acquire)) break;
+
+        var stream = server.accept(io) catch |err| switch (err) {
+            error.Canceled => continue,
+            else => continue,
+        };
+
+        const ctx_arg = ConnArg{
+            .session = session,
+            .stream = stream,
+            .io = io,
+            .allocator = allocator,
+        };
+        const t = std.Thread.spawn(.{}, handleConnection, .{ctx_arg}) catch {
+            stream.close(io);
+            continue;
+        };
+        t.detach();
+    }
+
+    if (session.restart_requested.load(.acquire)) {
+        server.deinit(io);
+        server_closed.* = true;
+        session.broadcastEvent(allocator, "event: close\ndata: {}\n\n");
+    }
+}
+
 
 // ─── session ─────────────────────────────────────────────────────
 
