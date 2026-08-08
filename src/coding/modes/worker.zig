@@ -1,8 +1,9 @@
 //! `--mode worker` — franky-box task queue worker.
 //!
-//! Reuses the proxy listener unchanged — tasks from the queue are
+//! Reuses the proxy listener and session — tasks from the queue are
 //! just additional prompts fed into the same session that the web UI
-//! (POST /prompt) uses. Everything serializes on the session mutex.
+//! uses. After each turn, inspects stop_reason and cancel state to
+//! determine success/failure and posts the result to the outbox.
 
 const std = @import("std");
 const franky = @import("../../root.zig");
@@ -10,6 +11,7 @@ const ai = franky.ai;
 const box_client = franky.franky_box.box_client;
 const cli_mod = franky.coding.cli;
 const proxy = @import("proxy.zig");
+const at = franky.agent.types;
 
 pub const RunError = error{
     MissingInboxServer,
@@ -89,16 +91,34 @@ pub fn run(
             defer claimed.deinit(allocator);
             ai.log.log(.info, "worker", "claimed", "task={s} action={s} try={d}", .{ claimed.task_id, claimed.action, claimed.try_count });
 
-            // Same mutex as POST /prompt — user prompts and task
-            // prompts serialize perfectly.
+            // Run the agent — same mutex as POST /prompt
             session.run_mutex.lockUncancelable(io);
             proxy.runOneTurn(&session, allocator, io, claimed.payload);
             session.run_mutex.unlock(io);
 
-            const output = try std.fmt.allocPrint(allocator, "{{\"status\":\"completed\",\"task_id\":\"{s}\"}}", .{claimed.task_id});
-            _ = try client.complete(claimed.task_id, output);
+            // Detect outcome
+            const outcome = detectOutcome(&session);
+
+            switch (outcome) {
+                .success => {
+                    const output = try std.fmt.allocPrint(allocator,
+                        "{{\"status\":\"completed\",\"task_id\":\"{s}\"}}", .{claimed.task_id});
+                    _ = try client.complete(claimed.task_id, output);
+                    ai.log.log(.info, "worker", "completed", "task={s}", .{claimed.task_id});
+                },
+                .failed => |reason| {
+                    const error_body = try std.fmt.allocPrint(allocator,
+                        "{{\"error\":\"{s}\",\"task_id\":\"{s}\"}}", .{ reason, claimed.task_id });
+                    defer allocator.free(error_body);
+                    _ = try client.fail(claimed.task_id, error_body);
+                    ai.log.log(.info, "worker", "failed", "task={s} reason={s}", .{ claimed.task_id, reason });
+                },
+            }
+
+            // Reset cancel flag for next task
+            session.cancel = .{};
+
             completed += 1;
-            ai.log.log(.info, "worker", "done", "task={s} total={d}", .{ claimed.task_id, completed });
         } else {
             std.time.sleep(backoff_ms * std.time.ns_per_ms);
             backoff_ms = @min(backoff_ms * 2, 30_000);
@@ -106,4 +126,35 @@ pub fn run(
     }
 
     ai.log.log(.err, "worker", "exit", "{d} consecutive failures exceeded", .{max_failures});
+}
+
+const Outcome = union(enum) {
+    success: void,
+    failed: []const u8,
+};
+
+fn detectOutcome(session: *proxy.Session) Outcome {
+    // Check if agent was aborted (cancel fired, max_turns exceeded)
+    if (session.cancel.isFired()) {
+        return .{ .failed = "aborted" };
+    }
+
+    // Check the last message's stop_reason
+    const msgs = session.transcript.messages.items;
+    if (msgs.len > 0) {
+        const last = &msgs[msgs.len - 1];
+        const reason = last.stop_reason orelse return .{ .failed = "no stop reason" };
+        switch (reason) {
+            .err => {
+                const err_msg = last.error_message orelse "agent error";
+                return .{ .failed = err_msg };
+            },
+            .aborted => return .{ .failed = "aborted" },
+            .refusal => return .{ .failed = "refused" },
+            .stop, .tool_use, .length => return .{ .success = {} },
+        }
+    }
+
+    // No messages means something went wrong before we got a response
+    return .{ .failed = "empty response" };
 }
