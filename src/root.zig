@@ -25,6 +25,7 @@ pub const test_helpers = @import("test_helpers.zig");
 /// that doesn't thread an allocator explicitly gets it from here.
 /// Change `src/global_allocator.zig` to swap the allocator project-wide.
 pub const global_allocator = @import("global_allocator.zig");
+pub const franky_box = @import("franky_box");
 
 /// Version info injected by goreleaser via -Dversion / -Dcommit / -Ddate.
 /// Falls back to "dev"/"unknown" when building with plain `zig build`.

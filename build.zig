@@ -72,6 +72,13 @@ pub fn build(b: *std.Build) void {
     // lib artifact. Link it so sqlite3 symbols resolve at link time.
     const sqlite3_art = am_dep.artifact("sqlite3");
 
+    // ── franky_box client dependency (lightweight, no SQLite) ────
+    const fb_dep = b.dependency("franky_box", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const fb_module = fb_dep.module("franky_box_client");
+
     // Public module — exposed to dependents via `b.dependency("franky").module("franky")`.
     // The internal binary still imports through the same `franky_module`
     // so there's only one definition. This is what makes franky-do (and
@@ -85,6 +92,7 @@ pub fn build(b: *std.Build) void {
     franky_module.addOptions("build_options", franky_options);
     franky_module.addImport("zompress", zompress_module);
     franky_module.addImport("agent_memory", am_module);
+    franky_module.addImport("franky_box", fb_module);
     // v0.2.0 — link the vendored sqlite3 static lib from agent_memory.
     franky_module.linkLibrary(sqlite3_art);
     // v0.2.0 — agent_memory now vendors the SQLite amalgamation
@@ -172,6 +180,7 @@ pub fn build(b: *std.Build) void {
     test_module.addOptions("build_options", test_options);
     test_module.addImport("zompress", zompress_module);
     test_module.addImport("agent_memory", am_module);
+    test_module.addImport("franky_box", fb_module);
     // v0.2.0 — link vendored sqlite3 from agent_memory.
     test_module.linkLibrary(sqlite3_art);
     // v0.2.0 — agent_memory vendors SQLite; no system lib needed.
