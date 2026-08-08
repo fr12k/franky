@@ -335,7 +335,7 @@ const SseSubscriber = struct {
     }
 };
 
-const Session = struct {
+pub const Session = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     registry: ai.registry.Registry,
