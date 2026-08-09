@@ -885,7 +885,7 @@ pub fn assertRefsInKeep(
     transcript: *const agent_mod.loop.Transcript,
     keep: []const []const u8,
 ) void {
-    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) return;
+    if (builtin.mode == .fast or builtin.mode == .small) return;
 
     var tmp: std.ArrayList(u8) = .empty;
     defer tmp.deinit(allocator);

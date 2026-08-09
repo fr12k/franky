@@ -151,14 +151,6 @@ pub const BetweenTurnsFn = *const fn (
 /// hook — capture must never block the agent loop.
 ///
 /// `new_messages` is a borrow into `transcript.messages.items` — it is
-/// only valid for the duration of the call. Capture must copy any data
-/// it wants to keep.
-pub const CaptureTurnFn = *const fn (
-    userdata: ?*anyopaque,
-    transcript: *Transcript,
-    new_messages: []const at.AgentMessage,
-) void;
-
 /// Decision returned by `OnMaxTurnsFn` when the loop has reached
 /// its `max_turns` cap. `extend(N)` adds N more turns to the cap
 /// (additive — each call accumulates). `stop` declines to extend;
@@ -228,14 +220,6 @@ pub const Config = struct {
     /// stop early. When `null`, the loop uses its default
     /// "no tool calls → stop" rule.
     between_turns: ?BetweenTurnsFn = null,
-    /// v3.2 — L0 capture hook. Called after each turn with the messages
-    /// appended during that turn. Best-effort (errors are logged and
-    /// swallowed so capture never blocks the loop). `null` disables L0
-    /// capture.
-    capture_turn: ?CaptureTurnFn = null,
-    /// Optional per-hook userdata. Falls back to `hook_userdata` when
-    /// null — same pattern as `before_tool_call_userdata` etc.
-    capture_turn_userdata: ?*anyopaque = null,
     /// vN — optional check function. Called between turns just after
     /// the `between_turns` hook. Return true to exit the loop gracefully
     /// (the current turn's output is preserved in the transcript).
@@ -382,26 +366,10 @@ pub fn agentLoop(
                     return;
                 }
             }
-            const turn_start_msg_count = transcript.messages.items.len;
             const keep_going = runTurn(allocator, io, transcript, config, out, @ptrCast(&loop_client)) catch |err| {
-                // Best-effort L0 capture even on turn failure — the
-                // messages produced before the error are still part of
-                // the raw conversation and worth persisting.
-                if (config.capture_turn) |hook| {
-                    const ud = config.capture_turn_userdata orelse config.hook_userdata;
-                    const delta = transcript.messages.items[turn_start_msg_count..];
-                    if (delta.len > 0) hook(ud, transcript, delta);
-                }
                 pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
                 return;
             };
-            // v3.2 — L0 capture: persist the messages appended during
-            // this turn to the raw conversation store. Best-effort.
-            if (config.capture_turn) |hook| {
-                const ud = config.capture_turn_userdata orelse config.hook_userdata;
-                const delta = transcript.messages.items[turn_start_msg_count..];
-                if (delta.len > 0) hook(ud, transcript, delta);
-            }
             if (config.guardrails) |gr| {
                 const gr_wants_turn = gr.betweenTurns(allocator, io, transcript, out) catch |err| blk: {
                     ai.log.log(.warn, "guardrails", "between_turns_error", "err={s}", .{@errorName(err)});
@@ -590,6 +558,7 @@ fn maybeNudge(
     for (last.content) |cb| {
         switch (cb) {
             .text => |t| total_text_len += t.text.len,
+            .thinking => |th| total_text_len += th.thinking.len,
             .tool_call => has_tool_call = true,
             else => {},
         }
@@ -656,6 +625,7 @@ fn maybeNudgeToFinishTask(
     for (last.content) |cb| {
         switch (cb) {
             .text => |t| total_text_len += t.text.len,
+            .thinking => |th| total_text_len += th.thinking.len,
             .tool_call => has_tool_call = true,
             else => {},
         }
@@ -716,6 +686,7 @@ fn maybeNudgeAutoContinue(
     for (last.content) |cb| {
         switch (cb) {
             .text => |t| total_text_len += t.text.len,
+            .thinking => |th| total_text_len += th.thinking.len,
             .tool_call => |tc| {
                 // If the model already called finish_task, skip.
                 if (std.mem.eql(u8, tc.name, "finish_task")) has_finish_task = true;

@@ -189,6 +189,10 @@ pub fn run(
         const proxy_mode = @import("proxy.zig");
         return proxy_mode.run(allocator, io, environ, environ_map, &cfg, argv);
     }
+    if (cfg.mode == .worker) {
+        const worker_mode = @import("worker.zig");
+        return worker_mode.run(allocator, io, environ, environ_map, &cfg, argv);
+    }
     if (cfg.prompt.len == 0 and cfg.resume_id == null) {
         return exitWithMessage(io, "no prompt given; try: franky \"hello\"\n", 2);
     }
@@ -398,10 +402,6 @@ fn runPrint(
         .reducer_dump_dir = events_dir_path,
         .compress_fn = if (resolved.compression.enabled) compression_mod.compressToolResultInjected else null,
         .compress_ctx = if (resolved.compression.enabled) @ptrCast(&session_state.compression_ctx) else null,
-        // v3.2 — L0 capture: persist each turn's messages to the raw
-        // conversation store. Best-effort; disabled when memory is off.
-        .capture_turn = if (resolved.memory_state != null) captureTurnHook else null,
-        .capture_turn_userdata = @ptrCast(resolved.memory_state),
         .stream_options = .{
             .api_key = resolved.api_key,
             .auth_token = resolved.auth_token,
@@ -664,20 +664,6 @@ fn handleSseConn(args: HandleConnArgs) void {
 
 fn workerMain(args: WorkerArgs) void {
     agent.loop.agentLoop(args.allocator, args.io, args.transcript, args.config, args.ch);
-}
-
-/// v3.2 — L0 capture hook: persist the messages appended during a turn
-/// to the raw conversation store. Best-effort — errors are logged and
-/// swallowed so capture never blocks the agent loop.
-fn captureTurnHook(
-    userdata: ?*anyopaque,
-    _: *agent.loop.Transcript,
-    new_messages: []const at.AgentMessage,
-) void {
-    const ms: *franky.coding.memory.MemoryState = @ptrCast(@alignCast(userdata.?));
-    ms.captureTurn(new_messages) catch |err| {
-        ai.log.log(.warn, "memory", "capture_turn_failed", "err={s}", .{@errorName(err)});
-    };
 }
 
 // ─── model alias resolution ──────────────────────────────────────
