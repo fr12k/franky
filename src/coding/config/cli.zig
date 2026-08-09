@@ -24,7 +24,7 @@
 const std = @import("std");
 const types = @import("../../ai/types.zig");
 
-pub const Mode = enum { print, rpc, proxy };
+pub const Mode = enum { print, rpc, proxy, worker };
 
 pub const Config = struct {
     provider: ?[]const u8 = null,
@@ -166,6 +166,19 @@ pub const Config = struct {
     /// POST /register after binding its listen socket and
     /// POST /unregister on shutdown. Env: FRANKY_ORCHESTRATOR_URL.
     register_url: ?[]const u8 = null,
+    // ── franky-box worker mode flags ─────────────────────────
+    /// `--inbox-server URL` — franky-box base URL (e.g. https://franky-box.example.com).
+    inbox_server_url: ?[]const u8 = null,
+    /// `--agent-id ID` — agent identity for franky-box authentication.
+    inbox_agent_id: ?[]const u8 = null,
+    /// `--agent-secret SECRET` — agent secret. Env: FRANKY_AGENT_SECRET.
+    inbox_agent_secret: ?[]const u8 = null,
+    /// `--team-id ID` — multi-tenant team scope. Default "default".
+    inbox_team_id: ?[]const u8 = null,
+    /// `--web-port N` — local web UI port. Default 8788.
+    web_port: ?u16 = null,
+    /// `--max-consecutive-failures N` — max claim failures before exit. Default 5.
+    max_consecutive_failures: ?u32 = null,
 
     // ── §G.4 phase-timeout overrides ──────────────────────────────
     /// `--connect-timeout-ms N` — TCP/TLS connect deadline. 0 disables.
@@ -592,6 +605,18 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
     } else if (std.mem.eql(u8, name, "--proxy-port")) {
         const v = try takeValue(argv, i, inline_value);
         cfg.proxy_port = std.fmt.parseInt(u16, v, 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--inbox-server")) {
+        cfg.inbox_server_url = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--agent-id")) {
+        cfg.inbox_agent_id = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--agent-secret")) {
+        cfg.inbox_agent_secret = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--team-id")) {
+        cfg.inbox_team_id = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--web-port")) {
+        cfg.web_port = std.fmt.parseInt(u16, try takeValue(argv, i, inline_value), 10) catch return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--max-consecutive-failures")) {
+        cfg.max_consecutive_failures = std.fmt.parseInt(u32, try takeValue(argv, i, inline_value), 10) catch return error.UnknownMode;
     } else if (std.mem.eql(u8, name, "--register")) {
         cfg.register_url = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--connect-timeout-ms")) {
@@ -629,6 +654,8 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         if (std.mem.eql(u8, v, "print")) cfg.mode = .print
         else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
         else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
+        else if (std.mem.eql(u8, v, "worker")) cfg.mode = .worker
+        else if (std.mem.eql(u8, v, "worker")) cfg.mode = .worker
         else return error.UnknownMode;
     } else {
         return false;

@@ -189,6 +189,10 @@ pub fn run(
         const proxy_mode = @import("proxy.zig");
         return proxy_mode.run(allocator, io, environ, environ_map, &cfg, argv);
     }
+    if (cfg.mode == .worker) {
+        const worker_mode = @import("worker.zig");
+        return worker_mode.run(allocator, io, environ, environ_map, &cfg, argv);
+    }
     if (cfg.prompt.len == 0 and cfg.resume_id == null) {
         return exitWithMessage(io, "no prompt given; try: franky \"hello\"\n", 2);
     }

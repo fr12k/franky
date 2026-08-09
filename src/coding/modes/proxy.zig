@@ -237,6 +237,46 @@ pub fn run(
     }
 }
 
+
+/// Accept loop — blocks accepting HTTP connections and dispatching
+/// them to handleConnection. Made public so --mode worker can spawn
+/// it in a background thread with zero code duplication.
+pub fn runAcceptLoop(
+    session: *Session,
+    server: *std.Io.net.Server,
+    server_closed: *bool,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) void {
+    while (true) {
+        if (session.restart_requested.load(.acquire)) break;
+
+        var stream = server.accept(io) catch |err| switch (err) {
+            error.Canceled => continue,
+            else => continue,
+        };
+
+        const ctx_arg = ConnArg{
+            .session = session,
+            .stream = stream,
+            .io = io,
+            .allocator = allocator,
+        };
+        const t = std.Thread.spawn(.{}, handleConnection, .{ctx_arg}) catch {
+            stream.close(io);
+            continue;
+        };
+        t.detach();
+    }
+
+    if (session.restart_requested.load(.acquire)) {
+        server.deinit(io);
+        server_closed.* = true;
+        session.broadcastEvent(allocator, "event: close\ndata: {}\n\n");
+    }
+}
+
+
 // ─── session ─────────────────────────────────────────────────────
 
 /// v1.28.1 — bumped from 16 to 32. The 16 cap was tripping casual
@@ -295,7 +335,7 @@ const SseSubscriber = struct {
     }
 };
 
-const Session = struct {
+pub const Session = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     registry: ai.registry.Registry,
@@ -428,7 +468,7 @@ const Session = struct {
 
     events_mutex: std.Io.Mutex = .init,
 
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         // Join any in-flight /retry worker before freeing the
         // session: the worker holds `*Session` and dereferences it
         // (run_mutex, allocator, io) right up until its function
@@ -592,7 +632,7 @@ const Session = struct {
     }
 };
 
-fn initSession(
+pub fn initSession(
     session: *Session,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2196,7 +2236,7 @@ fn runPrompt(
     runOneTurn(session, allocator, io, text);
 }
 
-fn runOneTurn(
+pub fn runOneTurn(
     session: *Session,
     allocator: std.mem.Allocator,
     io: std.Io,
