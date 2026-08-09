@@ -25,7 +25,7 @@
         },
         .franky_box = .{
             // v0.2.2 — export lightweight client module (franky_box_client) without SQLite.
-            .url = "https://github.com/franky-agent/franky-box/archive/refs/tags/v0.2.2.tar.gz",
+            .url = "https://github.com/fr12k/franky-box/archive/refs/tags/v0.2.2.tar.gz",
             .hash = "agent_memory-0.2.1-yf36fiSEnADaULBYnOrkepgk8wc5EwPVNAF-6F_JbETz",
         },
     },
