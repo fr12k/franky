@@ -468,7 +468,7 @@ pub const Session = struct {
 
     events_mutex: std.Io.Mutex = .init,
 
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         // Join any in-flight /retry worker before freeing the
         // session: the worker holds `*Session` and dereferences it
         // (run_mutex, allocator, io) right up until its function

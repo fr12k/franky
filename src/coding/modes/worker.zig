@@ -80,7 +80,7 @@ pub fn run(
         const result = client.claim() catch |err| {
             ai.log.log(.warn, "worker", "claim", "failed: {}", .{err});
             failures += 1;
-            std.time.sleep(backoff_ms * std.time.ns_per_ms);
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(backoff_ms)), .real) catch {};
             backoff_ms = @min(backoff_ms * 2, 30_000);
             continue;
         };
@@ -120,7 +120,7 @@ pub fn run(
 
             completed += 1;
         } else {
-            std.time.sleep(backoff_ms * std.time.ns_per_ms);
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(backoff_ms)), .real) catch {};
             backoff_ms = @min(backoff_ms * 2, 30_000);
         }
     }
