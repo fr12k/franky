@@ -72,24 +72,38 @@ pub fn run(
 
     ai.log.log(.info, "worker", "start", "agent={s} team={s} inbox={s} web=:{d}", .{ agent_id, team_id, inbox_server, port });
 
+    // Two independent backoffs: one for claim *errors* (network/server
+    // failures — counts toward max_consecutive_failures and exits the
+    // loop), one for *idle* polls (empty inbox — normal, must not kill the
+    // worker but should still ease off the server). The previous code
+    // reset the idle backoff on every successful (non-erroring) claim,
+    // so an empty inbox was polled at 1 Hz forever — the escalation was
+    // dead code.
     var failures: u32 = 0;
-    var backoff_ms: u64 = 1000;
+    var fail_backoff_ms: u64 = 1000;
+    var idle_backoff_ms: u64 = 1000;
     var completed: u64 = 0;
 
     while (failures < max_failures) {
         const result = client.claim() catch |err| {
             ai.log.log(.warn, "worker", "claim", "failed: {}", .{err});
             failures += 1;
-            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(backoff_ms)), .real) catch {};
-            backoff_ms = @min(backoff_ms * 2, 30_000);
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(fail_backoff_ms)), .real) catch {};
+            fail_backoff_ms = @min(fail_backoff_ms * 2, 30_000);
             continue;
         };
+        // A successful claim call (even returning null) clears the
+        // *failure* counters — only claim errors are fatal.
         failures = 0;
-        backoff_ms = 1000;
+        fail_backoff_ms = 1000;
 
         if (result) |claimed| {
             defer claimed.deinit(allocator);
             ai.log.log(.info, "worker", "claimed", "task={s} action={s} try={d}", .{ claimed.task_id, claimed.action, claimed.try_count });
+
+            // Claimed work resets the idle backoff so the next empty
+            // poll starts from the base interval again.
+            idle_backoff_ms = 1000;
 
             // Run the agent — same mutex as POST /prompt
             session.run_mutex.lockUncancelable(io);
@@ -120,12 +134,14 @@ pub fn run(
 
             completed += 1;
         } else {
-            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(backoff_ms)), .real) catch {};
-            backoff_ms = @min(backoff_ms * 2, 30_000);
+            // Empty inbox — normal idle. Back off up to 30 s so an idle
+            // worker doesn't hammer the server at 1 Hz.
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(idle_backoff_ms)), .real) catch {};
+            idle_backoff_ms = @min(idle_backoff_ms * 2, 30_000);
         }
     }
 
-    ai.log.log(.err, "worker", "exit", "{d} consecutive failures exceeded", .{max_failures});
+    ai.log.log(.err, "worker", "exit", "{d} consecutive claim failures exceeded; {d} tasks completed", .{ max_failures, completed });
 }
 
 const Outcome = union(enum) {
