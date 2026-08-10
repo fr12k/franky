@@ -24,9 +24,14 @@
             .hash = "agent_memory-0.2.1-yf36ft61nQCiCR8_vRuXnKvy6wmsqra6XvSbShAswgiS",
         },
         .franky_box = .{
-            // v0.2.2 — export lightweight client module (franky_box_client) without SQLite.
-            .url = "https://github.com/fr12k/franky-box/archive/refs/tags/v0.2.2.tar.gz",
-            .hash = "agent_memory-0.2.1-yf36fiSEnADaULBYnOrkepgk8wc5EwPVNAF-6F_JbETz",
+            // v0.4.0 — fixes box_client.claim() to use `send_body = false`
+            // (the v0.2.2 version crashes on Zig 0.17-dev because
+            // `std.http.Client.fetch` with POST + no payload calls
+            // `sendBodilessUnflushed` which asserts `!requestHasBody`
+            // for POST). Also adds `handleWithPath` for head-string
+            // invalidation safety.
+            .url = "https://github.com/fr12k/franky-box/archive/refs/tags/v0.4.0.tar.gz",
+            .hash = "agent_memory-0.2.1-yf36fob4nACO4mZwwobQa9yMrpLGxoXzW8exPaLAaWD7",
         },
     },
 }

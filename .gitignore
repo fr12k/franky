@@ -7,3 +7,6 @@ jobs/
 memory.db
 memory.db-shm
 memory.db-wal
+franky-box.db
+franky-box.db-shm
+franky-box.db-wal
