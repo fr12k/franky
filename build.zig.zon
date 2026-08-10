@@ -24,14 +24,12 @@
             .hash = "agent_memory-0.2.1-yf36ft61nQCiCR8_vRuXnKvy6wmsqra6XvSbShAswgiS",
         },
         .franky_box = .{
-            // v0.4.0 — fixes box_client.claim() to use `send_body = false`
-            // (the v0.2.2 version crashes on Zig 0.17-dev because
-            // `std.http.Client.fetch` with POST + no payload calls
-            // `sendBodilessUnflushed` which asserts `!requestHasBody`
-            // for POST). Also adds `handleWithPath` for head-string
-            // invalidation safety.
-            .url = "https://github.com/fr12k/franky-box/archive/refs/tags/v0.4.0.tar.gz",
-            .hash = "agent_memory-0.2.1-yf36fob4nACO4mZwwobQa9yMrpLGxoXzW8exPaLAaWD7",
+            // v0.5.0 (from franky-agent/franky-box fork) — fixes:
+            //   - ambiguous artifact name (lib renamed to frankybox-lib)
+            //   - wrong package name in build.zig.zon (was .agent_memory)
+            //   - Zig 0.17-dev compat (send_body -> payload="", try handleWithPath)
+            .url = "https://github.com/franky-agent/franky-box/archive/refs/tags/v0.5.0.tar.gz",
+            .hash = "franky_box-0.5.0-ubJnQ9opnQAQBnQJ4xyvT9OtNKQtJYJICJ9FItdvd6tl",
         },
     },
 }

@@ -117,28 +117,12 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // v0.29.1 — build + install the franky-box server binary from the
-    // franky_box dependency's full module (Server + SqliteStore). Used by
-    // the worker-mode integration test (test/worker_test.zig) which spawns
-    // it as a subprocess. We build our own exe here (instead of using
-    // fb_dep.artifact) because the dependency has both a lib and an exe
-    // named "franky-box", making the artifact name ambiguous.
-    const fb_full_module = fb_dep.module("franky_box");
-    const box_exe_module = b.createModule(.{
-        .root_source_file = b.path("src/bin/franky_box_main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    box_exe_module.addImport("franky_box", fb_full_module);
-    box_exe_module.linkLibrary(sqlite3_art);
-    const box_exe = b.addExecutable(.{
-        .name = "franky-box",
-        .root_module = box_exe_module,
-        .use_llvm = use_llvm,
-        .use_lld = use_lld,
-    });
-    b.installArtifact(box_exe);
+    // v0.29.1 — install the franky-box server binary from the dependency.
+    // Used by the worker-mode integration test (test/worker_test.zig) which
+    // spawns it as a subprocess. The franky-box v0.5.0+ fixes the ambiguous
+    // artifact name (lib renamed to "frankybox-lib"), so we can use the exe
+    // artifact directly.
+    b.installArtifact(fb_dep.artifact("franky-box"));
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
