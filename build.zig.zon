@@ -29,7 +29,7 @@
             //   - wrong package name in build.zig.zon (was .agent_memory)
             //   - Zig 0.17-dev compat (send_body -> payload="", try handleWithPath)
             .url = "https://github.com/franky-agent/franky-box/archive/refs/tags/v0.5.0.tar.gz",
-            .hash = "franky_box-0.5.0-ubJnQ9opnQAQBnQJ4xyvT9OtNKQtJYJICJ9FItdvd6tl",
+            .hash = "franky_box-0.5.0-ubJnQ64onQA9RmNW8VW0FvgvOSWtfGkRZBtY-6DwkFQ8",
         },
     },
 }
