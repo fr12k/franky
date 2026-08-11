@@ -561,17 +561,30 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
         null;
     defer if (auth_header) |h| ctx.allocator.free(h);
 
-    var http_headers_buf: [4]std.http.Header = undefined;
-    var http_headers_len: usize = 0;
+    // Build the outgoing header slice. The fixed three (authorization,
+    // content-type, accept) are always present; `ctx.options.headers` is
+    // merged in afterwards so callers (notably the OpenRouter app-
+    // attribution path — see `ai/openrouter_attribution.zig`) can stamp
+    // HTTP-Referer / X-OpenRouter-Title / X-OpenRouter-Categories onto
+    // every gateway request. Heap-allocated because the count is caller-
+    // driven; the slice is tiny and freed before the fn returns.
+    const extra = ctx.options.headers orelse &.{ };
+    const base_count: usize = (if (auth_header != null) @as(usize, 1) else 0) + 2;
+    const http_headers = try ctx.allocator.alloc(std.http.Header, base_count + extra.len);
+    defer ctx.allocator.free(http_headers);
+    var hi: usize = 0;
     if (auth_header) |h| {
-        http_headers_buf[http_headers_len] = .{ .name = "authorization", .value = h };
-        http_headers_len += 1;
+        http_headers[hi] = .{ .name = "authorization", .value = h };
+        hi += 1;
     }
-    http_headers_buf[http_headers_len] = .{ .name = "content-type", .value = "application/json" };
-    http_headers_len += 1;
-    http_headers_buf[http_headers_len] = .{ .name = "accept", .value = "text/event-stream" };
-    http_headers_len += 1;
-    const http_headers = http_headers_buf[0..http_headers_len];
+    http_headers[hi] = .{ .name = "content-type", .value = "application/json" };
+    hi += 1;
+    http_headers[hi] = .{ .name = "accept", .value = "text/event-stream" };
+    hi += 1;
+    for (extra) |h| {
+        http_headers[hi] = .{ .name = h.name, .value = h.value };
+        hi += 1;
+    }
 
     const cancel = ctx.options.cancel orelse unreachable;
 

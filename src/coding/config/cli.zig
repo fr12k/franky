@@ -71,6 +71,17 @@ pub const Config = struct {
     /// no rotation or size cap so don't leave on for long runs.
     /// Env fallback: `FRANKY_HTTP_TRACE_DIR`.
     http_trace_dir: ?[]const u8 = null,
+    /// OpenRouter app-attribution overrides. When the resolved `base_url`
+    /// is an OpenRouter endpoint, these stamp `HTTP-Referer` /
+    /// `X-OpenRouter-Title` / `X-OpenRouter-Categories` onto every
+    /// request (see `ai/openrouter_attribution.zig`). Any left null falls
+    /// back to the built-in franky identity. Env fallbacks:
+    /// `FRANKY_HTTP_REFERER`, `FRANKY_OPENROUTER_TITLE`,
+    /// `FRANKY_OPENROUTER_CATEGORIES`. Profile fields of the same names
+    /// take precedence over env.
+    http_referer: ?[]const u8 = null,
+    openrouter_title: ?[]const u8 = null,
+    openrouter_categories: ?[]const u8 = null,
     /// `--text-tool-call-fallback` (v1.16.3). When the assistant
     /// ends a turn with text content that parses as a recognized
     /// tool-call shape (e.g. `{"name": "X", "parameters": {...}}`)

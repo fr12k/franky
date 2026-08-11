@@ -122,6 +122,15 @@ pub const ResolvedConfig = struct {
     http_trace_dir: ?[]const u8,
     log_per_session: bool,
 
+    // ── OpenRouter app-attribution ──────────────────────────────
+    /// Resolved `StreamOptions.Header` slice for OpenRouter attribution
+    /// (`HTTP-Referer` / `X-OpenRouter-Title` / optional
+    /// `X-OpenRouter-Categories`). Null when the resolved `base_url` is
+    /// not an OpenRouter endpoint — so non-OpenRouter providers get no
+    /// attribution metadata on the wire. Arena-allocated; lifetime tied
+    /// to the config arena. Wired into every mode's `stream_options`.
+    attribution_headers: ?[]const ai.registry.StreamOptions.Header,
+
     // ── Startup warnings ─────────────────────────────────────────
     /// Messages printed to stderr once at startup (tool install hints, etc).
     startup_warnings: []const []const u8 = &.{},
@@ -283,6 +292,21 @@ fn applyEnvOverrides(cfg: *cli_mod.Config, map: *const std.process.Environ.Map) 
     {
         if (map.get("FRANKY_HTTP_TRACE_DIR")) |val| {
             if (cfg.http_trace_dir == null) cfg.http_trace_dir = cfg.arena.allocator().dupe(u8, val) catch null;
+        }
+    }
+    {
+        if (map.get("FRANKY_HTTP_REFERER")) |val| {
+            if (cfg.http_referer == null) cfg.http_referer = cfg.arena.allocator().dupe(u8, val) catch null;
+        }
+    }
+    {
+        if (map.get("FRANKY_OPENROUTER_TITLE")) |val| {
+            if (cfg.openrouter_title == null) cfg.openrouter_title = cfg.arena.allocator().dupe(u8, val) catch null;
+        }
+    }
+    {
+        if (map.get("FRANKY_OPENROUTER_CATEGORIES")) |val| {
+            if (cfg.openrouter_categories == null) cfg.openrouter_categories = cfg.arena.allocator().dupe(u8, val) catch null;
         }
     }
     {
@@ -1432,6 +1456,21 @@ pub fn resolve(
         .active = .empty,
     };
 
+    // ── OpenRouter app-attribution headers ──────────────────────
+    // Computed once on the config arena; null when the resolved
+    // `base_url` is not an OpenRouter endpoint. Overrides come from
+    // profile/env-resolved `cfg` fields; anything left null falls back
+    // to the built-in franky identity. See `ai/openrouter_attribution.zig`.
+    const attribution_headers = ai.openrouter_attribution.attributionHeaders(
+        a,
+        provider.base_url,
+        .{
+            .referer = cfg.http_referer,
+            .title = cfg.openrouter_title,
+            .categories = cfg.openrouter_categories,
+        },
+    ) catch null;
+
     return ResolvedConfig{
         .provider_name = provider.provider_name,
         .model_id = provider.model_id,
@@ -1471,6 +1510,7 @@ pub fn resolve(
         .log_file = log_file,
         .http_trace_dir = http_trace_dir,
         .log_per_session = log_per_session,
+        .attribution_headers = attribution_headers,
         .startup_warnings = try startup_warnings.toOwnedSlice(a),
         .role_gate = role_gate,
         .active_role = active_role,

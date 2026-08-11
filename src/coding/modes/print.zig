@@ -411,6 +411,7 @@ fn runPrint(
             .timeouts = config_mod.resolveTimeouts(cfg, environ_map),
             .retry_policy = resolved.retry_policy,
             .http_trace_dir = config_mod.resolveHttpTraceDir(cfg, environ_map),
+            .headers = resolved.attribution_headers,
         },
     };
     if (config_mod.resolveMaxTurns(cfg, environ_map)) |v| loop_cfg.max_turns = v;

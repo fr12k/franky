@@ -380,6 +380,13 @@ pub const Session = struct {
     /// init; 0 disables offloading.
     max_full_tool_results: u32 = 0,
 
+    /// OpenRouter app-attribution headers (`HTTP-Referer` /
+    /// `X-OpenRouter-Title` / optional `X-OpenRouter-Categories`).
+    /// Null when the resolved `base_url` is not an OpenRouter endpoint.
+    /// Computed once at session init from `cfg` + `provider.base_url`;
+    /// arena-allocated on `role_arena` so it outlives the session.
+    attribution_headers: ?[]const ai.registry.StreamOptions.Header = null,
+
     /// Token display mode for the web UI status line.
 
     // ── v1.7.0 — session persistence on disk ──────────────────
@@ -841,6 +848,19 @@ pub fn initSession(
     errdefer session.faux.deinit();
 
     session.provider = try print_mode.resolveProviderIo(allocator, io, environ, cfg);
+
+    // OpenRouter app-attribution — computed once on the session's
+    // role arena so the header slice + strings outlive every request.
+    // Null when `provider.base_url` is not an OpenRouter endpoint.
+    session.attribution_headers = ai.openrouter_attribution.attributionHeaders(
+        session.role_arena.allocator(),
+        session.provider.base_url,
+        .{
+            .referer = cfg.http_referer,
+            .title = cfg.openrouter_title,
+            .categories = cfg.openrouter_categories,
+        },
+    ) catch null;
 
     // v0.30.0 — expose session metadata to the bash tool's child env now
     // that the provider is resolved. The session file is only set for
@@ -1510,6 +1530,7 @@ fn compactHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!vo
             .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
             .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
             .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
+            .headers = session.attribution_headers,
         },
         .pinned = pinned,
         .timestamp_ms = ai.stream.nowMillis(),
@@ -2375,6 +2396,7 @@ fn runOneTurnInternal(
                     .timeouts = print_mode.resolveTimeoutsFromMap(session.cfg, session.environ_map),
                     .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
                     .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
+                    .headers = session.attribution_headers,
                 },
             };
             // v3.0 — wire compression into the agent loop via DI.
