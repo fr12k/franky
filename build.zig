@@ -117,6 +117,13 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // v0.29.1 — install the franky-box server binary from the dependency.
+    // Used by the worker-mode integration test (test/worker_test.zig) which
+    // spawns it as a subprocess. The franky-box v0.5.0+ fixes the ambiguous
+    // artifact name (lib renamed to "frankybox-lib"), so we can use the exe
+    // artifact directly.
+    b.installArtifact(fb_dep.artifact("franky-box"));
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
@@ -248,6 +255,7 @@ pub fn build(b: *std.Build) void {
         "test/kitchen_sink_test.zig",
         "test/replay_test.zig",
         "test/mode_test.zig",
+        "test/worker_test.zig",
         "test/public_api_hash_test.zig",
         "test/compression_test.zig",
     };
