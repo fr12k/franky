@@ -164,7 +164,7 @@ and model "Apps" tabs as a recognized app ("harness"):
 
 | Header | Default | Purpose |
 |---|---|---|
-| `HTTP-Referer` | `https://github.com/franky-agent/franky` | Unique app identifier / ranking key (required by OpenRouter) |
+| `HTTP-Referer` | `https://github.com/fr12k/franky` | Unique app identifier / ranking key (required by OpenRouter) |
 | `X-OpenRouter-Title` | `franky` | Display name in rankings |
 | `X-OpenRouter-Categories` | `cli-agent` | Marketplace category (built-in `openrouter` profile) |
 

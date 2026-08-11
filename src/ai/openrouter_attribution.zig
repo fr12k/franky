@@ -45,7 +45,7 @@ pub const Overrides = struct {
 /// override `referer` (and usually `title`) via profile/env so it
 /// claims its own OpenRouter ranking identity.
 pub const default_attribution: Attribution = .{
-    .referer = "https://github.com/franky-agent/franky",
+    .referer = "https://github.com/fr12k/franky",
     .title = "franky",
 };
 
@@ -161,7 +161,7 @@ test "attributionHeaders: defaults produce 2 headers" {
     }
     try testing.expectEqual(@as(usize, 2), h.len);
     try testing.expectEqualStrings("HTTP-Referer", h[0].name);
-    try testing.expectEqualStrings("https://github.com/franky-agent/franky", h[0].value);
+    try testing.expectEqualStrings("https://github.com/fr12k/franky", h[0].value);
     try testing.expectEqualStrings("X-OpenRouter-Title", h[1].name);
     try testing.expectEqualStrings("franky", h[1].value);
 }
@@ -199,13 +199,13 @@ test "attributionHeaders: partial override falls back to defaults" {
     }
     try testing.expectEqual(@as(usize, 2), h.len);
     // referer fell back to default
-    try testing.expectEqualStrings("https://github.com/franky-agent/franky", h[0].value);
+    try testing.expectEqualStrings("https://github.com/fr12k/franky", h[0].value);
     // title overridden
     try testing.expectEqualStrings("custom-title", h[1].value);
 }
 
 test "default_attribution: referer is the project GitHub URL" {
-    try testing.expectEqualStrings("https://github.com/franky-agent/franky", default_attribution.referer);
+    try testing.expectEqualStrings("https://github.com/fr12k/franky", default_attribution.referer);
     try testing.expectEqualStrings("franky", default_attribution.title);
     try testing.expect(default_attribution.categories == null);
 }
