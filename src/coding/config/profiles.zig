@@ -59,6 +59,15 @@ pub const Profile = struct {
     append_system_prompt: ?[]const u8 = null,
     text_tool_call_fallback: ?bool = null,
     http_trace_dir: ?[]const u8 = null,
+    /// OpenRouter app-attribution overrides (see `ai/openrouter_attribution.zig`).
+    /// When the resolved `base_url` is an OpenRouter endpoint, these stamp
+    /// `HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories`
+    /// onto every request. Any left null falls back to the built-in franky
+    /// identity. Forks/rehosters should set `http_referer` (and usually
+    /// `openrouter_title`) to claim their own ranking identity.
+    http_referer: ?[]const u8 = null,
+    openrouter_title: ?[]const u8 = null,
+    openrouter_categories: ?[]const u8 = null,
     /// Hard cap on agent-loop turn count. CLI `--max-turns` always
     /// wins; this is the per-profile default for users who routinely
     /// run a slow / verbose model and want a higher cap baked in.
@@ -348,6 +357,9 @@ fn parseProfileObject(
     if (try optString(arena, environ_map, obj, "append_system_prompt")) |v| p.append_system_prompt = v;
     if (optBool(obj, "text_tool_call_fallback")) |v| p.text_tool_call_fallback = v;
     if (try optString(arena, environ_map, obj, "http_trace_dir")) |v| p.http_trace_dir = v;
+    if (try optString(arena, environ_map, obj, "http_referer")) |v| p.http_referer = v;
+    if (try optString(arena, environ_map, obj, "openrouter_title")) |v| p.openrouter_title = v;
+    if (try optString(arena, environ_map, obj, "openrouter_categories")) |v| p.openrouter_categories = v;
     if (optInt(u32, obj, "max_turns")) |v| p.max_turns = v;
     if (optInt(u32, obj, "retry_max_attempts")) |v| p.retry_max_attempts = v;
     if (optInt(u64, obj, "retry_max_total_ms")) |v| p.retry_max_total_ms = v;
@@ -544,6 +556,15 @@ fn applyProfileStringFields(
     if (cfg.http_trace_dir == null) if (profile.http_trace_dir) |v| {
         cfg.http_trace_dir = try arena.dupe(u8, v);
     };
+    if (cfg.http_referer == null) if (profile.http_referer) |v| {
+        cfg.http_referer = try arena.dupe(u8, v);
+    };
+    if (cfg.openrouter_title == null) if (profile.openrouter_title) |v| {
+        cfg.openrouter_title = try arena.dupe(u8, v);
+    };
+    if (cfg.openrouter_categories == null) if (profile.openrouter_categories) |v| {
+        cfg.openrouter_categories = try arena.dupe(u8, v);
+    };
     if (cfg.role == null) if (profile.role) |v| {
         cfg.role = try arena.dupe(u8, v);
     };
@@ -666,7 +687,8 @@ const builtin_openrouter_body =
     \\{
     \\  "provider": "gateway",
     \\  "base_url": "https://openrouter.ai/api/v1/chat/completions",
-    \\  "api_key_env": "OPENROUTER_API_KEY"
+    \\  "api_key_env": "OPENROUTER_API_KEY",
+    \\  "openrouter_categories": "cli-agent"
     \\}
 ;
 
@@ -1404,6 +1426,92 @@ test "applyProfile: built-in catalog works without settings.json" {
     try testing.expect(std.mem.indexOf(u8, cfg.base_url.?, "acct-test") != null);
     try testing.expectEqualStrings("tok-test", cfg.api_key.?);
     try testing.expect(cfg.text_tool_call_fallback);
+}
+
+test "applyProfile: openrouter profile sets attribution fields" {
+    // The built-in `openrouter` profile now ships `openrouter_categories`
+    // ("cli-agent"); applying it must populate `cfg.openrouter_categories`
+    // and leave the referer/title overrides null (so the built-in franky
+    // identity is used). `cfg.base_url` must be the OpenRouter endpoint.
+    const gpa = testing.allocator;
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("OPENROUTER_API_KEY", "or-test-key");
+
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cfg = try cli.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+
+    try applyProfile(&cfg, io, &env, "openrouter");
+
+    try testing.expectEqualStrings("gateway", cfg.provider.?);
+    try testing.expectEqualStrings(
+        "https://openrouter.ai/api/v1/chat/completions",
+        cfg.base_url.?,
+    );
+    try testing.expectEqualStrings("or-test-key", cfg.api_key.?);
+    try testing.expectEqualStrings("cli-agent", cfg.openrouter_categories.?);
+    // referer/title not set in the builtin profile → fall back to defaults.
+    try testing.expect(cfg.http_referer == null);
+    try testing.expect(cfg.openrouter_title == null);
+}
+
+test "applyProfile: explicit attribution overrides round-trip" {
+    // A profile that explicitly sets all three attribution fields must
+    // overlay them onto `cfg` verbatim.
+    const gpa = testing.allocator;
+
+    const ts = stream.nowMillis();
+    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/franky-attribution-{d}", .{ts});
+    defer gpa.free(dir_path);
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, dir_path);
+    const settings_path = try std.fs.path.join(gpa, &.{ dir_path, "settings.json" });
+    defer gpa.free(settings_path);
+    const settings_body =
+        \\{
+        \\  "profiles": {
+        \\    "orfork": {
+        \\      "provider": "gateway",
+        \\      "base_url": "https://openrouter.ai/api/v1/chat/completions",
+        \\      "api_key_env": "OPENROUTER_API_KEY",
+        \\      "http_referer": "https://myfork.example",
+        \\      "openrouter_title": "myfork",
+        \\      "openrouter_categories": "cli-agent,cloud-agent"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var f = try std.Io.Dir.cwd().createFile(io, settings_path, .{});
+    {
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(settings_body);
+        try w.interface.flush();
+    }
+    f.close(io);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("FRANKY_HOME", dir_path);
+    try env.put("OPENROUTER_API_KEY", "or-key");
+
+    var cfg = try cli.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+
+    try applyProfile(&cfg, io, &env, "orfork");
+
+    try testing.expectEqualStrings("https://myfork.example", cfg.http_referer.?);
+    try testing.expectEqualStrings("myfork", cfg.openrouter_title.?);
+    try testing.expectEqualStrings("cli-agent,cloud-agent", cfg.openrouter_categories.?);
 }
 
 test "saveBuiltin: writes preset to fresh settings.json" {

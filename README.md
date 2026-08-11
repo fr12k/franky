@@ -155,6 +155,52 @@ explicitly to override. Each provider has its own env-var fallback —
     --model llama3 "summarize"
 ```
 
+#### OpenRouter app attribution
+
+When the resolved provider endpoint is `openrouter.ai`, franky automatically
+sends [OpenRouter app-attribution](https://openrouter.ai/docs/app-attribution)
+headers on every request so franky shows up in OpenRouter's public rankings
+and model "Apps" tabs as a recognized app ("harness"):
+
+| Header | Default | Purpose |
+|---|---|---|
+| `HTTP-Referer` | `https://github.com/franky-agent/franky` | Unique app identifier / ranking key (required by OpenRouter) |
+| `X-OpenRouter-Title` | `franky` | Display name in rankings |
+| `X-OpenRouter-Categories` | `cli-agent` | Marketplace category (built-in `openrouter` profile) |
+
+No configuration is needed — the built-in `openrouter` profile (`--profile
+openrouter`) carries these defaults. The headers are **host-gated**: they are
+only added when `base_url` resolves to `openrouter.ai` (or a subdomain), so
+they are never leaked to other gateways (Cerebras, xAI, Ollama, …).
+
+**Forks and hosted deployments** should override the identity to claim their
+own ranking entry, via profile fields or environment variables:
+
+```jsonc
+// profiles entry
+{
+  "provider": "gateway",
+  "base_url": "https://openrouter.ai/api/v1/chat/completions",
+  "api_key_env": "OPENROUTER_API_KEY",
+  "http_referer": "https://my-fork.example",
+  "openrouter_title": "my-franky-fork",
+  "openrouter_categories": "cli-agent,cloud-agent"
+}
+```
+
+| Env var | Profile field | Header |
+|---|---|---|
+| `FRANKY_HTTP_REFERER` | `http_referer` | `HTTP-Referer` |
+| `FRANKY_OPENROUTER_TITLE` | `openrouter_title` | `X-OpenRouter-Title` |
+| `FRANKY_OPENROUTER_CATEGORIES` | `openrouter_categories` | `X-OpenRouter-Categories` |
+
+Profile fields take precedence over env vars; any field left null falls back
+to the built-in franky identity. Categories is a comma-separated list (max 2
+per request, each ≤30 chars, lowercase hyphen-separated; recognized Coding
+group: `cli-agent`, `ide-extension`, `cloud-agent`, `programming-app`,
+`native-app-builder`).
+
+
 ### Run modes
 
 `--mode <print|rpc|proxy>` picks how franky drives the agent

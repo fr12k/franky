@@ -1010,6 +1010,19 @@ fn runSubagent(
         sys_prompt_base;
     defer if (pwd != null) allocator.free(sys_prompt);
 
+    // OpenRouter app-attribution for the sub-agent. Computed on the
+    // sub-agent's config arena so the header slice + strings outlive the
+    // sub-agent's requests. Null when the provider isn't OpenRouter.
+    const sub_attribution_headers = ai.openrouter_attribution.attributionHeaders(
+        sub_cfg.arena.allocator(),
+        provider_info.base_url,
+        .{
+            .referer = sub_cfg.http_referer,
+            .title = sub_cfg.openrouter_title,
+            .categories = sub_cfg.openrouter_categories,
+        },
+    ) catch null;
+
     // Build the sub-agent.
     const sub_model: ai.types.Model = .{
         .id = provider_info.model_id,
@@ -1036,6 +1049,7 @@ fn runSubagent(
             // FRANKY_FIRST_BYTE_TIMEOUT_MS overrides) without
             // touching the parent's map.
             .environ_map = &local_env_map,
+            .headers = sub_attribution_headers,
         },
         .tool_gate = .{
             .userdata = @ptrCast(&sub_gates),
