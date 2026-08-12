@@ -27,6 +27,14 @@ const std = @import("std");
 // quiet on default levels. Genuine swap failures still emit `.warn`
 // regardless so they're visible at the default level.
 const tunnel_log = @import("../log.zig");
+// v0.29.0 — vendored TLS client (src/ai/vendored/tls_client.zig).
+// Drop-in for `std.crypto.tls.Client` with a single fix: RSA-PSS
+// signature verification (`PSSSignature.concatVerify` →
+// `EMSA_PSS_VERIFY`) is reimplemented inline so the `@memmove(m_p, ...)`
+// slice-length panic in zig 0.17.0-dev.1609 (Certificate.zig:1151) is
+// corrected to `@memmove(m_p[0..8], ...)` without editing the system
+// stdlib. See tls_client.zig header for the full rationale.
+const tls_client_mod = @import("tls_client.zig");
 const Io = std.Io;
 const testing = std.testing;
 const http = std.http;
@@ -53,11 +61,11 @@ io: Io,
 ca_bundle_lock: if (disable_tls) void else Io.RwLock = if (disable_tls) {} else .init,
 ca_bundle: if (disable_tls) void else std.crypto.Certificate.Bundle = if (disable_tls) {} else .empty,
 /// Used both for the reader and writer buffers.
-tls_buffer_size: if (disable_tls) u0 else usize = if (disable_tls) 0 else std.crypto.tls.Client.min_buffer_len,
+tls_buffer_size: if (disable_tls) u0 else usize = if (disable_tls) 0 else tls_client_mod.min_buffer_len,
 /// If non-null, ssl secrets are logged to a stream. Creating such a stream
 /// allows other processes with access to that stream to decrypt all
 /// traffic over connections created with this `Client`.
-ssl_key_log: ?*std.crypto.tls.Client.SslKeyLog = null,
+ssl_key_log: ?*tls_client_mod.SslKeyLog = null,
 
 /// The time used to decide whether certificates are expired.
 ///
@@ -315,7 +323,7 @@ pub const Connection = struct {
     };
 
     const Tls = struct {
-        client: std.crypto.tls.Client,
+        client: tls_client_mod,
         connection: Connection,
 
         /// Asserts that `client.now` is non-null.
@@ -342,7 +350,7 @@ pub const Connection = struct {
             assert(base.ptr + alloc_len == socket_read_buffer.ptr + socket_read_buffer.len);
             @memcpy(host_buffer, remote_host.bytes);
             const tls: *Tls = @ptrCast(base);
-            var random_buffer: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+            var random_buffer: [tls_client_mod.Options.entropy_len]u8 = undefined;
             io.random(&random_buffer);
             tls.* = .{
                 .connection = .{
@@ -360,7 +368,7 @@ pub const Connection = struct {
                 // TLS connection is created. After initialization it is
                 // immutable; bundle reads/writes during verification remain
                 // guarded by `client.ca_bundle_lock` inside tls.Client.
-                .client = std.crypto.tls.Client.init(
+                .client = tls_client_mod.init(
                     &tls.connection.stream_reader.interface,
                     &tls.connection.stream_writer.interface,
                     tlsOptions(client, remote_host, tls_read_buffer, socket_write_buffer, &random_buffer),
@@ -392,7 +400,7 @@ pub const Connection = struct {
         }
     };
 
-    pub const ReadError = std.crypto.tls.Client.ReadError || Io.net.Stream.Reader.Error;
+    pub const ReadError = tls_client_mod.ReadError || Io.net.Stream.Reader.Error;
 
     pub fn getReadError(c: *const Connection) ?ReadError {
         return switch (c.protocol) {
@@ -1742,8 +1750,8 @@ fn tlsOptions(
     remote_host: HostName,
     read_buffer: []u8,
     write_buffer: []u8,
-    entropy: *const [std.crypto.tls.Client.Options.entropy_len]u8,
-) std.crypto.tls.Client.Options {
+    entropy: *const [tls_client_mod.Options.entropy_len]u8,
+) tls_client_mod.Options {
     if (comptime tls_insecure) {
         return .{
             .host = .no_verification,
