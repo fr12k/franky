@@ -13,6 +13,14 @@
 //! match CONNECT request"). See https://github.com/ziglang/zig/issues/19878
 //! and https://github.com/ziglang/zig/pull/23365.
 //!
+//! v0.30.0 — the RSA-PSS `@memmove(m_p, ...)` slice-length panic that
+//! affected zig 0.17.0-dev.1609 (Certificate.zig:1151) is fixed upstream
+//! since 0.17.0-dev.1622 (`@memmove(m_p[0..8], ...)`). With the build now
+//! pinning zig >= 0.17.0-dev.1622 the vendored tls/Client.zig workaround
+//! (formerly src/ai/vendored/tls_client.zig, PR #60) is no longer needed;
+//! we use `std.crypto.tls.Client` directly. Only this http client remains
+//! vendored, for the still-unmerged PR #23365 CONNECT-tunnel TLS upgrade.
+//!
 const Client = @This();
 
 const builtin = @import("builtin");
@@ -27,14 +35,14 @@ const std = @import("std");
 // quiet on default levels. Genuine swap failures still emit `.warn`
 // regardless so they're visible at the default level.
 const tunnel_log = @import("../log.zig");
-// v0.29.0 — vendored TLS client (src/ai/vendored/tls_client.zig).
-// Drop-in for `std.crypto.tls.Client` with a single fix: RSA-PSS
-// signature verification (`PSSSignature.concatVerify` →
-// `EMSA_PSS_VERIFY`) is reimplemented inline so the `@memmove(m_p, ...)`
-// slice-length panic in zig 0.17.0-dev.1609 (Certificate.zig:1151) is
-// corrected to `@memmove(m_p[0..8], ...)` without editing the system
-// stdlib. See tls_client.zig header for the full rationale.
-const tls_client_mod = @import("tls_client.zig");
+// v0.30.0 — use std.crypto.tls.Client directly. The RSA-PSS
+// `@memmove(m_p, ...)` slice-length panic in zig 0.17.0-dev.1609
+// (Certificate.zig:1151) is fixed upstream since 0.17.0-dev.1622
+// (`@memmove(m_p[0..8], ...)`), and the build pins zig >= 0.17.0-dev.1622,
+// so the vendored tls/Client.zig workaround (PR #60) is no longer needed.
+// Only this http client remains vendored, for the still-unmerged PR #23365
+// CONNECT-tunnel TLS upgrade.
+const tls_client_mod = std.crypto.tls.Client;
 const Io = std.Io;
 const testing = std.testing;
 const http = std.http;
