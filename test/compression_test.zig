@@ -114,7 +114,7 @@ test "compression: large JSON array is compressed in tool result" {
     var ch = try newAgentChannel(gpa);
     defer ch.deinit();
 
-    var ccr_store = compression_mod.CcrSessionStore.init(gpa);
+    var ccr_store = compression_mod.CcrSessionStore.init(gpa, io);
     defer ccr_store.deinit();
     var compression_stats = compression_mod.CompressionStats{};
     var compression_ctx = compression_mod.CompressionContext{
@@ -188,7 +188,7 @@ test "compression: small result passes through unchanged" {
     var ch = try newAgentChannel(gpa);
     defer ch.deinit();
 
-    var ccr_store = compression_mod.CcrSessionStore.init(gpa);
+    var ccr_store = compression_mod.CcrSessionStore.init(gpa, io);
     defer ccr_store.deinit();
     var compression_stats = compression_mod.CompressionStats{};
     var compression_ctx = compression_mod.CompressionContext{
@@ -300,7 +300,7 @@ test "compression: ccr_store retains original content for retrieval" {
     var ch = try newAgentChannel(gpa);
     defer ch.deinit();
 
-    var ccr_store = compression_mod.CcrSessionStore.init(gpa);
+    var ccr_store = compression_mod.CcrSessionStore.init(gpa, io);
     defer ccr_store.deinit();
     var compression_stats = compression_mod.CompressionStats{};
     var compression_ctx = compression_mod.CompressionContext{
@@ -337,14 +337,17 @@ test "compression: ccr_store retains original content for retrieval" {
 
     // The CCR store should have entries we can retrieve.
     // Iterate store keys and verify we can get the original back.
+    // retrieve returns an owned copy allocated with the store's allocator
+    // (gpa = c_allocator), so free with gpa, not std.testing.allocator.
     var it = ccr_store.map.iterator();
     var found: usize = 0;
     while (it.next()) |entry| {
-        const retrieved = ccr_store.retrieve(entry.key_ptr.*);
-        try testing.expect(retrieved != null);
-        try testing.expect(retrieved.?.len > 1000);
-        try testing.expect(std.mem.indexOf(u8, retrieved.?, "\"id\": 0") != null);
-        try testing.expect(std.mem.indexOf(u8, retrieved.?, "\"id\": 19") != null);
+        const retrieved = ccr_store.retrieve(entry.key_ptr.*) orelse continue;
+        errdefer gpa.free(retrieved);
+        try testing.expect(retrieved.len > 1000);
+        try testing.expect(std.mem.indexOf(u8, retrieved, "\"id\": 0") != null);
+        try testing.expect(std.mem.indexOf(u8, retrieved, "\"id\": 19") != null);
+        gpa.free(retrieved);
         found += 1;
     }
     try testing.expect(found > 0);

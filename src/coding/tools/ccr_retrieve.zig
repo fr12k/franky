@@ -76,7 +76,7 @@ pub fn toolWithCtxAndStats(ctx: ?*compression_mod.CcrContext) at.AgentTool {
 fn execute(
     self: *const at.AgentTool,
     allocator: std.mem.Allocator,
-    _: std.Io,
+    io: std.Io,
     _: []const u8,
     args_json: []const u8,
     _: *ai.stream.Cancel,
@@ -114,11 +114,18 @@ fn execute(
 
     const original = store.retrieve(key) orelse
         return common.toolError(allocator, "not_found", "no content found for this CCR key (may have been evicted)");
+    // `retrieve` returns an owned copy allocated with the store's allocator;
+    // free it after copying into the tool result (allocated with `allocator`).
+    defer store.allocator.free(original);
 
     // Record retrieved bytes in compression stats so net savings is accurate.
+    // The stats mutex serializes against the main-thread `snapshot` reads;
+    // the write must be under the same lock or it races with the reader.
     if (ccr_ctx) |ctx_node| {
         if (ctx_node.stats) |stats| {
+            stats.lock(io);
             stats.bytes_retrieved += original.len;
+            stats.unlock(io);
         }
     }
 

@@ -134,7 +134,7 @@ pub const SessionState = struct {
                 .transcript = transcript,
                 .created_at_ms = created_ms,
                 .tree = tree,
-                .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator),
+                .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator, io),
             };
             state.ccr_ctx = .{ .store = &state.ccr_store, .stats = &state.compression_stats };
             state.compression_ctx.ccr_store = &state.ccr_store;
@@ -166,7 +166,7 @@ pub const SessionState = struct {
             .transcript = agent.loop.Transcript.init(allocator),
             .created_at_ms = ai.stream.nowMillis(),
             .tree = tree,
-            .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator),
+            .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator, io),
         };
         state.ccr_ctx = .{ .store = &state.ccr_store, .stats = &state.compression_stats };
         return state;
