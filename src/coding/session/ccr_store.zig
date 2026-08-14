@@ -12,6 +12,7 @@
 //! Collision probability at 1000 entries is ~10⁻⁹, negligible.
 
 const std = @import("std");
+const test_h = @import("../../test_helpers.zig");
 
 /// Maximum number of entries in the CCR store before LRU eviction kicks in.
 pub const default_max_entries: usize = 1000;
@@ -26,6 +27,16 @@ pub const key_len: usize = 12;
 ///
 /// Stores original content blobs keyed by a 12-char truncated SHA-256 hex hash.
 /// Old entries are evicted via LRU when the cap is reached.
+///
+/// Thread-safety: the store is shared across the agent's parallel tool
+/// workers — `store()` is called from the main-thread compression path
+/// while `ccr_retrieve` (a `.parallel` tool) calls `retrieve()` from a
+/// worker thread. Without synchronization the underlying `StringHashMap`
+/// (which `free`s keys/values on eviction/replace) races with concurrent
+/// reads, corrupting the heap and crashing on the next `free` with a
+/// general-protection fault in the poison-on-free `@memset`. The mutex
+/// serializes all map/LRU mutations and reads. `deinit` is single-
+/// threaded (session teardown) and need not lock.
 pub const CcrSessionStore = struct {
     allocator: std.mem.Allocator,
     /// key -> original content (both owned)
@@ -36,8 +47,12 @@ pub const CcrSessionStore = struct {
     total_bytes: usize,
     /// LRU tracking: ordered list of keys, most-recently-used at the end.
     lru_keys: std.ArrayList([]const u8),
+    /// Serializes `store`/`retrieve` against concurrent tool workers.
+    /// Requires the session `io` (stored below) for `std.Io.Mutex` ops.
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) CcrSessionStore {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) CcrSessionStore {
         return .{
             .allocator = allocator,
             .map = std.StringHashMap([]const u8).init(allocator),
@@ -45,10 +60,14 @@ pub const CcrSessionStore = struct {
             .max_bytes = default_max_bytes,
             .total_bytes = 0,
             .lru_keys = .empty,
+            .io = io,
         };
     }
 
     pub fn deinit(self: *CcrSessionStore) void {
+        // No lock: teardown is single-threaded. The agent loop joins every
+        // parallel tool worker (loop.zig runParallelToolCalls) before the
+        // turn ends, so no worker can touch the store after deinit.
         var it = self.map.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -68,6 +87,12 @@ pub const CcrSessionStore = struct {
 
         const val = try self.allocator.dupe(u8, original);
         errdefer self.allocator.free(val);
+
+        // Serialize against concurrent `retrieve` calls from parallel tool
+        // workers — the hashmap frees keys/values on eviction/replace,
+        // so an unsynchronized read can observe a freed pointer.
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Remove old value if key already exists (content collision)
         if (self.map.fetchRemove(key)) |kv| {
@@ -110,25 +135,41 @@ pub const CcrSessionStore = struct {
     }
 
     /// Retrieve original content by hash key.
+    ///
+    /// Returns an OWNED copy (allocated with `self.allocator`) so the
+    /// caller can safely use it after the lock is released — a borrowed
+    /// slice would be freed by a concurrent `store()` eviction before the
+    /// caller copies it. The caller must free the returned slice with
+    /// `self.allocator`. Returns `null` when the key is absent.
     pub fn retrieve(self: *CcrSessionStore, key: []const u8) ?[]const u8 {
-        const value = self.map.get(key) orelse return null;
+        // Serialize against concurrent `store` calls (which can evict/free
+        // the very entry we're about to read).
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        // Update LRU: move to end
-        for (self.lru_keys.items, 0..) |lk, i| {
+        const value = self.map.get(key) orelse return null;
+        // Owned copy for the caller — done under the lock so the source
+        // can't be evicted mid-copy.
+        const owned = self.allocator.dupe(u8, value) catch return null;
+
+        // Best-effort LRU move-to-end. Append the new key FIRST, then
+        // remove the old entry — so if append fails the LRU is unchanged
+        // and the map entry is not orphaned (in map but not in lru_keys).
+        const duped_key = self.allocator.dupe(u8, key) catch return owned;
+        self.lru_keys.append(self.allocator, duped_key) catch {
+            self.allocator.free(duped_key);
+            return owned;
+        };
+        // New key appended — remove the old entry (if any). Exclude the
+        // last element (the one we just appended) from the search.
+        for (self.lru_keys.items[0 .. self.lru_keys.items.len - 1], 0..) |lk, i| {
             if (std.mem.eql(u8, lk, key)) {
                 const removed = self.lru_keys.orderedRemove(i);
                 self.allocator.free(removed);
                 break;
             }
         }
-
-        const duped_key = self.allocator.dupe(u8, key) catch return value;
-        self.lru_keys.append(self.allocator, duped_key) catch {
-            self.allocator.free(duped_key);
-            return value;
-        };
-
-        return value;
+        return owned;
     }
 
     /// Format a CCR marker for embedding in compressed output.
@@ -175,26 +216,43 @@ fn computeKey(allocator: std.mem.Allocator, content: []const u8) ![]const u8 {
 }
 
 test "CCR store and retrieve" {
-    var store = CcrSessionStore.init(std.testing.allocator);
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    var store = CcrSessionStore.init(std.testing.allocator, threaded.io());
     defer store.deinit();
 
     const original = "Large payload content here";
     const key = try store.store(original);
     const retrieved = store.retrieve(key) orelse return error.TestFailed;
+    defer std.testing.allocator.free(retrieved);
     try std.testing.expectEqualStrings(original, retrieved);
 }
 
 test "CCR store round-trip multiple entries" {
-    var store = CcrSessionStore.init(std.testing.allocator);
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    var store = CcrSessionStore.init(std.testing.allocator, threaded.io());
     defer store.deinit();
 
     const a = try store.store("content a");
     const b = try store.store("content b");
     const c = try store.store("content c");
 
-    try std.testing.expectEqualStrings("content a", store.retrieve(a).?);
-    try std.testing.expectEqualStrings("content b", store.retrieve(b).?);
-    try std.testing.expectEqualStrings("content c", store.retrieve(c).?);
+    {
+        const r = store.retrieve(a) orelse return error.TestFailed;
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqualStrings("content a", r);
+    }
+    {
+        const r = store.retrieve(b) orelse return error.TestFailed;
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqualStrings("content b", r);
+    }
+    {
+        const r = store.retrieve(c) orelse return error.TestFailed;
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqualStrings("content c", r);
+    }
 }
 
 test "CCR marker format and parse" {
@@ -233,7 +291,9 @@ test "CCR key length is 12" {
 }
 
 test "CCR store LRU eviction" {
-    var store = CcrSessionStore.init(std.testing.allocator);
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    var store = CcrSessionStore.init(std.testing.allocator, threaded.io());
     store.max_entries = 3;
     defer store.deinit();
 
@@ -242,20 +302,22 @@ test "CCR store LRU eviction" {
     const c = try store.store("entry c");
 
     // All three should be present
-    try std.testing.expect(store.retrieve(a) != null);
-    try std.testing.expect(store.retrieve(b) != null);
-    try std.testing.expect(store.retrieve(c) != null);
+    if (store.retrieve(a)) |r| std.testing.allocator.free(r) else return error.TestFailed;
+    if (store.retrieve(b)) |r| std.testing.allocator.free(r) else return error.TestFailed;
+    if (store.retrieve(c)) |r| std.testing.allocator.free(r) else return error.TestFailed;
 
     // Adding a fourth should evict the oldest (a)
     const d = try store.store("entry d");
-    try std.testing.expect(store.retrieve(d) != null);
+    if (store.retrieve(d)) |r| std.testing.allocator.free(r) else return error.TestFailed;
     try std.testing.expect(store.retrieve(a) == null); // evicted
-    try std.testing.expect(store.retrieve(b) != null);
-    try std.testing.expect(store.retrieve(c) != null);
+    if (store.retrieve(b)) |r| std.testing.allocator.free(r) else return error.TestFailed;
+    if (store.retrieve(c)) |r| std.testing.allocator.free(r) else return error.TestFailed;
 }
 
 test "CCR store retrieve by key from marker" {
-    var store = CcrSessionStore.init(std.testing.allocator);
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    var store = CcrSessionStore.init(std.testing.allocator, threaded.io());
     defer store.deinit();
 
     const key = try store.store("some important content");
@@ -263,7 +325,11 @@ test "CCR store retrieve by key from marker" {
     try std.testing.expectEqual(@as(usize, key_len), key.len);
 
     // Retrieving with the key should work
-    try std.testing.expectEqualStrings("some important content", store.retrieve(key).?);
+    {
+        const r = store.retrieve(key) orelse return error.TestFailed;
+        defer std.testing.allocator.free(r);
+        try std.testing.expectEqualStrings("some important content", r);
+    }
 
     // A non-existent key should return null
     try std.testing.expect(store.retrieve("nonexistent12") == null);

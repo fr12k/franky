@@ -265,7 +265,7 @@ fn initSession(
         .environ_map = environ_map,
         .prompts_enabled = prompts_enabled,
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
-        .ccr_store = compression_mod.CcrSessionStore.init(allocator),
+        .ccr_store = compression_mod.CcrSessionStore.init(allocator, io),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.compression_ctx.ccr_store = &session.ccr_store;

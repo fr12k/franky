@@ -371,10 +371,14 @@ fn selectTools(
     return allocator.realloc(out, n);
 }
 
-const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_search", "web_fetch" };
+// v3.2 — memory tools are wired into the parent tool list with their
+// own MemoryState ctx, so selectTools can pick them up by name. Recall
+// (memory_search) is safe for read-only presets; persist (memory_save)
+// only for write-capable presets. diff-review stays tool-less by design.
+const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_search", "web_fetch", "memory_search" };
 const diff_review_tool_names = [_][]const u8{};
-const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls", "find", "grep" };
-const bash_runner_tool_names = [_][]const u8{ "bash", "ls", "find", "grep" };
+const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls", "find", "grep", "memory_search", "memory_save" };
+const bash_runner_tool_names = [_][]const u8{ "bash", "ls", "find", "grep", "memory_search", "memory_save" };
 
 fn buildResearchTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
     return selectTools(alloc, parent, &research_tool_names);
@@ -404,7 +408,8 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
         .default_role = .read,
         .default_system_prompt =
         \\You are a research sub-agent. Your job is to read, search, and summarise.
-        \\You have read, ls, find, and grep. Do NOT write or modify files.
+        \\You have read, ls, find, grep, web_search, and memory_search. Do NOT write or modify files.
+        \\Use memory_search to recall relevant context from prior sessions when useful.
         \\When finished, write your final answer as a clear, self-contained summary.
         ,
         .build_tools = buildResearchTools,
@@ -417,7 +422,8 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
         .default_role = .read,
         .default_system_prompt =
         \\You are a code-audit sub-agent. Focus on the single concern stated in the prompt.
-        \\You have read, ls, find, and grep. Do NOT write or modify files.
+        \\You have read, ls, find, grep, and memory_search. Do NOT write or modify files.
+        \\Use memory_search to recall relevant conventions or past decisions when useful.
         \\Report findings as a structured list with file paths and line references.
         ,
         .build_tools = buildCodeAuditTools,
@@ -445,7 +451,8 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
         .default_role = .plan,
         .default_system_prompt =
         \\You are a file-ops sub-agent. Apply the edits described in the prompt exactly.
-        \\You have read, write, edit, and ls. Prefer edit over write for existing files.
+        \\You have read, write, edit, ls, and memory_search/memory_save. Prefer edit over write for existing files.
+        \\Use memory_search to recall relevant context; use memory_save only for durable, self-contained facts.
         \\When finished, confirm what you changed.
         ,
         .build_tools = buildFileOpsTools,
@@ -457,7 +464,8 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
         .default_role = .code,
         .default_system_prompt =
         \\You are a bash-runner sub-agent. Execute the shell task described in the prompt.
-        \\You have bash and ls. Keep commands focused and report results clearly.
+        \\You have bash, ls, and memory_search/memory_save. Keep commands focused and report results clearly.
+        \\Use memory_search to recall relevant context; use memory_save only for durable, self-contained facts.
         ,
         .build_tools = buildBashRunnerTools,
     });
