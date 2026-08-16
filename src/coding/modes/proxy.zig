@@ -1612,6 +1612,8 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "retry", .description = "Re-run the last turn", .handler = retryHandler });
     try reg.register(.{ .name = "edit", .description = "Edit the last user message", .handler = editHandler });
     try reg.register(.{ .name = "compact", .description = "Compact older messages into a summary", .handler = compactHandler });
+    try reg.register(.{ .name = "skills", .description = "List loaded skills + which are active for this workspace", .handler = skillsHandler });
+    try reg.register(.{ .name = "design", .description = "Open the Design Documents panel", .handler = designHandler });
     try reg.register(.{ .name = "review", .description = "Multi-model code review (requires --skill multimodel-review)", .handler = reviewHandler });
     try reg.register(.{ .name = "quit", .description = "Close this browser tab", .handler = quitHandler });
     try reg.register(.{ .name = "restart", .description = "Restart the franky process (spawn-and-exit)", .handler = restartHandler });
