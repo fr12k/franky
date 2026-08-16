@@ -221,7 +221,7 @@ Testing Patterns
 Build (build.zig)
 
     Single franky module exposed via b.addModule("franky", …)
-    Binaries: franky (main CLI), franky-gen-models (model catalog poller), franky-doctor (self-improvement analyzer), franky-check-spec-anchors
+    Binaries: franky (main CLI), franky-gen-models (model catalog poller), franky-check-spec-anchors
     6 integration test binaries
     LLVM/LLD opt-in for macOS compatibility
 
