@@ -680,8 +680,6 @@ pub const usage_text: []const u8 =
     \\USAGE:
     \\  franky [FLAGS] [--] PROMPT...
     \\  franky update [--check] [--force] [--repo owner/name]
-    \\  franky replay <trace_file> [--diff <expected.jsonl>]
-    \\  franky fixture <trace_file> [--name SCENARIO] [--out DIR] [--force]
     \\
     \\FLAGS:
     \\  --provider NAME              Provider (faux, anthropic, openai, gateway, google-gemini) [default: faux]
