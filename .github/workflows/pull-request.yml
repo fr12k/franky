@@ -15,5 +15,5 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: containifyci/.github/.github/workflows/pull-request.yml@v1.3.28
+    uses: containifyci/.github/.github/workflows/pull-request.yml@v1
     secrets: inherit
