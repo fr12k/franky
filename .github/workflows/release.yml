@@ -17,6 +17,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    uses: containifyci/.github/.github/workflows/release.yml@v1.3.27
+    uses: containifyci/.github/.github/workflows/release.yml@v1.3.28
     secrets: 
       RELEASE_GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
