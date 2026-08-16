@@ -65,8 +65,6 @@ const permissions_mod = franky.coding.permissions;
 const session_mod = franky.coding.session;
 const session_create = franky.coding.session.create;
 const slash_mod = franky.coding.slash;
-const diagnostics_mod = franky.coding.diagnostics;
-const improvement_mod = franky.coding.improvement;
 const skills_mod = franky.coding.skills;
 const restart_mod = franky.coding.restart;
 const extensions_mod = franky.coding.extensions;
@@ -1063,8 +1061,6 @@ fn helpHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
         \\| `/retry` | Re-run the last turn |
         \\| `/edit` | Edit the last user message in the composer |
         \\| `/compact` | Compact older messages into a summary |
-        \\| `/diagnostics` | Per-turn anomaly report — saved to `~/.franky/diagnostics/<sid>/<ts>.txt` (see `docs/reference/diagnostics.md`) |
-        \\| `/improve` | Cross-session self-improvement report (mines past summaries) |
         \\| `/skills` | List loaded skills + which are active for this workspace |
         \\| `/design` | Open the Design Documents panel |
         \\| `/restart` | Restart the franky process (spawn-and-exit) |
@@ -1152,70 +1148,6 @@ fn thinkingHandler(ctx: *slash_mod.Ctx, args: []const []const u8) slash_mod.Erro
     try ctx.output.appendSlice(ctx.allocator, "`.");
 }
 
-/// v1.29.2 — `/diagnostics` runs the
-/// `coding/diagnostics` analyzer over the active session and
-/// renders the report into `ctx.output`. The web UI displays it
-/// as a system message (same pipeline as every other slash
-/// response) — outside the LLM's transcript by construction:
-/// `respondSlashCommand` returns the rendered text in the JSON
-/// response and never appends it to `session.transcript.messages`,
-/// so the next /prompt turn doesn't see it.
-///
-/// Side effect: also persists the rendered text to
-/// `<franky_home>/diagnostics/<session_id>/<unix_ms>.txt`. Best-
-/// effort — a write failure is reported in the response but does
-/// not fail the command itself.
-fn improveHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
-    const px = proxySlashCtx(ctx);
-    const session = px.session;
-
-    const home_owned = diagnostics_mod.resolveFrankyHome(ctx.allocator, session.environ_map) catch |e| switch (e) {
-        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
-    };
-    defer if (home_owned) |h| ctx.allocator.free(h);
-    const home = home_owned orelse {
-        try ctx.output.appendSlice(
-            ctx.allocator,
-            "/improve: $FRANKY_HOME and $HOME both unset; cannot resolve diagnostics dir.\n",
-        );
-        return;
-    };
-
-    const diag_dir = std.fmt.allocPrint(ctx.allocator, "{s}/diagnostics", .{home}) catch return slash_mod.Error.OutOfMemory;
-    defer ctx.allocator.free(diag_dir);
-    const imp_root = std.fmt.allocPrint(ctx.allocator, "{s}/improvements", .{home}) catch return slash_mod.Error.OutOfMemory;
-    defer ctx.allocator.free(imp_root);
-
-    const result = improvement_mod.runAndPersist(ctx.allocator, session.io, .{
-        .diagnostics_dir = diag_dir,
-        .improvements_root = imp_root,
-        .model_filter = session.cfg.model,
-        .timestamp_ms = ai.stream.nowMillis(),
-    }) catch |e| switch (e) {
-        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
-        else => {
-            const msg = std.fmt.allocPrint(
-                ctx.allocator,
-                "/improve: failed to run analyzer: {s}\n",
-                .{@errorName(e)},
-            ) catch return slash_mod.Error.OutOfMemory;
-            defer ctx.allocator.free(msg);
-            try ctx.output.appendSlice(ctx.allocator, msg);
-            return;
-        },
-    };
-    defer result.deinit(ctx.allocator);
-
-    try ctx.output.appendSlice(ctx.allocator, "```\n");
-    try ctx.output.appendSlice(ctx.allocator, result.rendered);
-    try ctx.output.appendSlice(ctx.allocator, "```\n");
-    if (result.persisted_path) |path| {
-        try ctx.output.appendSlice(ctx.allocator, "\nReport saved to: `");
-        try ctx.output.appendSlice(ctx.allocator, path);
-        try ctx.output.appendSlice(ctx.allocator, "`\n");
-    }
-}
-
 fn skillsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
     const px = proxySlashCtx(ctx);
     const session = px.session;
@@ -1246,63 +1178,6 @@ fn skillsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!voi
     try ctx.output.appendSlice(ctx.allocator, "```\n");
 }
 
-fn diagnosticsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
-    const px = proxySlashCtx(ctx);
-    const session = px.session;
-
-    const session_dir: ?[]u8 = if (session.parent_dir) |parent|
-        std.fs.path.join(ctx.allocator, &.{ parent, session.session_id }) catch null
-    else
-        null;
-    defer if (session_dir) |sd| ctx.allocator.free(sd);
-
-    const opts: diagnostics_mod.Options = .{
-        .transcript = session.transcript.messages.items,
-        .http_trace_dir = if (session.cfg.http_trace_dir) |s| (if (s.len > 0) s else null) else null,
-        .session_dir = session_dir,
-        .session_label = session.session_id,
-        .mode_name = "proxy",
-        .provider = session.cfg.provider,
-        .model = session.cfg.model,
-    };
-
-    const home_owned = diagnostics_mod.resolveFrankyHome(ctx.allocator, session.environ_map) catch |e| switch (e) {
-        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
-    };
-    defer if (home_owned) |h| ctx.allocator.free(h);
-
-    const persist_opts: ?diagnostics_mod.PersistOptions = if (home_owned) |h| .{
-        .franky_home = h,
-        .session_id = session.session_id,
-        .timestamp_ms = ai.stream.nowMillis(),
-    } else null;
-
-    const result = diagnostics_mod.runAndPersist(
-        ctx.allocator,
-        session.io,
-        opts,
-        persist_opts,
-    ) catch |e| switch (e) {
-        error.OutOfMemory => return slash_mod.Error.OutOfMemory,
-    };
-    defer result.deinit(ctx.allocator);
-
-    // Wrap the report body in a fenced block so the Markdown
-    // renderer in the web UI preserves whitespace + monospaces it.
-    try ctx.output.appendSlice(ctx.allocator, "```\n");
-    try ctx.output.appendSlice(ctx.allocator, result.rendered);
-    try ctx.output.appendSlice(ctx.allocator, "```\n");
-    if (result.persisted_path) |path| {
-        try ctx.output.appendSlice(ctx.allocator, "\nReport saved to: `");
-        try ctx.output.appendSlice(ctx.allocator, path);
-        try ctx.output.appendSlice(ctx.allocator, "`\n");
-    } else {
-        try ctx.output.appendSlice(
-            ctx.allocator,
-            "\n*(persist skipped: $FRANKY_HOME and $HOME both unset, or write failed)*\n",
-        );
-    }
-}
 
 fn costHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
     const px = proxySlashCtx(ctx);
@@ -1737,10 +1612,6 @@ fn buildProxySlashRegistry(allocator: std.mem.Allocator) !slash_mod.Registry {
     try reg.register(.{ .name = "retry", .description = "Re-run the last turn", .handler = retryHandler });
     try reg.register(.{ .name = "edit", .description = "Edit the last user message", .handler = editHandler });
     try reg.register(.{ .name = "compact", .description = "Compact older messages into a summary", .handler = compactHandler });
-    try reg.register(.{ .name = "diagnostics", .description = "Per-turn diagnostic report (anomalies + trace pointers)", .handler = diagnosticsHandler });
-    try reg.register(.{ .name = "improve", .description = "Cross-session self-improvement report (mines past summaries)", .handler = improveHandler });
-    try reg.register(.{ .name = "skills", .description = "List loaded skills + which are active for this workspace", .handler = skillsHandler });
-    try reg.register(.{ .name = "design", .description = "Open the Design Documents panel", .handler = designHandler });
     try reg.register(.{ .name = "review", .description = "Multi-model code review (requires --skill multimodel-review)", .handler = reviewHandler });
     try reg.register(.{ .name = "quit", .description = "Close this browser tab", .handler = quitHandler });
     try reg.register(.{ .name = "restart", .description = "Restart the franky process (spawn-and-exit)", .handler = restartHandler });

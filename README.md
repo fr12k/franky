@@ -579,7 +579,6 @@ src/
   bin/
     main.zig              # CLI entrypoint (franky binary)
     gen_models.zig        # Model catalog regenerator
-    franky_doctor.zig     # Cross-session self-improvement analyzer
     check_spec_anchors.zig # §-reference verifier
 
 test/

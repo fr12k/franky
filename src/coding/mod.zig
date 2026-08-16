@@ -73,8 +73,6 @@ pub const regex = @import("regex.zig");
 pub const gitignore = @import("gitignore.zig");
 pub const rpc = @import("rpc.zig");
 pub const slash = @import("slash.zig");
-pub const diagnostics = @import("diagnostics.zig");
-pub const improvement = @import("improvement.zig");
 pub const update = @import("update.zig");
 pub const orchestrator = @import("orchestrator.zig");
 pub const skills = @import("skills.zig");
@@ -135,8 +133,6 @@ test {
     _ = gitignore;
     _ = rpc;
     _ = slash;
-    _ = diagnostics;
-    _ = improvement;
     _ = update;
     _ = skills;
     _ = restart;

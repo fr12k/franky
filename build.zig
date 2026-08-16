@@ -150,27 +150,6 @@ pub fn build(b: *std.Build) void {
     gen_models_run.addPassthruArgs();
     b.step("gen-models", "Regenerate models.json by polling provider endpoints").dependOn(&gen_models_run.step);
 
-    // `zig build doctor` — cross-session self-improvement analyzer.
-    // See `coding/improvement.zig` for the heuristics; this binary
-    // is the CLI wrapper that walks `~/.franky/diagnostics/` and
-    // writes a feature-request-shaped markdown report to
-    // `~/.franky/improvements/<model>/<unix_ms>.md`.
-    const doctor_module = b.createModule(.{
-        .root_source_file = b.path("src/bin/franky_doctor.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    doctor_module.addImport("franky", franky_module);
-    const doctor_exe = b.addExecutable(.{
-        .name = "franky-doctor",
-        .root_module = doctor_module,
-        .use_llvm = use_llvm,
-        .use_lld = use_lld,
-    });
-    const doctor_run = b.addRunArtifact(doctor_exe);
-    doctor_run.addPassthruArgs();
-    b.step("doctor", "Run cross-session self-improvement analyzer").dependOn(&doctor_run.step);
-
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "embedded_settings_json", "{}");
     test_options.addOption([]const u8, "version", "test");
