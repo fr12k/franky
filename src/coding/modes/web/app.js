@@ -874,7 +874,13 @@ function highlightCodeBlocks(container) {
         const opening = designPanelEl.hidden;
         designPanelEl.hidden = !opening;
         if (designPanelBtn) designPanelBtn.classList.toggle('is-active', opening);
-        if (opening) dpFetch();
+        if (opening) {
+            dpFetch();
+            closeMobileSidebar();
+            if (backdropEl && isMobile()) showBackdrop();
+        } else if (isMobile() && !document.body.classList.contains('sidebar-open') && subagentPanelEl.hidden) {
+            hideBackdrop();
+        }
     }
 
     async function dpFetch() {
@@ -980,6 +986,9 @@ function highlightCodeBlocks(container) {
     function dpClose() {
         if (designPanelEl) designPanelEl.hidden = true;
         if (designPanelBtn) designPanelBtn.classList.remove('is-active');
+        if (isMobile() && !document.body.classList.contains('sidebar-open') && subagentPanelEl.hidden) {
+            hideBackdrop();
+        }
     }
 
     function dpFillComposer(prompt) {
@@ -1775,10 +1784,15 @@ function highlightCodeBlocks(container) {
         subagentPanelEl.removeAttribute('hidden');
         if (subagentPanelBtn) subagentPanelBtn.removeAttribute('hidden');
         updateSubagentPanelSubtitle();
+        closeMobileSidebar();
+        if (backdropEl && isMobile()) showBackdrop();
     }
 
     function closeSubagentPanel() {
         if (subagentPanelEl) subagentPanelEl.setAttribute('hidden', '');
+        if (isMobile() && !document.body.classList.contains('sidebar-open') && (designPanelEl.hidden)) {
+            hideBackdrop();
+        }
     }
 
     function updateSubagentPanelSubtitle() {
@@ -3096,12 +3110,48 @@ function highlightCodeBlocks(container) {
         clearConversation();
         await rehydrate();
         await loadSessions();
+        // v2.32 — after swapping sessions on mobile, close the sidebar drawer.
+        closeMobileSidebar();
+    }
+
+    // ── v2.32 — mobile drawer helpers. On screens <= 768px the
+    // sidebar and right panels become fixed drawers with a shared
+    // `#app-backdrop` behind them. Desktop behavior is untouched.
+    const mobileMQ = window.matchMedia('(max-width: 768px)');
+    const backdropEl = document.getElementById('app-backdrop');
+
+    function isMobile() { return mobileMQ.matches; }
+    function showBackdrop() {
+        if (backdropEl && isMobile()) backdropEl.removeAttribute('hidden');
+    }
+    function hideBackdrop() {
+        if (backdropEl && isMobile()) backdropEl.setAttribute('hidden', '');
+    }
+    function closeMobileSidebar() {
+        document.body.classList.remove('sidebar-open');
+        hideBackdrop();
     }
 
     if (newSessionBtn) newSessionBtn.addEventListener('click', newSession);
     if (sidebarToggle) {
         sidebarToggle.addEventListener('click', function () {
-            document.body.classList.toggle('sidebar-collapsed');
+            if (isMobile()) {
+                // Toggle the drawer (overlay) on mobile.
+                const open = document.body.classList.toggle('sidebar-open');
+                const otherOpen = !designPanelEl.hidden || !subagentPanelEl.hidden;
+                if (open && !otherOpen) showBackdrop();
+                else if (!open && !otherOpen) hideBackdrop();
+            } else {
+                document.body.classList.toggle('sidebar-collapsed');
+            }
+        });
+    }
+    if (backdropEl) {
+        backdropEl.addEventListener('click', function () {
+            closeMobileSidebar();
+            if (!designPanelEl.hidden) dpClose();
+            if (!subagentPanelEl.hidden) closeSubagentPanel();
+            hideBackdrop();
         });
     }
     if (subagentPanelClose) subagentPanelClose.addEventListener('click', closeSubagentPanel);

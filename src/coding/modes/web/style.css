@@ -2043,3 +2043,89 @@ button#send:hover:not(:disabled) {
 .message, .tool-card, .error-banner {
     position: relative;
 }
+/* ─── Mobile responsive (v2.32) ─────────────────────────────────
+ * Optimizes the layout for small screens:
+ *   - Sidebar  → fixed full-height drawer that slides in over
+ *                 the conversation (closed by default).
+ *   - Right panels (design docs + sub-agent) → fixed drawers
+ *                 sliding in from the right edge.
+ *   - A shared `#app-backdrop` dims / taps-to-close the drawers.
+ *   - Messages + diffs use the wider available width.
+ * Desktop behavior (>= 769px) is unchanged. */
+
+@media (max-width: 768px) {
+    /* Overlay backdrop behind the mobile drawers */
+    #app-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 110;
+        background: rgba(0, 0, 0, 0.5);
+    }
+    #app-backdrop[hidden] { display: none; }
+
+    /* Header: let items wrap instead of overflowing */
+    header { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
+    header h1 { font-size: 14px; }
+    .status-line { margin-left: 0; }
+
+    /* Sidebar drawer */
+    aside#sidebar {
+        position: fixed;
+        top: 0; bottom: 0; left: 0;
+        z-index: 120;
+        width: min(300px, 82vw);
+        flex-basis: auto;
+        transform: translateX(-100%);
+        transition: transform 200ms ease;
+        box-shadow: 0 0 24px rgba(0,0,0,0.4);
+    }
+    body.sidebar-open aside#sidebar { transform: translateX(0); }
+    /* Neutralize the desktop collapsed-state while drawer is fixed. */
+    body.sidebar-collapsed aside#sidebar {
+        width: min(300px, 82vw);
+        flex-basis: auto;
+        border-right: 1px solid var(--border);
+        transform: translateX(-100%);
+    }
+    body.sidebar-collapsed.sidebar-open aside#sidebar { transform: translateX(0); }
+
+    /* Right-side drawers */
+    aside#design-panel,
+    aside#subagent-panel {
+        position: fixed;
+        top: 0; bottom: 0; right: 0;
+        z-index: 120;
+        flex-basis: auto;
+        width: min(360px, 92vw);
+        box-shadow: 0 0 24px rgba(0,0,0,0.4);
+    }
+
+    /* Conversation */
+    main#conversation { padding: 12px 10px; gap: 10px; }
+    .message, .tool-card { max-width: 96%; }
+    .message { padding: 8px 12px; }
+    /* Allow wide markdown content to scroll within the bubble. */
+    .message .content { overflow-x: auto; }
+
+    /* Composer */
+    form#composer { padding: 8px; gap: 6px; }
+    textarea#input { font-size: 16px; } /* avoid iOS zoom-on-focus */
+    button#send { padding: 8px 14px; }
+
+    /* Diff view stacks side-by-side columns */
+    .franky-diff-side .fd-side-pair { flex-direction: column; }
+    .franky-diff-side .fd-side-col { overflow-x: auto; }
+    .franky-diff-side .fd-side-col:first-child {
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+    }
+
+    /* Overlays expand to use phone space */
+    .sa-overlay-card, .help-card { width: 94vw; }
+}
+
+/* Very small phones: drop the least-essential header chips so the
+ * actions that matter (abort / help / drawers) stay tappable. */
+@media (max-width: 520px) {
+    .status-line, .model-pill { display: none; }
+}
