@@ -874,7 +874,14 @@ function highlightCodeBlocks(container) {
         const opening = designPanelEl.hidden;
         designPanelEl.hidden = !opening;
         if (designPanelBtn) designPanelBtn.classList.toggle('is-active', opening);
-        if (opening) dpFetch();
+        if (opening) {
+            dpFetch();
+            // Mobile: only one right-side drawer at a time.
+            if (isMobile() && subagentPanelEl && !subagentPanelEl.hidden) closeSubagentPanel();
+            openMobileDrawer();
+        } else {
+            maybeHideBackdrop();
+        }
     }
 
     async function dpFetch() {
@@ -980,6 +987,7 @@ function highlightCodeBlocks(container) {
     function dpClose() {
         if (designPanelEl) designPanelEl.hidden = true;
         if (designPanelBtn) designPanelBtn.classList.remove('is-active');
+        maybeHideBackdrop();
     }
 
     function dpFillComposer(prompt) {
@@ -1775,10 +1783,14 @@ function highlightCodeBlocks(container) {
         subagentPanelEl.removeAttribute('hidden');
         if (subagentPanelBtn) subagentPanelBtn.removeAttribute('hidden');
         updateSubagentPanelSubtitle();
+        // Mobile: only one right-side drawer at a time.
+        if (isMobile() && designPanelEl && !designPanelEl.hidden) dpClose();
+        openMobileDrawer();
     }
 
     function closeSubagentPanel() {
         if (subagentPanelEl) subagentPanelEl.setAttribute('hidden', '');
+        maybeHideBackdrop();
     }
 
     function updateSubagentPanelSubtitle() {
@@ -3096,12 +3108,63 @@ function highlightCodeBlocks(container) {
         clearConversation();
         await rehydrate();
         await loadSessions();
+        // v2.32 — after swapping sessions on mobile, close the sidebar drawer.
+        closeMobileSidebar();
     }
+
+    // ── v2.32 — mobile drawer helpers. On screens <= 768px the
+    // sidebar and right panels become fixed drawers with a shared
+    // `#app-backdrop` behind them. Desktop behavior is untouched.
+    const mobileMQ = window.matchMedia('(max-width: 768px)');
+    const backdropEl = document.getElementById('app-backdrop');
+
+    function isMobile() { return mobileMQ.matches; }
+    // Show backdrop + close sidebar — the common "open a drawer" path.
+    function openMobileDrawer() {
+        if (!isMobile()) return;
+        document.body.classList.remove('sidebar-open');
+        if (backdropEl) backdropEl.removeAttribute('hidden');
+    }
+    // Hide backdrop only when no drawer remains open.
+    function maybeHideBackdrop() {
+        if (!isMobile()) return;
+        if (document.body.classList.contains('sidebar-open')) return;
+        if (designPanelEl && !designPanelEl.hidden) return;
+        if (subagentPanelEl && !subagentPanelEl.hidden) return;
+        if (backdropEl) backdropEl.setAttribute('hidden', '');
+    }
+    function closeMobileSidebar() {
+        document.body.classList.remove('sidebar-open');
+        maybeHideBackdrop();
+    }
+    // Reset mobile state when leaving the breakpoint so a resize
+    // mobile→desktop doesn't leak `sidebar-open` or a stray backdrop.
+    mobileMQ.addEventListener('change', function (e) {
+        if (e.matches) return;
+        document.body.classList.remove('sidebar-open');
+        if (backdropEl) backdropEl.setAttribute('hidden', '');
+    });
 
     if (newSessionBtn) newSessionBtn.addEventListener('click', newSession);
     if (sidebarToggle) {
         sidebarToggle.addEventListener('click', function () {
-            document.body.classList.toggle('sidebar-collapsed');
+            if (isMobile()) {
+                const open = document.body.classList.toggle('sidebar-open');
+                if (open) {
+                    if (backdropEl) backdropEl.removeAttribute('hidden');
+                } else {
+                    maybeHideBackdrop();
+                }
+            } else {
+                document.body.classList.toggle('sidebar-collapsed');
+            }
+        });
+    }
+    if (backdropEl) {
+        backdropEl.addEventListener('click', function () {
+            closeMobileSidebar();
+            if (!designPanelEl.hidden) dpClose();
+            if (!subagentPanelEl.hidden) closeSubagentPanel();
         });
     }
     if (subagentPanelClose) subagentPanelClose.addEventListener('click', closeSubagentPanel);
