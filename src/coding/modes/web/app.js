@@ -876,10 +876,11 @@ function highlightCodeBlocks(container) {
         if (designPanelBtn) designPanelBtn.classList.toggle('is-active', opening);
         if (opening) {
             dpFetch();
-            closeMobileSidebar();
-            if (backdropEl && isMobile()) showBackdrop();
-        } else if (isMobile() && !document.body.classList.contains('sidebar-open') && subagentPanelEl.hidden) {
-            hideBackdrop();
+            // Mobile: only one right-side drawer at a time.
+            if (isMobile() && subagentPanelEl && !subagentPanelEl.hidden) closeSubagentPanel();
+            openMobileDrawer();
+        } else {
+            maybeHideBackdrop();
         }
     }
 
@@ -986,9 +987,7 @@ function highlightCodeBlocks(container) {
     function dpClose() {
         if (designPanelEl) designPanelEl.hidden = true;
         if (designPanelBtn) designPanelBtn.classList.remove('is-active');
-        if (isMobile() && !document.body.classList.contains('sidebar-open') && subagentPanelEl.hidden) {
-            hideBackdrop();
-        }
+        maybeHideBackdrop();
     }
 
     function dpFillComposer(prompt) {
@@ -1784,15 +1783,14 @@ function highlightCodeBlocks(container) {
         subagentPanelEl.removeAttribute('hidden');
         if (subagentPanelBtn) subagentPanelBtn.removeAttribute('hidden');
         updateSubagentPanelSubtitle();
-        closeMobileSidebar();
-        if (backdropEl && isMobile()) showBackdrop();
+        // Mobile: only one right-side drawer at a time.
+        if (isMobile() && designPanelEl && !designPanelEl.hidden) dpClose();
+        openMobileDrawer();
     }
 
     function closeSubagentPanel() {
         if (subagentPanelEl) subagentPanelEl.setAttribute('hidden', '');
-        if (isMobile() && !document.body.classList.contains('sidebar-open') && (designPanelEl.hidden)) {
-            hideBackdrop();
-        }
+        maybeHideBackdrop();
     }
 
     function updateSubagentPanelSubtitle() {
@@ -3121,26 +3119,42 @@ function highlightCodeBlocks(container) {
     const backdropEl = document.getElementById('app-backdrop');
 
     function isMobile() { return mobileMQ.matches; }
-    function showBackdrop() {
-        if (backdropEl && isMobile()) backdropEl.removeAttribute('hidden');
+    // Show backdrop + close sidebar — the common "open a drawer" path.
+    function openMobileDrawer() {
+        if (!isMobile()) return;
+        document.body.classList.remove('sidebar-open');
+        if (backdropEl) backdropEl.removeAttribute('hidden');
     }
-    function hideBackdrop() {
-        if (backdropEl && isMobile()) backdropEl.setAttribute('hidden', '');
+    // Hide backdrop only when no drawer remains open.
+    function maybeHideBackdrop() {
+        if (!isMobile()) return;
+        if (document.body.classList.contains('sidebar-open')) return;
+        if (designPanelEl && !designPanelEl.hidden) return;
+        if (subagentPanelEl && !subagentPanelEl.hidden) return;
+        if (backdropEl) backdropEl.setAttribute('hidden', '');
     }
     function closeMobileSidebar() {
         document.body.classList.remove('sidebar-open');
-        hideBackdrop();
+        maybeHideBackdrop();
     }
+    // Reset mobile state when leaving the breakpoint so a resize
+    // mobile→desktop doesn't leak `sidebar-open` or a stray backdrop.
+    mobileMQ.addEventListener('change', function (e) {
+        if (e.matches) return;
+        document.body.classList.remove('sidebar-open');
+        if (backdropEl) backdropEl.setAttribute('hidden', '');
+    });
 
     if (newSessionBtn) newSessionBtn.addEventListener('click', newSession);
     if (sidebarToggle) {
         sidebarToggle.addEventListener('click', function () {
             if (isMobile()) {
-                // Toggle the drawer (overlay) on mobile.
                 const open = document.body.classList.toggle('sidebar-open');
-                const otherOpen = !designPanelEl.hidden || !subagentPanelEl.hidden;
-                if (open && !otherOpen) showBackdrop();
-                else if (!open && !otherOpen) hideBackdrop();
+                if (open) {
+                    if (backdropEl) backdropEl.removeAttribute('hidden');
+                } else {
+                    maybeHideBackdrop();
+                }
             } else {
                 document.body.classList.toggle('sidebar-collapsed');
             }
@@ -3151,7 +3165,6 @@ function highlightCodeBlocks(container) {
             closeMobileSidebar();
             if (!designPanelEl.hidden) dpClose();
             if (!subagentPanelEl.hidden) closeSubagentPanel();
-            hideBackdrop();
         });
     }
     if (subagentPanelClose) subagentPanelClose.addEventListener('click', closeSubagentPanel);

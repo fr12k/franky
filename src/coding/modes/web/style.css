@@ -2061,7 +2061,6 @@ button#send:hover:not(:disabled) {
         z-index: 110;
         background: rgba(0, 0, 0, 0.5);
     }
-    #app-backdrop[hidden] { display: none; }
 
     /* Header: let items wrap instead of overflowing */
     header { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
@@ -2074,16 +2073,14 @@ button#send:hover:not(:disabled) {
         top: 0; bottom: 0; left: 0;
         z-index: 120;
         width: min(300px, 82vw);
-        flex-basis: auto;
         transform: translateX(-100%);
         transition: transform 200ms ease;
         box-shadow: 0 0 24px rgba(0,0,0,0.4);
     }
     body.sidebar-open aside#sidebar { transform: translateX(0); }
-    /* Neutralize the desktop collapsed-state while drawer is fixed. */
+    /* Un-collapse the desktop collapsed-state while drawer is fixed. */
     body.sidebar-collapsed aside#sidebar {
         width: min(300px, 82vw);
-        flex-basis: auto;
         border-right: 1px solid var(--border);
         transform: translateX(-100%);
     }
@@ -2095,7 +2092,6 @@ button#send:hover:not(:disabled) {
         position: fixed;
         top: 0; bottom: 0; right: 0;
         z-index: 120;
-        flex-basis: auto;
         width: min(360px, 92vw);
         box-shadow: 0 0 24px rgba(0,0,0,0.4);
     }
