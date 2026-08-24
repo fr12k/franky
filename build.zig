@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
     // Used by the worker-mode integration test (test/worker_test.zig) which
     // spawns it as a subprocess. The franky-box v0.5.0+ fixes the ambiguous
     // artifact name (lib renamed to "frankybox-lib"), so we can use the exe
-    // artifact directly.
+    // artifact directly. Currently pinned to franky-box v0.10.0.
     b.installArtifact(fb_dep.artifact("franky-box"));
 
     const run_cmd = b.addRunArtifact(exe);
