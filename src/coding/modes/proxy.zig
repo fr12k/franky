@@ -3273,7 +3273,7 @@ fn respondNewSession(
     defer session.run_mutex.unlock(io);
 
     persistSession(session); // last save before swap
-    swapToFreshSession(session) catch {
+    swapToFreshSession(session, null) catch {
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
@@ -3522,12 +3522,17 @@ fn respondPermissionResolve(
     sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
 }
 
-/// In-place mutate `session` to point at a fresh ULID with an
-/// empty transcript. Caller holds `run_mutex`.
-fn swapToFreshSession(session: *Session) !void {
+/// In-place mutate `session` to point at a fresh empty transcript.
+/// When `id_override` is null a new ULID is minted; otherwise the
+/// provided id is duped (used by `switchToTaskSession` to key sessions
+/// by workstream/task id). Caller holds `run_mutex`.
+fn swapToFreshSession(session: *Session, id_override: ?[]const u8) !void {
     var new_transcript = agent.loop.Transcript.init(session.allocator);
     errdefer new_transcript.deinit();
-    const new_id = try mintUlid(session.allocator);
+    const new_id = if (id_override) |id|
+        try session.allocator.dupe(u8, id)
+    else
+        try mintUlid(session.allocator);
     errdefer session.allocator.free(new_id);
 
     session.transcript.deinit();
@@ -3608,43 +3613,28 @@ pub fn switchToTaskSession(session: *Session, key: []const u8) void {
     // Persist the outgoing session before swapping it out.
     persistSession(session);
 
-    const parent = session.parent_dir;
-    if (parent) |p| {
-        // Try to load an existing session for this key.
-        if (session_mod.load(session.allocator, session.io, p, key)) |loaded| {
-            var l = loaded;
-            swapToLoadedSession(session, &l, key) catch {
-                l.deinit(session.allocator);
-                // Fall back to a fresh session on swap failure.
-                swapToFreshSessionWithId(session, key) catch {};
-            };
-        } else |_| {
-            // No existing session — mint a fresh one keyed by `key`.
-            swapToFreshSessionWithId(session, key) catch {};
-        }
+    // Try to load an existing session for this key. Both the "load
+    // failed" and "no parent_dir" (ephemeral) cases fall through to
+    // the same fresh-session path — they only differ in whether a
+    // disk read was attempted.
+    const maybe_loaded: ?session_mod.Session = if (session.parent_dir) |p|
+        session_mod.load(session.allocator, session.io, p, key) catch null
+    else
+        null;
+
+    if (maybe_loaded) |loaded| {
+        var l = loaded;
+        swapToLoadedSession(session, &l, key) catch {
+            l.deinit(session.allocator);
+            swapToFreshSession(session, key) catch {};
+        };
     } else {
-        // Ephemeral (no persistence) — just reset to a fresh transcript
-        // keyed by `key` so consecutive tasks don't bleed history.
-        swapToFreshSessionWithId(session, key) catch {};
+        // No existing session (or ephemeral) — fresh transcript keyed by `key`.
+        swapToFreshSession(session, key) catch {};
     }
 
     updateBashStateForSession(session);
     broadcastSessionSwitched(session, session.allocator);
-}
-
-/// In-place mutate `session` to a fresh empty transcript keyed by an
-/// explicit `id` (rather than a minted ULID). Caller holds `run_mutex`.
-fn swapToFreshSessionWithId(session: *Session, id: []const u8) !void {
-    var new_transcript = agent.loop.Transcript.init(session.allocator);
-    errdefer new_transcript.deinit();
-    const new_id = try session.allocator.dupe(u8, id);
-    errdefer session.allocator.free(new_id);
-
-    session.transcript.deinit();
-    session.transcript = new_transcript;
-    session.allocator.free(session.session_id);
-    session.session_id = new_id;
-    session.created_at_ms = ai.stream.nowMillis();
 }
 
 /// Broadcast a synthetic `session_switched` SSE so live tabs
