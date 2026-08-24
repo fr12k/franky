@@ -112,7 +112,7 @@ fn doReq(io: std.Io, allocator: std.mem.Allocator, port: u16, request_str: []con
     var stream = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
     defer stream.close(io);
 
-    var wb: [256]u8 = undefined;
+    var wb: [4096]u8 = undefined;
     var w = stream.writer(io, &wb);
     try w.interface.writeAll(request_str);
     try w.interface.flush();
@@ -167,9 +167,22 @@ test "worker mode: claims a dispatched task and posts a completed result" {
     // Port 8080 is hardcoded in franky-box; skip if it's already in use.
     if (!isPortFree(io, box_port)) return error.SkipZigTest;
 
+    // Isolated workdir for the franky-box server so it gets a fresh
+    // SQLite DB (franky-box hardcodes `franky-box.db` in its CWD).
+    const box_workdir = try std.fmt.allocPrint(
+        gpa,
+        "/tmp/franky_worker_boxtest1_{x}",
+        .{franky.ai.stream.nowMillis()},
+    );
+    defer gpa.free(box_workdir);
+    _ = std.Io.Dir.cwd().deleteTree(io, box_workdir) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, box_workdir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, box_workdir);
+
     // 1. Spawn the franky-box server subprocess.
     var box_child = std.process.spawn(io, .{
         .argv = &.{box_bin},
+        .cwd = .{ .path = box_workdir },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -232,13 +245,14 @@ test "worker mode: claims a dispatched task and posts a completed result" {
         };
         defer gpa.free(outbox_json);
 
-        // The outbox JSON is an array. A non-empty array with the task_id
-        // and "completed_at" means the task was processed.
-        if (std.mem.indexOf(u8, outbox_json, "task-") != null and
+        // The outbox JSON is an array. A non-empty array with a task id
+        // (t_-prefixed since franky-box v0.6) and "completed_at" means the
+        // task was processed.
+        if (std.mem.indexOf(u8, outbox_json, "t_") != null and
             std.mem.indexOf(u8, outbox_json, "completed_at") != null)
         {
             found_completed = true;
-            // The worker posts {"status":"completed","task_id":"task-0"}
+            // The worker posts {"status":"completed","task_id":"t_…"}
             // as the completion body — verify it's present.
             try testing.expect(std.mem.indexOf(u8, outbox_json, "completed") != null);
             break;
@@ -248,4 +262,200 @@ test "worker mode: claims a dispatched task and posts a completed result" {
     }
 
     try testing.expect(found_completed);
+}
+
+// ── Admin-dispatch helper ─────────────────────────────────────────────────
+
+/// The franky-box default admin token (src/server.zig: `default_admin_token`).
+const admin_token = "admin-token-change-me";
+
+/// Dispatch a task via the admin endpoint, which lets us pin a
+/// `workstream_name` so multiple tasks share one workstream (and thus,
+/// with v0.31.0 session continuity, one on-disk session).
+fn adminDispatchTask(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    workstream_name: []const u8,
+    payload_text: []const u8,
+) ![]const u8 {
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agent_id\":\"{s}\",\"action\":\"process\",\"payload\":\"{s}\",\"workstream_name\":\"{s}\"}}",
+        .{ agent_id, payload_text, workstream_name },
+    );
+    defer allocator.free(body);
+    const req = try std.fmt.allocPrint(
+        allocator,
+        "POST /admin/dispatch HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ admin_token, body.len, body },
+    );
+    defer allocator.free(req);
+    return httpReq(io, allocator, box_port, req);
+}
+
+/// Count session directories under `session_dir` whose name starts with
+/// `prefix` (e.g. "w_" for workstream-keyed sessions). Returns 0 when the
+/// dir doesn't exist.
+fn countSessions(io: std.Io, session_dir: []const u8, prefix: []const u8) !usize {
+    var dir = std.Io.Dir.cwd().openDir(io, session_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len < prefix.len) continue;
+        if (std.mem.eql(u8, entry.name[0..prefix.len], prefix)) n += 1;
+    }
+    return n;
+}
+
+test "worker mode: session continuity — same workstream resumes one session" {
+    // This test verifies the v0.31.0 feature: when the worker claims a
+    // task, it switches to the on-disk session keyed by workstream_id
+    // (or task_id when no workstream). Two tasks dispatched to the same
+    // workstream_name must produce exactly ONE w_-prefixed session dir,
+    // proving the second task resumed the first's session rather than
+    // minting a new one.
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const franky_bin = findBin(io, "zig-out/bin/franky") orelse return error.SkipZigTest;
+    const box_bin = findBin(io, "zig-out/bin/franky-box") orelse return error.SkipZigTest;
+
+    if (!isPortFree(io, box_port)) return error.SkipZigTest;
+
+    // Unique temp workdir for the franky-box server so it gets a fresh
+    // SQLite DB (franky-box hardcodes `franky-box.db` in its CWD).
+    // Without this, stale outbox entries from prior runs/tests would
+    // contaminate the completion checks below.
+    const box_workdir = try std.fmt.allocPrint(
+        gpa,
+        "/tmp/franky_worker_boxtest_{x}",
+        .{franky.ai.stream.nowMillis()},
+    );
+    defer gpa.free(box_workdir);
+    _ = std.Io.Dir.cwd().deleteTree(io, box_workdir) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, box_workdir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, box_workdir);
+
+    // Unique session dir for the worker's persistent sessions.
+    const session_dir = try std.fmt.allocPrint(
+        gpa,
+        "/tmp/franky_worker_session_test_{x}",
+        .{franky.ai.stream.nowMillis()},
+    );
+    defer gpa.free(session_dir);
+    _ = std.Io.Dir.cwd().deleteTree(io, session_dir) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, session_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+
+    // 1. Spawn franky-box in the isolated workdir.
+    var box_child = std.process.spawn(io, .{
+        .argv = &.{box_bin},
+        .cwd = .{ .path = box_workdir },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.SkipZigTest;
+    defer box_child.kill(io);
+
+    if (!waitForPort(io, box_port, 5_000)) {
+        box_child.kill(io);
+        return error.SkipZigTest;
+    }
+
+    // 2. Spawn the worker WITH persistence (no --no-session) pointed at
+    //    our temp session dir via --session-dir.
+    const inbox_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{box_port});
+    defer gpa.free(inbox_url);
+    const web_port_str = try std.fmt.allocPrint(gpa, "{d}", .{box_port + 101});
+    defer gpa.free(web_port_str);
+
+    var worker_child = std.process.spawn(io, .{
+        .argv = &.{
+            franky_bin,
+            "--provider", "faux",
+            "--mode", "worker",
+            "--session-dir", session_dir,
+            "--inbox-server", inbox_url,
+            "--agent-id", agent_id,
+            "--agent-secret", agent_secret,
+            "--web-port", web_port_str,
+            "--max-consecutive-failures", "3",
+        },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch {
+        box_child.kill(io);
+        return error.SkipZigTest;
+    };
+    defer worker_child.kill(io);
+
+    // 3. Dispatch two tasks to the SAME workstream (by name).
+    const ws_name = "session-continuity-test";
+    const r1 = try adminDispatchTask(io, gpa, ws_name, "first task in workstream");
+    defer gpa.free(r1);
+    try testing.expect(std.mem.indexOf(u8, r1, "dispatched") != null);
+
+    // Wait for the first task to complete before dispatching the second,
+    // so the session is persisted to disk before we look at it.
+    const deadline1 = franky.ai.stream.nowMillis() + 30_000;
+    var first_done = false;
+    while (franky.ai.stream.nowMillis() < deadline1) {
+        const ob = readOutbox(io, gpa) catch {
+            std.Io.sleep(io, std.Io.Duration{ .nanoseconds = 300_000_000 }, .real) catch {};
+            continue;
+        };
+        defer gpa.free(ob);
+        // The outbox accumulates; wait until at least one completed entry.
+        if (std.mem.indexOf(u8, ob, "completed_at") != null) {
+            first_done = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration{ .nanoseconds = 300_000_000 }, .real) catch {};
+    }
+    try testing.expect(first_done);
+
+    const r2 = try adminDispatchTask(io, gpa, ws_name, "second task in workstream");
+    defer gpa.free(r2);
+    try testing.expect(std.mem.indexOf(u8, r2, "dispatched") != null);
+
+    // 4. Wait for the second task to complete.
+    const deadline2 = franky.ai.stream.nowMillis() + 30_000;
+    var second_done = false;
+    var saw_two: usize = 0;
+    while (franky.ai.stream.nowMillis() < deadline2) {
+        const ob = readOutbox(io, gpa) catch {
+            std.Io.sleep(io, std.Io.Duration{ .nanoseconds = 300_000_000 }, .real) catch {};
+            continue;
+        };
+        defer gpa.free(ob);
+        // Count completed_at occurrences to know both tasks are done.
+        saw_two = 0;
+        var rest: []const u8 = ob;
+        while (std.mem.indexOf(u8, rest, "completed_at")) |idx| {
+            saw_two += 1;
+            rest = rest[idx + "completed_at".len ..];
+        }
+        if (saw_two >= 2) {
+            second_done = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration{ .nanoseconds = 300_000_000 }, .real) catch {};
+    }
+    try testing.expect(second_done);
+
+    // 5. The key assertion: exactly ONE w_-prefixed session dir exists —
+    //    both tasks shared the workstream's session. (t_-prefixed dirs
+    //    would indicate standalone tasks; there should be none here.)
+    //    The initial ULID session (minted at worker startup before the
+    //    first task is claimed) is also present but doesn't match w_/t_.
+    const w_count = try countSessions(io, session_dir, "w_");
+    try testing.expectEqual(@as(usize, 1), w_count);
+
+    const t_count = try countSessions(io, session_dir, "t_");
+    try testing.expectEqual(@as(usize, 0), t_count);
 }

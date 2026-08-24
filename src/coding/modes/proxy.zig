@@ -3273,7 +3273,7 @@ fn respondNewSession(
     defer session.run_mutex.unlock(io);
 
     persistSession(session); // last save before swap
-    swapToFreshSession(session) catch {
+    swapToFreshSession(session, null) catch {
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
@@ -3522,12 +3522,17 @@ fn respondPermissionResolve(
     sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
 }
 
-/// In-place mutate `session` to point at a fresh ULID with an
-/// empty transcript. Caller holds `run_mutex`.
-fn swapToFreshSession(session: *Session) !void {
+/// In-place mutate `session` to point at a fresh empty transcript.
+/// When `id_override` is null a new ULID is minted; otherwise the
+/// provided id is duped (used by `switchToTaskSession` to key sessions
+/// by workstream/task id). Caller holds `run_mutex`.
+fn swapToFreshSession(session: *Session, id_override: ?[]const u8) !void {
     var new_transcript = agent.loop.Transcript.init(session.allocator);
     errdefer new_transcript.deinit();
-    const new_id = try mintUlid(session.allocator);
+    const new_id = if (id_override) |id|
+        try session.allocator.dupe(u8, id)
+    else
+        try mintUlid(session.allocator);
     errdefer session.allocator.free(new_id);
 
     session.transcript.deinit();
@@ -3553,6 +3558,83 @@ fn swapToLoadedSession(session: *Session, loaded: *session_mod.Session, target_i
     // `loaded.transcript` was moved; replace with empty so a
     // subsequent `loaded.deinit` doesn't double-free.
     loaded.transcript = agent.loop.Transcript.init(session.allocator);
+}
+
+/// v0.31.0 — refresh `bash_state` (on-disk spill dir + session env
+/// metadata) after a session swap. `swapToFreshSession`/
+/// `swapToLoadedSession` mutate `session_id`/`transcript` but don't
+/// touch `bash_state`, so without this the bash tool keeps writing
+/// spills + `FRANKY_SESSION_ID` for the *previous* session. Caller
+/// holds `run_mutex`.
+fn updateBashStateForSession(session: *Session) void {
+    // Spill dir: `<parent>/<session_id>`.
+    if (session.parent_dir) |parent| {
+        if (std.fs.path.join(session.allocator, &.{ parent, session.session_id })) |sd| {
+            defer session.allocator.free(sd);
+            session.bash_state.setSessionDir(sd) catch {};
+        } else |_| {}
+    }
+    // Env metadata: session id + transcript path + provider/model.
+    const tfile: ?[]const u8 = if (session.parent_dir) |parent|
+        std.fs.path.join(session.role_arena.allocator(), &.{ parent, session.session_id, "transcript.json" }) catch null
+    else
+        null;
+    session.bash_state.setSessionMetadata(
+        session.session_id,
+        tfile,
+        session.provider.provider_name,
+        session.provider.model_id,
+        session.cfg.thinking,
+    ) catch {};
+}
+
+/// v0.31.0 — worker-mode session continuity. Before running a claimed
+/// task, the worker calls this with `workstream_id orelse task_id` so
+/// that tasks sharing a workstream resume the *same* on-disk session
+/// (continuing the prior transcript), while standalone tasks (no
+/// workstream) each get their own session keyed by task id.
+///
+/// franky-box ids are self-describing (`t_`/`w_` prefixes + UUID), so
+/// storing either in the single session-id slot preserves the type.
+/// The key is used directly as the on-disk session directory name:
+///   `<parent_dir>/<w_…>/`  — shared across a workstream
+///   `<parent_dir>/<t_…>/`  — per-task when no workstream
+///
+/// When the key's session already exists on disk it is loaded
+/// (transcript + header); otherwise a fresh empty session is minted
+/// with the key as its id. The caller MUST hold `run_mutex` (the
+/// worker does) — this function does not lock.
+///
+/// No-op when the worker runs without persistence (`--no-session` /
+/// `parent_dir == null`): the in-memory transcript is still reset so a
+/// standalone task doesn't inherit the previous task's history, but
+/// nothing is loaded from or saved to disk.
+pub fn switchToTaskSession(session: *Session, key: []const u8) void {
+    // Persist the outgoing session before swapping it out.
+    persistSession(session);
+
+    // Try to load an existing session for this key. Both the "load
+    // failed" and "no parent_dir" (ephemeral) cases fall through to
+    // the same fresh-session path — they only differ in whether a
+    // disk read was attempted.
+    const maybe_loaded: ?session_mod.Session = if (session.parent_dir) |p|
+        session_mod.load(session.allocator, session.io, p, key) catch null
+    else
+        null;
+
+    if (maybe_loaded) |loaded| {
+        var l = loaded;
+        swapToLoadedSession(session, &l, key) catch {
+            l.deinit(session.allocator);
+            swapToFreshSession(session, key) catch {};
+        };
+    } else {
+        // No existing session (or ephemeral) — fresh transcript keyed by `key`.
+        swapToFreshSession(session, key) catch {};
+    }
+
+    updateBashStateForSession(session);
+    broadcastSessionSwitched(session, session.allocator);
 }
 
 /// Broadcast a synthetic `session_switched` SSE so live tabs
