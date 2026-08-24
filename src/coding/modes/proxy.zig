@@ -3555,6 +3555,98 @@ fn swapToLoadedSession(session: *Session, loaded: *session_mod.Session, target_i
     loaded.transcript = agent.loop.Transcript.init(session.allocator);
 }
 
+/// v0.31.0 — refresh `bash_state` (on-disk spill dir + session env
+/// metadata) after a session swap. `swapToFreshSession`/
+/// `swapToLoadedSession` mutate `session_id`/`transcript` but don't
+/// touch `bash_state`, so without this the bash tool keeps writing
+/// spills + `FRANKY_SESSION_ID` for the *previous* session. Caller
+/// holds `run_mutex`.
+fn updateBashStateForSession(session: *Session) void {
+    // Spill dir: `<parent>/<session_id>`.
+    if (session.parent_dir) |parent| {
+        if (std.fs.path.join(session.allocator, &.{ parent, session.session_id })) |sd| {
+            defer session.allocator.free(sd);
+            session.bash_state.setSessionDir(sd) catch {};
+        } else |_| {}
+    }
+    // Env metadata: session id + transcript path + provider/model.
+    const tfile: ?[]const u8 = if (session.parent_dir) |parent|
+        std.fs.path.join(session.role_arena.allocator(), &.{ parent, session.session_id, "transcript.json" }) catch null
+    else
+        null;
+    session.bash_state.setSessionMetadata(
+        session.session_id,
+        tfile,
+        session.provider.provider_name,
+        session.provider.model_id,
+        session.cfg.thinking,
+    ) catch {};
+}
+
+/// v0.31.0 — worker-mode session continuity. Before running a claimed
+/// task, the worker calls this with `workstream_id orelse task_id` so
+/// that tasks sharing a workstream resume the *same* on-disk session
+/// (continuing the prior transcript), while standalone tasks (no
+/// workstream) each get their own session keyed by task id.
+///
+/// franky-box ids are self-describing (`t_`/`w_` prefixes + UUID), so
+/// storing either in the single session-id slot preserves the type.
+/// The key is used directly as the on-disk session directory name:
+///   `<parent_dir>/<w_…>/`  — shared across a workstream
+///   `<parent_dir>/<t_…>/`  — per-task when no workstream
+///
+/// When the key's session already exists on disk it is loaded
+/// (transcript + header); otherwise a fresh empty session is minted
+/// with the key as its id. The caller MUST hold `run_mutex` (the
+/// worker does) — this function does not lock.
+///
+/// No-op when the worker runs without persistence (`--no-session` /
+/// `parent_dir == null`): the in-memory transcript is still reset so a
+/// standalone task doesn't inherit the previous task's history, but
+/// nothing is loaded from or saved to disk.
+pub fn switchToTaskSession(session: *Session, key: []const u8) void {
+    // Persist the outgoing session before swapping it out.
+    persistSession(session);
+
+    const parent = session.parent_dir;
+    if (parent) |p| {
+        // Try to load an existing session for this key.
+        if (session_mod.load(session.allocator, session.io, p, key)) |loaded| {
+            var l = loaded;
+            swapToLoadedSession(session, &l, key) catch {
+                l.deinit(session.allocator);
+                // Fall back to a fresh session on swap failure.
+                swapToFreshSessionWithId(session, key) catch {};
+            };
+        } else |_| {
+            // No existing session — mint a fresh one keyed by `key`.
+            swapToFreshSessionWithId(session, key) catch {};
+        }
+    } else {
+        // Ephemeral (no persistence) — just reset to a fresh transcript
+        // keyed by `key` so consecutive tasks don't bleed history.
+        swapToFreshSessionWithId(session, key) catch {};
+    }
+
+    updateBashStateForSession(session);
+    broadcastSessionSwitched(session, session.allocator);
+}
+
+/// In-place mutate `session` to a fresh empty transcript keyed by an
+/// explicit `id` (rather than a minted ULID). Caller holds `run_mutex`.
+fn swapToFreshSessionWithId(session: *Session, id: []const u8) !void {
+    var new_transcript = agent.loop.Transcript.init(session.allocator);
+    errdefer new_transcript.deinit();
+    const new_id = try session.allocator.dupe(u8, id);
+    errdefer session.allocator.free(new_id);
+
+    session.transcript.deinit();
+    session.transcript = new_transcript;
+    session.allocator.free(session.session_id);
+    session.session_id = new_id;
+    session.created_at_ms = ai.stream.nowMillis();
+}
+
 /// Broadcast a synthetic `session_switched` SSE so live tabs
 /// know to drop their conversation pane and rehydrate from
 /// `/transcript`.
