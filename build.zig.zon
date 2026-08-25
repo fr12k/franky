@@ -20,8 +20,8 @@
             // v0.3.0 adds vector search, checkpoint parsing, scenario prefix filtering,
             // recallWithBudget (incl. MemoryContext/Store exposure), and a time_start_ms
             // binding fix.
-            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.3.0.tar.gz",
-            .hash = "agent_memory-0.2.1-yf36ft61nQCiCR8_vRuXnKvy6wmsqra6XvSbShAswgiS",
+            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.4.2.tar.gz",
+            .hash = "agent_memory-0.2.1-yf36fk3-nAA0G6SD5Cue_QqVncvk-8wP2acbodaUwD2m",
         },
         .franky_box = .{
             // v0.6.1 (from the original fr12k/franky-box repo) — on top of
