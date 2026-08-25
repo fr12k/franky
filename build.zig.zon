@@ -16,10 +16,11 @@
             .hash = "zompress-0.0.1-hHj4JvKLAQD99DOqFg8rU0NfnwqGflzoPr0m_2A0ZmVG",
         },
         .agent_memory = .{
-            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.3.0).
-            // v0.3.0 adds vector search, checkpoint parsing, scenario prefix filtering,
-            // recallWithBudget (incl. MemoryContext/Store exposure), and a time_start_ms
-            // binding fix.
+            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.4.2).
+            // v0.4.2 simplifies to a single L1 memory layer (SQLite + FTS5),
+            // removing the L0 conversation layer, L2 scenario layer, L3 persona,
+            // and vector/embeddings support. recallWithBudget (incl.
+            // MemoryContext/Store exposure) is retained.
             .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.4.2.tar.gz",
             .hash = "agent_memory-0.2.1-yf36fk3-nAA0G6SD5Cue_QqVncvk-8wP2acbodaUwD2m",
         },
