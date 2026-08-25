@@ -2,7 +2,7 @@
 //!
 //! Provides:
 //! - `MemoryState` — owns the agent_memory.SqliteStore + MemoryContext
-//! - `buildMemoryContext()` — recalls L1/L2/L3 and formats as a bounded
+//! - `buildMemoryContext()` — recalls L1 memories and formats as a bounded
 //!   context block for system prompt injection.
 //!
 //! This module is the single integration point between franky and the
@@ -16,8 +16,9 @@ const agent_memory = @import("agent_memory");
 pub const MemoryConfig = struct {
     /// Path to the SQLite database file.
     db_path: []const u8,
-    /// Directory for L2/L3 markdown files.
-    data_dir: []const u8,
+    /// Reserved — unused since agent_memory v0.4.2 removed the L2/L3
+    /// markdown-file layers. Kept for config-struct ABI stability.
+    data_dir: []const u8 = "",
     /// Isolation context (team/user/agent/session).
     iso: agent_memory.IsolationContext = .{},
     /// Max L1 results to inject into the system prompt (default 10).
@@ -43,7 +44,7 @@ pub const MemoryState = struct {
         defer allocator.free(db_path_z);
         @memcpy(db_path_z[0..config.db_path.len], config.db_path);
 
-        const store = try agent_memory.SqliteStore.init(allocator, io, db_path_z, config.data_dir);
+        const store = try agent_memory.SqliteStore.init(allocator, io, db_path_z);
 
         var state: MemoryState = .{
             .allocator = allocator,
@@ -90,13 +91,6 @@ pub const MemoryState = struct {
         defer buf.deinit(self.allocator);
 
         try buf.appendSlice(self.allocator, "<memory_context>\n");
-
-        // L3 persona
-        if (recall.persona) |p| {
-            try buf.appendSlice(self.allocator, "## Persona\n");
-            try buf.appendSlice(self.allocator, p);
-            try buf.appendSlice(self.allocator, "\n\n");
-        }
 
         // L1 facts
         if (recall.l1_results.len > 0) {

@@ -948,7 +948,7 @@ pub fn initMemoryFromEnv(
         try std.fs.path.join(arena_alloc, &.{ h, "memory" })
     else
         try arena_alloc.dupe(u8, "./memory");
-    // Ensure the data dir exists for L2/L3 markdown files.
+    // Ensure the data dir exists for the memory store.
     std.Io.Dir.cwd().createDirPath(io, data_dir) catch {};
 
     var out: MemoryInit = .{};
