@@ -329,7 +329,7 @@ fn runPrint(
     }
 
     // ── Agent loop ─────────────────────────────────────────────────
-    // v3.2 — recall memory context (L1/L2/L3) from previous sessions
+    // v3.2 — recall memory context (L1) from previous sessions
     // before building the system prompt. The recalled block is injected
     // between the memory-tools hint and any appended user prompt.
     //
@@ -1677,7 +1677,7 @@ pub fn buildSystemPromptIo(
     }
     defer if (memory_owned) allocator.free(with_memory);
 
-    // v3.2 — inject recalled memory context (L1/L2/L3) from previous
+    // v3.2 — inject recalled memory context (L1) from previous
     // sessions. The caller (mode driver) builds this via
     // `MemoryState.buildContextBlock()` before calling us, so this fn
     // stays a pure string-composition primitive. When null or memory

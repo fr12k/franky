@@ -105,8 +105,21 @@ pub fn run(
             // poll starts from the base interval again.
             idle_backoff_ms = 1000;
 
-            // Run the agent — same mutex as POST /prompt
+            // v0.31.0 — session continuity. Switch to the on-disk session
+            // for this task before running the turn, so tasks sharing a
+            // workstream resume the same transcript (continued context)
+            // while standalone tasks get a per-task session. The key is
+            // workstream_id when present (groups related tasks), else
+            // task_id. franky-box ids are self-describing (w_/t_ prefix
+            // + UUID), so either fits in the single session-id slot.
+            //
+            // Done under run_mutex (acquired next line) so the swap is
+            // atomic w.r.t. the web UI / SSE subscribers.
             session.run_mutex.lockUncancelable(io);
+            const session_key = claimed.workstream_id orelse claimed.task_id;
+            proxy.switchToTaskSession(&session, session_key);
+
+            // Run the agent — same mutex as POST /prompt
             proxy.runOneTurn(&session, allocator, io, claimed.payload);
             session.run_mutex.unlock(io);
 
