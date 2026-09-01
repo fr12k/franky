@@ -474,7 +474,7 @@ function highlightCodeBlocks(container) {
         });
     }
 
-    function appendUserMessage(text) {
+    function appendUserMessage(text, ts) {
         const el = document.createElement('div');
         el.className = 'message message-user';
         const role = document.createElement('span');
@@ -485,6 +485,8 @@ function highlightCodeBlocks(container) {
         content.textContent = text;
         el.appendChild(role);
         el.appendChild(content);
+        const tEl = makeTimeEl(ts);
+        if (tEl) el.appendChild(tEl);
         el.id = anchorIdFor("msg");
         conversation.appendChild(el);
         // User just sent a message — force scroll so they see their
@@ -497,7 +499,7 @@ function highlightCodeBlocks(container) {
      * transcript. Unlike the streaming path, this builds the bubble
      * in one shot from the persisted text/thinking blocks.
      */
-    function appendFinalizedAssistantMessage(blocks, role) {
+    function appendFinalizedAssistantMessage(blocks, role, ts) {
         // Skip empty messages (e.g. assistant turn that only emitted
         // a tool call and the call already rendered as a card).
         const hasRenderable = blocks.some(b => b.kind === 'text' || b.kind === 'thinking');
@@ -509,6 +511,10 @@ function highlightCodeBlocks(container) {
         roleEl.className = 'role';
         roleEl.textContent = role || 'assistant';
         el.appendChild(roleEl);
+
+        // vN — optional timestamp (Unix millis) from the transcript.
+        const tEl0 = makeTimeEl(ts);
+        if (tEl0) el.appendChild(tEl0);
 
         // Thinking first (if any), then text — matches the live render.
         const thinkingText = blocks.filter(b => b.kind === 'thinking').map(b => b.text || '').join('');
@@ -1089,6 +1095,8 @@ function highlightCodeBlocks(container) {
         content.className = 'content';
         el.appendChild(roleEl);
         el.appendChild(content);
+        const tEl = makeTimeEl(Date.now());
+        if (tEl) el.appendChild(tEl);
         el.id = anchorIdFor("msg");
         conversation.appendChild(el);
         active = {
@@ -2361,7 +2369,7 @@ function highlightCodeBlocks(container) {
         lastEventAt = Date.now();      // v1.7.2 — start the watchdog clock
         watchdogWarned = false;        // v1.7.4 — fresh advisory budget per turn
         startStatusLineTimer();        // v1.7.7 — elapsed seconds counter
-        appendUserMessage(text);
+        appendUserMessage(text, Date.now());
         try {
             const resp = await fetch('/prompt', {
                 method: 'POST',
@@ -2400,6 +2408,8 @@ function highlightCodeBlocks(container) {
         content.innerHTML = Markdown.render(outputMd || '');
         highlightCodeBlocks(content);
         el.appendChild(content);
+        const tEl = makeTimeEl(Date.now());
+        if (tEl) el.appendChild(tEl);
         el.id = anchorIdFor("msg")
         conversation.appendChild(el);
         scrollToBottom(true);
@@ -3013,6 +3023,31 @@ function highlightCodeBlocks(container) {
         return Math.floor(diff / 86_400_000) + 'd ago';
     }
 
+    // vN — format a Unix-millis timestamp as a short wall-clock time
+    // (HH:MM) for display on message bubbles. Returns '' for falsy
+    // input so callers can render unconditionally without guards.
+    function fmtClockTime(ms) {
+        if (!ms) return '';
+        const d = new Date(ms);
+        const h = d.getHours();
+        const m = d.getMinutes();
+        return (h < 10 ? '0' + h : '' + h) + ':' + (m < 10 ? '0' + m : '' + m);
+    }
+
+    // vN — build a <span class="msg-time"> element for the given
+    // timestamp (Unix millis). Returns null when ts is falsy so the
+    // caller can skip appending it for legacy/unknown timestamps.
+    function makeTimeEl(ts) {
+        const label = fmtClockTime(ts);
+        if (!label) return null;
+        const el = document.createElement('time');
+        el.className = 'msg-time';
+        el.dateTime = new Date(ts).toISOString();
+        el.textContent = label;
+        el.title = new Date(ts).toLocaleString();
+        return el;
+    }
+
     function renderSessionList() {
         sessionList.innerHTML = '';
         if (!sessionsPersisted) {
@@ -3221,9 +3256,9 @@ function highlightCodeBlocks(container) {
                     .filter(b => b.kind === 'text')
                     .map(b => b.text || '')
                     .join('');
-                if (text.length > 0) appendUserMessage(text);
+                if (text.length > 0) appendUserMessage(text, m.timestamp);
             } else if (m.role === 'assistant') {
-                appendFinalizedAssistantMessage(m.blocks || [], 'assistant');
+                appendFinalizedAssistantMessage(m.blocks || [], 'assistant', m.timestamp);
                 for (const b of m.blocks || []) {
                     if (b.kind === 'tool_call' && b.id) {
                         const r = toolResults.get(b.id) || { isError: false, resultText: '' };
