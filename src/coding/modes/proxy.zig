@@ -2484,6 +2484,14 @@ fn writeMessageForUi(
     try buf.append(allocator, '{');
     try buf.appendSlice(allocator, "\"role\":");
     try appendUiJsonStr(buf, allocator, m.role.toString());
+    // vN — surface the per-message timestamp (Unix millis) so the
+    // web UI can render a clock time on each bubble. 0 means unknown
+    // (e.g. a legacy/compacted message); the UI treats 0 as absent.
+    {
+        var num: [32]u8 = undefined;
+        try buf.appendSlice(allocator, ",\"timestamp\":");
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{m.timestamp}) catch unreachable);
+    }
     if (m.tool_call_id) |tcid| {
         try buf.appendSlice(allocator, ",\"toolCallId\":");
         // tool_results appear in the same order as their matching
@@ -4293,6 +4301,8 @@ test "renderTranscriptForUi: user + assistant + tool_result round-trip" {
     try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"text\",\"text\":\"hello\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"tool_call\",\"id\":\"c1_0\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\"name\":\"read\"") != null);
+    // vN — timestamp field is emitted for every message.
+    try testing.expect(std.mem.indexOf(u8, json, "\"timestamp\":0") != null);
 }
 
 test "renderTranscriptForUi: escapes JSON specials in text content" {

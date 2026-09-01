@@ -730,6 +730,18 @@ main#conversation {
     font-weight: 600;
 }
 
+/* vN — per-message timestamp (HH:MM). Sits at the bottom-right of
+ * each bubble, muted and small so it doesn't compete with content. */
+.message .msg-time {
+    display: block;
+    text-align: right;
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.8;
+}
+
 .message .content {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
