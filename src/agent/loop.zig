@@ -346,6 +346,12 @@ pub fn agentLoop(
         };
     }
 
+    // v3.3 — clear finish_task_completed at the start of each agentLoop
+    // run. GuardrailState may be reused across prompts (proxy/rpc modes
+    // create it once per session), so a stale `true` from a previous
+    // prompt would suppress all nudges for the new task.
+    if (config.guardrails) |gr| gr.finish_task_completed = false;
+
     var turn_count: u32 = 0;
     var current_cap: u32 = config.max_turns;
     var nudge_count: u32 = 0; // v2.27 — nudges injected this episode
@@ -406,8 +412,14 @@ pub fn agentLoop(
                 // then inject a "Are you done? Please call finish_task" message.
                 // Caps at 2 nudges per session. Designed for print mode where
                 // there is no user to say "done".
+                //
+                // v3.3 — skip when the guardrails report finish_task already
+                // completed. Without this guard the nudge fires again after
+                // a successful finish_task (the post-finish_task text reply
+                // has no tool call), causing the model to re-call finish_task
+                // in a wasted loop.
                 if (config.nudge_on_finish_task) {
-                    if (finish_nudge_count < 2) {
+                    if (finish_nudge_count < 2 and !finishTaskCompleted(config)) {
                         const nudged = maybeNudgeToFinishTask(allocator, io, transcript) catch |e| blk: {
                             ai.log.log(.warn, "finish_nudge", "inject_failed", "err={s}", .{@errorName(e)});
                             break :blk false;
@@ -423,8 +435,10 @@ pub fn agentLoop(
                 // tool-call turns too (not only clean .stop). Injects
                 // "Continue until you are done and then call finish task"
                 // when the model stopped without calling finish_task.
+                //
+                // v3.3 — same finish_task_completed guard as above.
                 if (config.nudge_on_autocontinue) {
-                    if (autocontinue_nudge_count < 2) {
+                    if (autocontinue_nudge_count < 2 and !finishTaskCompleted(config)) {
                         const nudged = maybeNudgeAutoContinue(allocator, transcript) catch |e| blk: {
                             ai.log.log(.warn, "autocontinue", "inject_failed", "err={s}", .{@errorName(e)});
                             break :blk false;
@@ -532,6 +546,18 @@ fn runForcedSummary(
     _ = runTurn(allocator, io, transcript, no_tools_cfg, out, http_client) catch |err| {
         ai.log.log(.warn, "loop", "forced_summary_turn_failed", "err={s}", .{@errorName(err)});
     };
+}
+
+/// v3.3 — returns true when the guardrails report that finish_task
+/// has already been called and its pipeline (compilation + optional
+/// auto-commit) completed successfully. Used by the nudge-on-finish-task
+/// and nudge-on-autocontinue checks to suppress re-nudging after a
+/// successful finish_task. When guardrails are not wired (null), returns
+/// false — preserving the pre-v3.3 behaviour for callers that don't
+/// use guardrails.
+fn finishTaskCompleted(config: Config) bool {
+    if (config.guardrails) |gr| return gr.finish_task_completed;
+    return false;
 }
 
 /// v2.27 — inspect the last assistant message in the transcript and

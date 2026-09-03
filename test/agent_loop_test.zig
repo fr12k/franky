@@ -1051,3 +1051,90 @@ test "v2.27 nudge-on-stall: tool call skips nudge" {
     try testing.expectEqual(@as(usize, 0), user_count);
 }
 
+test "v3.3 nudge-on-finish-task: suppressed after finish_task completes" {
+    // Reproduces the bug where after the model calls finish_task and the
+    // guardrails pipeline completes, the nudge-on-finish-task fires again
+    // (because the post-finish_task text reply has no tool call), causing
+    // the model to re-call finish_task in a wasted loop.
+    //
+    // With the v3.3 fix, the guardrails set finish_task_completed=true
+    // after step 2, and the nudge checks skip when that flag is set.
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = franky.global_allocator.gpa;
+
+    var faux = faux_mod.FauxProvider.init(gpa);
+    defer faux.deinit();
+
+    // turn 1: assistant calls finish_task (tool_call + done=tool_use).
+    try faux.push(.{ .events = &.{
+        .{ .tool_call = .{
+            .id = "call_1",
+            .name = "finish_task",
+            .args_json = "{\"commit_message\":\"test: done\",\"summary\":\"done\"}",
+            .args_chunk_size = 10,
+        } },
+        .{ .done = .{ .stop_reason = .tool_use } },
+    } });
+    // turn 2: assistant says "Done." (text + done=stop).
+    // This is the reply after finish_task is processed.
+    try faux.push(.{ .events = &.{
+        .{ .text = .{ .text = "Done. All work complete.", .chunk_size = 8 } },
+        .{ .done = .{ .stop_reason = .stop } },
+    } });
+
+    var reg = ai.registry.Registry.init(gpa);
+    defer reg.deinit();
+    try reg.register(.{
+        .api = "faux",
+        .provider = "faux",
+        .stream_fn = fauxStreamShim,
+        .userdata = @ptrCast(&faux),
+    });
+
+    var cancel = ai.stream.Cancel{};
+    var transcript = loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    var ch = try newAgentChannel(gpa);
+    defer ch.deinit();
+
+    // Set up guardrails — workspace_dir=/tmp means compilation is a no-op.
+    const guardrails_mod = franky.agent.guardrails;
+    var guardrail_state = try guardrails_mod.GuardrailState.init(
+        gpa,
+        .{ .workspace_dir = "/tmp" },
+        io,
+    );
+    defer guardrail_state.deinit();
+
+    // Get the finish_task tool from the guardrails.
+    const finish_task_tool = guardrail_state.finishTaskTool();
+
+    loop.agentLoop(gpa, io, &transcript, .{
+        .model = .{ .id = "faux-1", .provider = "faux", .api = "faux" },
+        .tools = &[_]at.AgentTool{finish_task_tool},
+        .registry = &reg,
+        .cancel = &cancel,
+        .guardrails = &guardrail_state,
+        .nudge_on_finish_task = true,
+    }, &ch);
+
+    // Drain events.
+    while (ch.next(io)) |ev| ev.deinit(gpa);
+
+    // After finish_task completes, finish_task_completed must be true.
+    try testing.expect(guardrail_state.finish_task_completed);
+
+    // Count user-role messages (nudges are user-role).
+    var user_count: usize = 0;
+    for (transcript.messages.items) |m| {
+        if (m.role == .user) user_count += 1;
+    }
+    // With the fix: no nudge is injected after finish_task completes.
+    // Without the fix: a "Are you done?" nudge would be injected.
+    try testing.expectEqual(@as(usize, 0), user_count);
+}
+

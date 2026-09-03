@@ -57,6 +57,15 @@ pub const GuardrailState = struct {
     finish_task_state: finish_mod.FinishTaskState,
     guardrail_fire_count: u32 = 0,
     finish_task_pending_compilation: bool = false,
+    /// v3.3 — set true once the finish_task pipeline (compilation +
+    /// optional auto-commit) has completed successfully. The loop's
+    /// nudge-on-finish-task / nudge-on-autocontinue checks read this to
+    /// suppress re-nudging the model after it has already called
+    /// finish_task and the guardrails have processed it. Without this,
+    /// the nudges see the post-finish_task text reply (which contains no
+    /// tool call) and inject another "please call finish_task" message,
+    /// causing the model to call finish_task again in a wasted loop.
+    finish_task_completed: bool = false,
     restart_requested: ?*std.atomic.Value(bool) = null,
     /// v3.2 — optional memory nudge guardrail. When non-null and
     /// `finish_task` fires without any `memory_save` call this session,
@@ -185,12 +194,21 @@ pub const GuardrailState = struct {
             });
 
             if (to_free) |s| self.allocator.free(s);
+            // v3.3 — clear finish_task_completed so the nudges remain
+            // active while the model fixes the CI failure and re-calls
+            // finish_task.
+            self.finish_task_completed = false;
             self.finish_task_state.reset();
             return true;
         }
 
         // ── 1. finish_task triggered ──
         if (self.finish_task_state.triggered) {
+            // v3.3 — a new finish_task call clears the completed flag
+            // so the nudges remain active during the compilation/commit
+            // pipeline. This single reset replaces per-failure-path
+            // resets in step 2 and the CI branches.
+            self.finish_task_completed = false;
             // v3.2 — memory nudge: if the agent finished without saving
             // any memory this session, inject a reminder before the
             // compilation/commit pipeline runs. This gives the agent one
@@ -260,6 +278,10 @@ pub const GuardrailState = struct {
                     ai.log.log(.info, "guardrails", "restart", "finish_task requested restart", .{});
                 }
             }
+            // v3.3 — mark the finish_task pipeline as completed so the
+            // loop's nudge-on-finish-task / nudge-on-autocontinue checks
+            // do not re-nudge the model after a successful finish_task.
+            self.finish_task_completed = true;
             self.finish_task_state.reset();
             return false;
         }
@@ -865,6 +887,74 @@ test "GuardrailState: betweenTurns step 2 — compilation auto_commit without gi
     try testing.expect(!state.finish_task_state.triggered);
     _ = wants2;
 }
+
+test "GuardrailState: v3.3 finish_task_completed is set after step 2 passes" {
+    // When finish_task is triggered and step 2 (compilation) completes
+    // without a failure, finish_task_completed must be true so the loop's
+    // nudge-on-finish-task / nudge-on-autocontinue checks suppress
+    // re-nudging the model.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var state = try GuardrailState.init(gpa, .{ .workspace_dir = "/tmp" }, io);
+    defer state.deinit();
+
+    // No auto_commit — avoids the git pipeline so step 2 just runs
+    // compilation (which is a no-op in /tmp) and returns false.
+    state.finish_task_state.commit_message = try gpa.dupe(u8, "feat(test): change");
+    state.finish_task_state.triggered = true;
+    state.finish_task_state.summary = try gpa.dupe(u8, "test summary");
+
+    var transcript = at.Transcript.init(gpa);
+    defer transcript.deinit();
+    var channel = try ai.channel.Channel(at.AgentEvent).init(gpa, 64);
+    defer channel.deinit();
+
+    // Before any betweenTurns call, finish_task_completed is false.
+    try testing.expect(!state.finish_task_completed);
+
+    // First call: step 1 — triggered → sets pending_compilation.
+    const wants1 = try state.betweenTurns(gpa, io, &transcript, &channel);
+    try testing.expect(wants1);
+    try testing.expect(state.finish_task_pending_compilation);
+    // Still false after step 1.
+    try testing.expect(!state.finish_task_completed);
+
+    // Second call: step 2 — compilation passes (no-op in /tmp), no auto_commit
+    // → returns false and sets finish_task_completed = true.
+    const wants2 = try state.betweenTurns(gpa, io, &transcript, &channel);
+    try testing.expect(!wants2);
+    try testing.expect(state.finish_task_completed);
+}
+
+test "GuardrailState: v3.3 finish_task_completed reset on CI failure" {
+    // When CI polling fails, finish_task_completed must be cleared so
+    // the nudges remain active while the model fixes the failure.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var state = try GuardrailState.init(gpa, .{ .workspace_dir = "/tmp" }, io);
+    defer state.deinit();
+
+    // Simulate a completed finish_task.
+    state.finish_task_completed = true;
+    state.pending_ci_failure = try gpa.dupe(u8, "test failure output");
+
+    var transcript = at.Transcript.init(gpa);
+    defer transcript.deinit();
+    var channel = try ai.channel.Channel(at.AgentEvent).init(gpa, 64);
+    defer channel.deinit();
+
+    // Step 0 — pending CI failure injection clears finish_task_completed.
+    const wants = try state.betweenTurns(gpa, io, &transcript, &channel);
+    try testing.expect(wants);
+    try testing.expect(!state.finish_task_completed);
+}
+
 test "Config: auto_commit with gh_repo explicit" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
