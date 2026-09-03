@@ -832,13 +832,22 @@ test "gitRemoteRepo: parses SSH URL via helper in a real git repo" {
         .argv = &argv,
         .stdout_limit = .limited(512),
         .stderr_limit = .limited(256),
-    }) catch |err| {
-        // Not a git repo or no remote — skip this test
-        std.debug.print("skipping (no remote): {s}\n", .{@errorName(err)});
+    }) catch {
+        // git binary unavailable (e.g. the CI Alpine image installs only
+        // curl + xz, not git) — skip silently. Writing to stderr here would
+        // be captured by the build runner and rendered as a misleading
+        // "failed command" for an otherwise-successful test step.
         return error.SkipZigTest;
     };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+
+    // std.process.run does not error on a non-zero exit, so a missing
+    // `origin` remote surfaces as a failed git invocation rather than an
+    // error.SkipZigTest. Skip in that case too rather than passing on a
+    // failed command (matches the `result.term != .exited or ... != 0`
+    // idiom used in betweenTurns above).
+    if (result.term != .exited or result.term.exited != 0) return error.SkipZigTest;
 
     const url = std.mem.trimEnd(u8, result.stdout, "\n\r ");
     // We just verify the function doesn't crash with real input
