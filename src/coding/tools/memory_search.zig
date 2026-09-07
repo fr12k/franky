@@ -85,7 +85,8 @@ fn execute(
         allocator.free(results);
     }
 
-    // Format results as text.
+    // Format results as text. The record_id is shown so the agent can
+    // reference the memory later — memory_delete deletes by this id.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     if (results.len == 0) {
@@ -93,8 +94,9 @@ fn execute(
         try buf.appendSlice(allocator, query);
     } else {
         for (results, 0..) |r, i| {
-            const line = try std.fmt.allocPrint(allocator, "[{d}] ({s}, priority={d}) {s}\n", .{
+            const line = try std.fmt.allocPrint(allocator, "[{d}] [id: {s}] ({s}, priority={d}) {s}\n", .{
                 i + 1,
+                r.record_id,
                 r.type.toString(),
                 @as(i32, @intFromFloat(r.priority)),
                 r.content,

@@ -237,6 +237,7 @@ pub fn build(b: *std.Build) void {
         "test/worker_test.zig",
         "test/public_api_hash_test.zig",
         "test/compression_test.zig",
+        "test/memory_tools_test.zig",
     };
     for (integration_files) |path| {
         const mod = b.createModule(.{

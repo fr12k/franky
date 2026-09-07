@@ -17,6 +17,7 @@ pub const tools = struct {
     pub const ccr_retrieve = @import("tools/ccr_retrieve.zig");
     pub const memory_search = @import("tools/memory_search.zig");
     pub const memory_save = @import("tools/memory_save.zig");
+    pub const memory_delete = @import("tools/memory_delete.zig");
 };
 
 pub const modes = struct {
