@@ -1652,6 +1652,9 @@ pub fn buildSystemPromptIo(
     // memory_save so new sessions know to search memory. Gated by
     // cfg.memory_enabled (default true; disable via --no-memory or
     // settings.json tools.memory.enabled=false).
+    //
+    // v3.3 — memory_delete added (agent_memory v0.5.0): the agent can now
+    // remove stale/wrong memories by record_id, soft-deleted by default.
     var with_memory: []u8 = with_compression;
     var memory_owned = false;
     if (cfg.memory_enabled) {
@@ -1663,14 +1666,21 @@ pub fn buildSystemPromptIo(
             "- **memory_search**: Search for relevant memories from previous sessions.\n" ++
             "  Use this when you need to recall user preferences, past decisions, or\n" ++
             "  facts established in earlier conversations. Pass a natural language\n" ++
-            "  query; results are ranked by relevance.\n\n" ++
+            "  query; results are ranked by relevance and include an [id: ...] field.\n\n" ++
             "- **memory_save**: Save a fact, decision, preference, or instruction to\n" ++
             "  persistent memory. Only save information that is:\n" ++
             "  - Durable: not one-time or transient\n" ++
             "  - Self-contained: makes sense without conversation context\n" ++
             "  - User or AI centric: the subject is \"User\" or \"AI\"\n\n" ++
+            "- **memory_delete**: Delete a memory that is wrong, outdated, or superseded,\n" ++
+            "  by the [id: ...] from memory_search. Deletion is soft: the memory stops\n" ++
+            "  appearing in search and recall but can be recovered. Never delete\n" ++
+            "  a memory just because it is currently not relevant — stale memories are\n" ++
+            "  the problem, not topical ones.\n\n" ++
             "When you finish a task, consider whether anything worth remembering happened.\n" ++
-            "If so, save it with memory_save before calling finish_task.\n",
+            "If so, save it with memory_save before calling finish_task. Likewise, if you\n" ++
+            "notice an existing memory is now wrong or superseded, delete it with\n" ++
+            "memory_delete.\n",
             .{trimmed},
         );
         memory_owned = true;

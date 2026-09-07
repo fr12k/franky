@@ -1151,7 +1151,7 @@ pub fn finalizeToolSet(
     ctx: ToolBindingCtx,
 ) ![]at.AgentTool {
     const base_len = ctx.base_tools.len + ctx.ext_tools.len;
-    const extra: usize = if (ctx.memory_state != null) 6 else 4;
+    const extra: usize = if (ctx.memory_state != null) 7 else 4;
     const slice = try allocator.alloc(at.AgentTool, base_len + extra);
     @memcpy(slice[0..ctx.base_tools.len], ctx.base_tools);
     if (ctx.ext_tools.len > 0) {
@@ -1164,6 +1164,7 @@ pub fn finalizeToolSet(
     if (ctx.memory_state) |ms| {
         slice[base_len + 4] = tools_mod.memory_search.tool(ms);
         slice[base_len + 5] = tools_mod.memory_save.tool(ms);
+        slice[base_len + 6] = tools_mod.memory_delete.tool(ms);
     }
     return slice;
 }
