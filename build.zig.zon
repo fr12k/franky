@@ -16,18 +16,17 @@
             .hash = "zompress-0.0.1-hHj4JvKLAQD99DOqFg8rU0NfnwqGflzoPr0m_2A0ZmVG",
         },
         .agent_memory = .{
-            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.5.0).
-            // v0.5.0 adds L1 memory deletion on top of v0.4.2's single-L1
-            // layer: deleteL1 (soft by default / hard opt-in), restoreL1,
-            // purgeDeletedL1, a `deleted` column with in-place ALTER TABLE
-            // migration of existing databases, a content-guarded l1_au FTS
-            // trigger, and delete-aware search/recall (deleted = 0 filter).
-            // Exposed via MemoryStore vtable + MemoryContext helpers. Also
-            // fixes the stale integration tests (v0.4.2 test-integration
-            // build was broken).
-            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.5.0.tar.gz",
-
-            .hash = "agent_memory-0.5.0-yf36fsNlnQDwhE16OHwexQw2C4NxB7Md1jcgiXctl_kK",
+            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.5.1).
+            // v0.5.0 adds L1 memory deletion: deleteL1 (soft by default /
+            // hard opt-in), restoreL1, purgeDeletedL1, a `deleted` column
+            // with in-place ALTER TABLE migration of existing databases, a
+            // content-guarded l1_au FTS trigger, and delete-aware
+            // search/recall (deleted = 0 filter). Exposed via MemoryStore
+            // vtable + MemoryContext helpers. v0.5.1 is the follow-up
+            // refactor (shared execRecordStatement for delete/restore) —
+            // behavior-preserving, same API.
+            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.5.1.tar.gz",
+            .hash = "agent_memory-0.5.0-yf36fk5mnQBWhXALo2RH-lQdZHQliXiASDdAg69RMwAs",
         },
         .franky_box = .{
             // v0.6.1 (from the original fr12k/franky-box repo) — on top of
