@@ -7,7 +7,8 @@
 //! Covers:
 //! - save → search (results include the [id: ...] field)
 //! - delete (soft) → hidden from search, "no live memory" on second delete
-//! - delete (hard) → "no live memory" on restore-attempt via save+delete
+//! - delete is always soft — an explicit `hard: true` arg is ignored,
+//!   the row stays restorable via the operator-level store API
 //! - unknown id → clear non-error message
 //! - finalizeToolSet registers all three memory tools when memory is on
 
@@ -100,7 +101,7 @@ test "memory tools: save → search shows id → soft delete → gone" {
     const del_args = try std.fmt.bufPrint(&buf, "{{\"record_id\": \"{s}\"}}", .{record_id});
     const del_text = try runTool(&delete_tool, allocator, io, del_args);
     defer allocator.free(del_text);
-    try testing.expect(std.mem.indexOf(u8, del_text, "Soft-deleted memory") != null);
+    try testing.expect(std.mem.indexOf(u8, del_text, "Deleted memory") != null);
 
     // 4. Search — no longer visible.
     const search2_text = try runTool(&search_tool, allocator, io,
@@ -115,7 +116,7 @@ test "memory tools: save → search shows id → soft delete → gone" {
     try testing.expect(std.mem.indexOf(u8, del2_text, "No live memory found") != null);
 }
 
-test "memory tools: hard delete is irreversible" {
+test "memory tools: agent delete is always soft — hard arg is ignored" {
     const allocator = testing.allocator;
     var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
@@ -153,24 +154,38 @@ test "memory tools: hard delete is irreversible" {
     const id_end = std.mem.indexOfPos(u8, search_text, id_start, "] ").?;
     const record_id = search_text[id_start..id_end];
 
-    // Hard delete.
+    // Delete with an explicit `hard: true` — the tool must IGNORE it and
+    // only soft-delete. (Hard delete is not exposed to the agent.)
     var buf: [256]u8 = undefined;
     const del_args = try std.fmt.bufPrint(&buf, "{{\"record_id\": \"{s}\", \"hard\": true}}", .{record_id});
     const del_text = try runTool(&delete_tool, allocator, io, del_args);
     defer allocator.free(del_text);
-    try testing.expect(std.mem.indexOf(u8, del_text, "Permanently deleted") != null);
+    try testing.expect(std.mem.indexOf(u8, del_text, "Deleted memory") != null);
+    try testing.expect(std.mem.indexOf(u8, del_text, "Permanently deleted") == null);
 
-    // Second hard delete → not found.
-    const del2_text = try runTool(&delete_tool, allocator, io, del_args);
-    defer allocator.free(del2_text);
-    try testing.expect(std.mem.indexOf(u8, del2_text, "No live memory found") != null);
-
-    // Search → gone.
+    // Hidden from search.
     const search2_text = try runTool(&search_tool, allocator, io,
         \\{"query": "SQLite"}
     );
     defer allocator.free(search2_text);
     try testing.expect(std.mem.indexOf(u8, search2_text, "No memories found") != null);
+
+    // Second delete → not found (no live row).
+    const del2_text = try runTool(&delete_tool, allocator, io, del_args);
+    defer allocator.free(del2_text);
+    try testing.expect(std.mem.indexOf(u8, del2_text, "No live memory found") != null);
+
+    // The row is still SOFT-deleted at the store level — restorable by the
+    // operator API (proof the agent cannot irreversibly destroy it).
+    const restored = try state.ctx.restore(record_id);
+    try testing.expect(restored);
+
+    // …and back in search results.
+    const search3_text = try runTool(&search_tool, allocator, io,
+        \\{"query": "SQLite"}
+    );
+    defer allocator.free(search3_text);
+    try testing.expect(std.mem.indexOf(u8, search3_text, "User uses SQLite for tests") != null);
 }
 
 test "memory tools: unknown id and invalid args return clear errors" {

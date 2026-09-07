@@ -4,14 +4,18 @@
 //! superseded. This is the deletion counterpart to memory_save: without a
 //! delete path, stale memories keep getting recalled forever.
 //!
-//! Deletion is SOFT by default (agent_memory v0.5.0): the record stops
-//! appearing in search/recall but the row is kept and can be restored.
-//! Pass hard=true for a permanent, irreversible removal.
+//! Deletion is ALWAYS SOFT (agent_memory v0.5.0): the record stops
+//! appearing in search/recall but the row is kept and can be recovered
+//! (store-level `restoreL1`, or simply saving the same fact again). The
+//! agent has no hard-delete capability — irreversible removal is an
+//! operator-level store API (`deleteL1(.{ .soft = false })`,
+//! `purgeDeletedL1`), deliberately not exposed as a tool: an autonomous
+//! agent must never be able to irreversibly destroy user memories.
 //!
 //! The agent deletes by record_id — the id memory_search returns — so
 //! deletion is by reference, never by fuzzy content matching.
 //!
-//! Schema: `{record_id, hard?}`.
+//! Schema: `{record_id}`.
 
 const std = @import("std");
 const ct = @import("../types.zig");
@@ -19,7 +23,6 @@ const at = ct.agent.types;
 const ai = ct.ai;
 const common = @import("common.zig");
 const memory_mod = @import("../memory.zig");
-const agent_memory = @import("agent_memory");
 
 pub const parameters_json: []const u8 =
     \\{
@@ -29,11 +32,6 @@ pub const parameters_json: []const u8 =
     \\    "record_id": {
     \\      "type": "string",
     \\      "description": "ID of the memory to delete, exactly as returned by memory_search (the [id: ...] field)"
-    \\    },
-    \\    "hard": {
-    \\      "type": "boolean",
-    \\      "description": "Permanently remove the memory (irreversible). Default false = soft delete: hidden from search/recall but recoverable.",
-    \\      "default": false
     \\    }
     \\  }
     \\}
@@ -46,11 +44,10 @@ pub fn tool(ctx: *memory_mod.MemoryState) at.AgentTool {
         .description = "Delete a memory from persistent memory. Use this when a memory " ++
             "is outdated, incorrect, or superseded — a stale memory that keeps " ++
             "getting recalled is worse than no memory. Pass the record_id exactly " ++
-            "as returned by memory_search. Deletion is soft by default (the memory " ++
-            "stops appearing in search and recall but can be restored); set " ++
-            "hard=true to permanently remove it. Do NOT delete a memory just " ++
-            "because it is currently not relevant — only delete memories that are " ++
-            "wrong, superseded, or explicitly unwanted.",
+            "as returned by memory_search. Deletion is soft: the memory stops " ++
+            "appearing in search and recall but is not permanently erased. " ++
+            "Do NOT delete a memory just because it is currently not relevant — " ++
+            "only delete memories that are wrong, superseded, or explicitly unwanted.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @ptrCast(ctx),
@@ -86,17 +83,9 @@ fn execute(
     const record_id = id_val.string;
     if (record_id.len == 0) return common.toolError(allocator, "invalid_args", "'record_id' must not be empty");
 
-    const hard: bool = if (root.object.get("hard")) |v| blk: {
-        // Be strict for booleans: anything that is not JSON true/false is
-        // treated as the default (soft) rather than guessed.
-        if (v == .bool) break :blk v.bool;
-        break :blk false;
-    } else false;
-
-    // Delete via MemoryContext (delegates through the store vtable).
-    // Soft by default; hard only when explicitly requested.
-    const options = agent_memory.DeleteOptions{ .soft = !hard };
-    const deleted = ctx.ctx.store.deleteL1(record_id, options, ctx.ctx.iso) catch |e| {
+    // Soft delete only — MemoryContext.delete always passes
+    // DeleteOptions{ .soft = true }. Hard delete is not exposed to the agent.
+    const deleted = ctx.ctx.delete(record_id) catch |e| {
         return common.toolError(allocator, "delete_failed", @errorName(e));
     };
 
@@ -116,14 +105,11 @@ fn execute(
     }
 
     // Confirm to the agent.
-    const text = if (hard)
-        try std.fmt.allocPrint(allocator, "Permanently deleted memory {s} (irreversible).", .{record_id})
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "Soft-deleted memory {s} (hidden from search/recall; recoverable by saving the same fact again).",
-            .{record_id},
-        );
+    const text = try std.fmt.allocPrint(
+        allocator,
+        "Deleted memory {s} (hidden from search/recall; recoverable by saving the same fact again).",
+        .{record_id},
+    );
     const content_arr = try allocator.alloc(ai.types.ContentBlock, 1);
     content_arr[0] = .{ .text = .{ .text = text } };
     return .{ .content = content_arr };

@@ -1673,8 +1673,8 @@ pub fn buildSystemPromptIo(
             "  - Self-contained: makes sense without conversation context\n" ++
             "  - User or AI centric: the subject is \"User\" or \"AI\"\n\n" ++
             "- **memory_delete**: Delete a memory that is wrong, outdated, or superseded,\n" ++
-            "  by the [id: ...] from memory_search. Deletion is soft by default\n" ++
-            "  (recoverable); pass hard=true only for permanent removal. Never delete\n" ++
+            "  by the [id: ...] from memory_search. Deletion is soft: the memory stops\n" ++
+            "  appearing in search and recall but can be recovered. Never delete\n" ++
             "  a memory just because it is currently not relevant — stale memories are\n" ++
             "  the problem, not topical ones.\n\n" ++
             "When you finish a task, consider whether anything worth remembering happened.\n" ++
