@@ -25,10 +25,7 @@
             // Exposed via MemoryStore vtable + MemoryContext helpers. Also
             // fixes the stale integration tests (v0.4.2 test-integration
             // build was broken).
-            .url = "https://github.com/franky-agent/franky-memory/archive/refs/tags/v0.5.0.tar.gz",
-            // NOTE: fork URL — upstream PR fr12k/franky-memory#25 is pending merge.
-            // After it merges, upstream CI tags v0.5.0 with identical content and
-            // this URL flips to github.com/fr12k/franky-memory (hash unchanged).
+            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.5.0.tar.gz",
 
             .hash = "agent_memory-0.5.0-yf36fsNlnQDwhE16OHwexQw2C4NxB7Md1jcgiXctl_kK",
         },
