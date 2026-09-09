@@ -6,8 +6,15 @@
     <title>franky</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/prism-tomorrow.css">
+    <script src="/htmx.min.js"></script>
+    <script src="/hx-sse.min.js"></script>
 </head>
 <body>
+    <!-- hx-sse: persistent SSE connection. htmx processes unnamed events
+         (OOB HTML swaps) and named events (hx-on) from this stream. -->
+    <div hx-sse:connect="/events" hx-swap="none" id="sse-conn"></div>
+    <!-- OOB target for permission modals (tool_permission_request) -->
+    <div id="permission-modal"></div>
     <header>
         <button id="sidebar-toggle" type="button" aria-label="Toggle sidebar" title="Toggle sidebar">☰</button>
         <h1>franky</h1>

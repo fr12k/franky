@@ -348,3 +348,18 @@ pub fn renderFrame(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
     const kind = @tagName(ev);
     return std.fmt.allocPrint(allocator, "event: {s}\ndata: {s}\n\n", .{ kind, json });
 }
+
+/// Render one `AgentEvent` as an SSE frame for the htmx hx-sse UI.
+/// Named events (lifecycle + text deltas) keep the `event: kind\n`
+/// prefix so the client can handle them via `hx-on`. Content events
+/// are unnamed (`data: ...\n\n`) carrying HTML with `hx-swap-oob`
+/// that htmx swaps into targets automatically. Owned by the caller.
+pub fn renderFrameHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
+    const body = try wire.encodeEventHtml(allocator, ev);
+    defer allocator.free(body);
+    if (wire.isNamedHtmlEvent(ev)) {
+        const kind = @tagName(ev);
+        return std.fmt.allocPrint(allocator, "event: {s}\ndata: {s}\n\n", .{ kind, body });
+    }
+    return std.fmt.allocPrint(allocator, "data: {s}\n\n", .{body});
+}
