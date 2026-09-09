@@ -308,6 +308,8 @@ const replay_ring_capacity: usize = 4096;
 const ReplayEvent = struct {
     id: u64,
     frame: []u8,
+    /// Optional HTML-mode frame (htmx hx-sse). See sse.zig ReplayEvent.
+    html_frame: ?[]u8 = null,
 };
 
 /// Per-connection SSE writer (one slot per `/events` subscriber).
@@ -326,6 +328,9 @@ const SseSubscriber = struct {
     /// leak on half-close / network blip. Can be set to `false` in tests
     /// that use an undefined stream.
     shutdown_on_close: bool = true,
+    /// When true, the subscriber receives htmx hx-sse HTML frames
+    /// instead of JSON frames. Set by GET /events?html=1.
+    html_mode: bool = false,
 
     fn close(sub: *SseSubscriber) void {
         sub.closed.store(true, .release);
@@ -508,7 +513,10 @@ pub const Session = struct {
         restart_mod.deinit(self.allocator);
         // v1.16.0 — release any retained replay frames.
         for (self.replay_ring[0..]) |maybe| {
-            if (maybe) |entry| self.allocator.free(entry.frame);
+            if (maybe) |entry| {
+                self.allocator.free(entry.frame);
+                if (entry.html_frame) |hf| self.allocator.free(hf);
+            }
         }
     }
 
@@ -567,18 +575,20 @@ pub const Session = struct {
     fn broadcastFrame(self: *Session, frame: []const u8) void {
         self.events_mutex.lockUncancelable(self.io);
         defer self.events_mutex.unlock(self.io);
-        self.fanOutLocked(frame);
+        self.fanOutLocked(frame, null);
     }
 
     /// Caller must hold `events_mutex`. Writes `frame` to every
     /// live subscriber; failed writes flag the subscriber closed.
-    fn fanOutLocked(self: *Session, frame: []const u8) void {
+    /// `html_frame` is sent to HTML-mode subscribers when non-null.
+    fn fanOutLocked(self: *Session, frame: []const u8, html_frame: ?[]const u8) void {
         for (self.subs[0..]) |maybe| {
             const sub = maybe orelse continue;
             if (sub.closed.load(.acquire)) continue;
+            const f = if (sub.html_mode and html_frame != null) html_frame.? else frame;
             var buf: [256]u8 = undefined;
             var w = sub.stream.writer(sub.io, &buf);
-            w.interface.writeAll(frame) catch {
+            w.interface.writeAll(f) catch {
                 sub.close();
                 continue;
             };
@@ -600,42 +610,59 @@ pub const Session = struct {
     /// Keepalive `ping`s should NOT — they're stateless heartbeats
     /// and replaying old ones is meaningless.
     fn broadcastEvent(self: *Session, allocator: std.mem.Allocator, frame_body: []const u8) void {
+        self.broadcastEventImpl(allocator, frame_body, null);
+    }
+
+    /// Like `broadcastEvent`, but also stamps an HTML-mode frame for
+    /// htmx hx-sse subscribers. Both are stored in the replay ring.
+    fn broadcastEventDual(self: *Session, allocator: std.mem.Allocator, frame_body: []const u8, html_frame_body: []const u8) void {
+        self.broadcastEventImpl(allocator, frame_body, html_frame_body);
+    }
+
+    /// True when at least one live subscriber is in HTML mode (htmx).
+    fn hasHtmlSubscriber(self: *Session) bool {
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
+        for (self.subs[0..]) |maybe| {
+            if (maybe) |sub| if (sub.html_mode and !sub.closed.load(.acquire)) return true;
+        }
+        return false;
+    }
+
+    fn broadcastEventImpl(self: *Session, allocator: std.mem.Allocator, frame_body: []const u8, html_frame_body: ?[]const u8) void {
         self.events_mutex.lockUncancelable(self.io);
         defer self.events_mutex.unlock(self.io);
 
         const id = self.next_event_id;
         self.next_event_id += 1;
 
-        // Pre-size the stamped buffer in one allocation. Going through
-        // `fmt.allocPrint` here used to cost an alloc + a remap per
-        // call (initCapacity is small, the format result overflows it),
-        // which dominated allocator traffic on tests that broadcast
-        // through the ring. `bufPrint` for the id header is bounded
-        // (u64 → at most 20 digits + "id: \n").
         var id_buf: [32]u8 = undefined;
         const id_str = std.fmt.bufPrint(&id_buf, "id: {d}\n", .{id}) catch unreachable;
         const stamped = allocator.alloc(u8, id_str.len + frame_body.len) catch {
-            // Allocation failed — give up on storing this event,
-            // but still try to fan out the unstamped frame so live
-            // subscribers don't miss it. Future reconnects after
-            // this point will see a `replay_gap` if they last
-            // received an id ≥ this one's predecessor.
-            self.fanOutLocked(frame_body);
+            self.fanOutLocked(frame_body, html_frame_body);
             return;
         };
         @memcpy(stamped[0..id_str.len], id_str);
         @memcpy(stamped[id_str.len..], frame_body);
 
-        // `id` is u64 but replay_ring is indexed by usize. The
-        // modulus is bounded by replay_ring_capacity, so the
-        // narrow cast is always safe.
+        const stamped_html: ?[]u8 = blk: {
+            if (html_frame_body) |hfb| {
+                const sh = allocator.alloc(u8, id_str.len + hfb.len) catch break :blk null;
+                @memcpy(sh[0..id_str.len], id_str);
+                @memcpy(sh[id_str.len..], hfb);
+                break :blk sh;
+            }
+            break :blk null;
+        };
+
         const slot: usize = @intCast(id % replay_ring_capacity);
         if (self.replay_ring[slot]) |old| {
             self.allocator.free(old.frame);
+            if (old.html_frame) |hf| self.allocator.free(hf);
         }
-        self.replay_ring[slot] = .{ .id = id, .frame = stamped };
+        self.replay_ring[slot] = .{ .id = id, .frame = stamped, .html_frame = stamped_html };
 
-        self.fanOutLocked(stamped);
+        self.fanOutLocked(stamped, stamped_html);
     }
 };
 
@@ -1782,6 +1809,16 @@ fn subagentProgressForward(
         return;
     };
     defer allocator.free(frame);
+    // Render the HTML frame too when an htmx subscriber is connected.
+    if (session.hasHtmlSubscriber()) {
+        const html_frame = sse_mod.renderFrameHtml(allocator, ev) catch null;
+        defer if (html_frame) |hf| allocator.free(hf);
+        if (html_frame) |hf| {
+            ev.deinit(allocator);
+            session.broadcastEventDual(allocator, frame, hf);
+            return;
+        }
+    }
     ev.deinit(allocator);
 
     session.broadcastEvent(allocator, frame);
@@ -1897,8 +1934,11 @@ fn handleConnection(arg: ConnArg) void {
             return;
         }
     }
-    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/events")) {
-        runSseStream(arg.session, &stream, arg.io, req.last_event_id orelse 0);
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/events")) {
+        // Detect ?html=1 to switch the SSE stream to htmx hx-sse mode
+        // (HTML frames with OOB swaps instead of JSON).
+        const html_mode = std.mem.indexOf(u8, req.path, "html=1") != null;
+        runSseStream(arg.session, &stream, arg.io, req.last_event_id orelse 0, html_mode);
         return;
     }
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/prompt")) {
@@ -1961,6 +2001,9 @@ fn runSseStream(
     /// id > last_event_id are written to this socket before the
     /// subscriber registers for live broadcast.
     last_event_id: u64,
+    /// htmx hx-sse mode: when true, the subscriber receives HTML
+    /// frames (renderFrameHtml) instead of JSON frames.
+    html_mode: bool,
 ) void {
     // Send the SSE preamble.
     const preamble =
@@ -1976,7 +2019,7 @@ fn runSseStream(
     pw.interface.writeAll(preamble) catch return;
     pw.interface.flush() catch return;
 
-    var sub = SseSubscriber{ .stream = stream.*, .io = io };
+    var sub = SseSubscriber{ .stream = stream.*, .io = io, .html_mode = html_mode };
 
     // v1.16.0 — replay missed events under `events_mutex` so a
     // broadcast can't slip an event between the last replayed
@@ -2014,7 +2057,11 @@ fn runSseStream(
                 // Cast bounded by replay_ring_capacity (256); always safe.
                 const slot: usize = @intCast(i % replay_ring_capacity);
                 if (session.replay_ring[slot]) |entry| {
-                    if (entry.id == i) writeReplayFrame(&sub, entry.frame);
+                    if (entry.id == i) {
+                        // Send the HTML frame to HTML-mode subscribers.
+                        const f = if (sub.html_mode and entry.html_frame != null) entry.html_frame.? else entry.frame;
+                        writeReplayFrame(&sub, f);
+                    }
                 }
                 if (sub.closed.load(.acquire)) break;
             }
@@ -2338,8 +2385,19 @@ fn runOneTurnInternal(
             continue;
         };
         defer allocator.free(frame);
-        // v1.16.0 — replay-eligible: stamp id, push to ring, fan out.
-        session.broadcastEvent(allocator, frame);
+        // Render the HTML frame too when an htmx subscriber is connected.
+        // The frame is rendered before ev.deinit frees owned strings.
+        if (session.hasHtmlSubscriber()) {
+            const html_frame = sse_mod.renderFrameHtml(allocator, ev) catch null;
+            defer if (html_frame) |hf| allocator.free(hf);
+            if (html_frame) |hf| {
+                session.broadcastEventDual(allocator, frame, hf);
+            } else {
+                session.broadcastEvent(allocator, frame);
+            }
+        } else {
+            session.broadcastEvent(allocator, frame);
+        }
         ev.deinit(allocator);
     }
 
