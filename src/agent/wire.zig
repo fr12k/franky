@@ -153,6 +153,176 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
     return try buf.toOwnedSlice(allocator);
 }
 
+/// HTML-escape `s` into `buf`. Replaces the browser-side `escapeHtml`
+/// for all server-rendered fragments. Escapes &, <, >, ", '.
+fn appendHtmlEsc(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '&' => try buf.appendSlice(allocator, "&amp;"),
+        '<' => try buf.appendSlice(allocator, "&lt;"),
+        '>' => try buf.appendSlice(allocator, "&gt;"),
+        '"' => try buf.appendSlice(allocator, "&quot;"),
+        '\'' => try buf.appendSlice(allocator, "&#39;"),
+        else => try buf.append(allocator, c),
+    };
+}
+
+/// Encode `ev` as an HTML fragment (for hx-sse OOB swaps) or a JSON
+/// payload (for named lifecycle events handled via `hx-on`). Returns
+/// the fragment body (without SSE framing); the caller wraps it in
+/// `data: ...\n\n` (unnamed, OOB) or `event: kind\ndata: ...\n\n`
+/// (named, lifecycle). See `sse.renderFrameHtml`.
+///
+/// Strategy (Phase 1, Option B):
+///   - Lifecycle events (turn_start/end, agent_error/interrupted,
+///     provider_retry, ping) stay JSON named events (small payloads,
+///     handled by `hx-on` on the client).
+///   - Content events (message_start/end, tool_execution_*,
+///     tool_permission_request, thinking/toolcall deltas) become
+///     HTML fragments with `hx-swap-oob` targeting stable element IDs.
+///   - Text deltas (`message_update` .text) stay JSON named events —
+///     the client-side markdown renderer accumulates and re-renders
+///     (Option B; Phase 2 may move this server-side).
+pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    switch (ev) {
+        // ── Lifecycle: named JSON events (client handles via hx-on) ──
+        .turn_start, .turn_end, .agent_interrupted => {
+            // These carry no payload; the event name is enough.
+            try buf.appendSlice(allocator, "{}");
+        },
+        .agent_error => |d| {
+            // Keep JSON so the client can read code/message/isFatal.
+            try buf.appendSlice(allocator, "{\"code\":");
+            try appendJsonStr(&buf, allocator, d.code.toString());
+            try buf.appendSlice(allocator, ",\"message\":");
+            try appendJsonStr(&buf, allocator, d.message);
+            if (!d.is_fatal) try buf.appendSlice(allocator, ",\"isFatal\":false");
+            try buf.appendSlice(allocator, "}");
+        },
+        .provider_retry => |r| {
+            try buf.appendSlice(allocator, "{\"attempt\":");
+            try appendJsonInt(&buf, allocator, @intCast(r.attempt));
+            try buf.appendSlice(allocator, ",\"reason\":");
+            try appendJsonStr(&buf, allocator, @tagName(r.reason));
+            try buf.appendSlice(allocator, "}");
+        },
+
+        // ── Text deltas: named JSON (client-side markdown render, Option B) ──
+        .message_update => |m| switch (m) {
+            .text => |t| {
+                try buf.appendSlice(allocator, "{\"deltaKind\":\"text\",\"blockIndex\":");
+                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
+                try buf.appendSlice(allocator, ",\"delta\":");
+                try appendJsonStr(&buf, allocator, t.delta);
+                try buf.appendSlice(allocator, "}");
+            },
+            // thinking + toolcall_args: OOB HTML append into the block.
+            .thinking => |t| {
+                try buf.appendSlice(allocator, "<div id=\"thinking-");
+                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
+                try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"thinking-delta\">");
+                try appendHtmlEsc(&buf, allocator, t.delta);
+                try buf.appendSlice(allocator, "</div>");
+            },
+            .toolcall_args => |t| {
+                try buf.appendSlice(allocator, "<span id=\"toolcall-args-");
+                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
+                try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"toolcall-args-delta\">");
+                try appendHtmlEsc(&buf, allocator, t.delta);
+                try buf.appendSlice(allocator, "</span>");
+            },
+        },
+
+        // ── Content: OOB HTML fragments ──
+        .message_start => |s| {
+            // Open the assistant message container.
+            try buf.appendSlice(allocator, "<div class=\"msg msg-");
+            try appendHtmlEsc(&buf, allocator, roleName(s.role));
+            try buf.appendSlice(allocator, "\"></div>");
+        },
+        .message_end => {
+            // Finalize the message container.
+            try buf.appendSlice(allocator, "</div><!-- msg-end -->");
+        },
+        .tool_execution_start => |s| {
+            try buf.appendSlice(allocator, "<div class=\"tool-card\" id=\"tool-");
+            try appendHtmlEsc(&buf, allocator, s.call_id);
+            try buf.appendSlice(allocator, "\"><div class=\"tool-head\"><span class=\"tool-name\">");
+            try appendHtmlEsc(&buf, allocator, s.name);
+            try buf.appendSlice(allocator, "</span></div><div class=\"tool-args\"><code>");
+            try appendHtmlEsc(&buf, allocator, s.args_json);
+            try buf.appendSlice(allocator, "</code></div></div>");
+        },
+        .tool_execution_update => |u| {
+            // Append to the sub-agent log inside the tool card.
+            try buf.appendSlice(allocator, "<div id=\"subagent-log-");
+            try appendHtmlEsc(&buf, allocator, u.call_id);
+            try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"subagent-entry\">");
+            try appendHtmlEsc(&buf, allocator, u.update_json);
+            try buf.appendSlice(allocator, "</div>");
+        },
+        .tool_execution_end => |e| {
+            // Re-render the full tool card with the result.
+            try buf.appendSlice(allocator, "<div class=\"tool-card");
+            if (e.result.is_error) try buf.appendSlice(allocator, " tool-card-error");
+            try buf.appendSlice(allocator, "\" id=\"tool-");
+            try appendHtmlEsc(&buf, allocator, e.call_id);
+            try buf.appendSlice(allocator, "\"><div class=\"tool-head\"><span class=\"tool-name\">");
+            // Tool name not carried in tool_execution_end; omit.
+            try buf.appendSlice(allocator, "</span></div><div class=\"tool-result\"><pre>");
+            var combined: std.ArrayListUnmanaged(u8) = .empty;
+            defer combined.deinit(allocator);
+            for (e.result.content) |cb| {
+                if (cb == .text) try combined.appendSlice(allocator, cb.text.text);
+            }
+            try appendHtmlEsc(&buf, allocator, combined.items);
+            try buf.appendSlice(allocator, "</pre></div></div>");
+        },
+        .tool_permission_request => |r| {
+            try buf.appendSlice(allocator, "<div id=\"permission-modal\" hx-swap-oob=\"true\" class=\"permission-modal\">");
+            try buf.appendSlice(allocator, "<div class=\"permission-card\"><h3>Permission required</h3>");
+            try buf.appendSlice(allocator, "<p>Tool: <code>");
+            try appendHtmlEsc(&buf, allocator, r.tool_name);
+            try buf.appendSlice(allocator, "</code></p><p>Args: <code>");
+            try appendHtmlEsc(&buf, allocator, r.args_json);
+            try buf.appendSlice(allocator, "</code></p>");
+            try buf.appendSlice(allocator, "<form hx-post=\"/permission/resolve\" hx-target=\"#permission-modal\" hx-swap=\"outerHTML\">");
+            try buf.appendSlice(allocator, "<input type=\"hidden\" name=\"callId\" value=\"");
+            try appendHtmlEsc(&buf, allocator, r.call_id);
+            try buf.appendSlice(allocator, "\" />");
+            try buf.appendSlice(allocator, "<button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>");
+            try buf.appendSlice(allocator, "<button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>");
+            try buf.appendSlice(allocator, "</form></div></div>");
+        },
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Whether `ev` should be sent as a named SSE event (JSON payload,
+/// client handles via `hx-on`) vs an unnamed event (HTML fragment,
+/// htmx processes OOB swaps). Lifecycle + text-delta events are
+/// named; content events are unnamed.
+pub fn isNamedHtmlEvent(ev: at.AgentEvent) bool {
+    return switch (ev) {
+        .turn_start,
+        .turn_end,
+        .agent_interrupted,
+        .agent_error,
+        .provider_retry,
+        .message_update, // text deltas stay JSON (Option B)
+        => true,
+        .message_start,
+        .message_end,
+        .tool_execution_start,
+        .tool_execution_end,
+        .tool_execution_update,
+        .tool_permission_request,
+        => false,
+    };
+}
+
 fn roleName(r: ai_types.Role) []const u8 {
     return switch (r) {
         .user => "user",

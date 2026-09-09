@@ -91,6 +91,8 @@ const web_app_js = @embedFile("web/app.js");
 const web_style_css = @embedFile("web/style.css");
 const web_prism_js = @embedFile("web/prism.js");
 const web_prism_css = @embedFile("web/prism-tomorrow.css");
+const web_htmx_js = @embedFile("web/htmx.min.js");
+const web_hx_sse_js = @embedFile("web/hx-sse.min.js");
 
 pub const RunError = error{
     BindFailed,
@@ -1934,6 +1936,14 @@ fn handleConnection(arg: ConnArg) void {
         }
         if (std.mem.eql(u8, req.path, "/prism-tomorrow.css")) {
             respondAsset(&stream, arg.io, web_prism_css, "text/css; charset=utf-8");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/htmx.min.js")) {
+            respondAsset(&stream, arg.io, web_htmx_js, "text/javascript; charset=utf-8");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/hx-sse.min.js")) {
+            respondAsset(&stream, arg.io, web_hx_sse_js, "text/javascript; charset=utf-8");
             return;
         }
     }
