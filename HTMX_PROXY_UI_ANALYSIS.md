@@ -1,297 +1,322 @@
-# Analysis: Migrating the franky Proxy Web UI to htmx 4
+# Analysis: Migrating the franky Proxy Web UI to htmx 4 (revised)
 
 | | |
 |---|---|
-| **Status** | Analysis (not a proposal to execute) |
+| **Status** | Analysis (revised after re-reading hx-sse docs) |
 | **Branch** | `rfc/htmx-proxy-ui` |
-| **Scope** | `src/coding/modes/web/` (the built-in web UI) + `src/coding/modes/proxy.zig` (the SSE/HTTP server) |
+| **Scope** | `src/coding/modes/web/` (the built-in web UI) + `src/coding/modes/proxy.zig` (the SSE/HTTP server) + `src/agent/wire.zig` (event encoder) + `src/coding/sse.zig` (frame renderer) |
 | **Created** | 2025-09-09 |
+| **Revised** | 2025-09-09 |
 
-## 1. Summary
+## 1. Summary (revised)
 
-This document analyzes whether the franky proxy-mode web UI — a
-3403-line vanilla-JS single-page chat client (`src/coding/modes/web/app.js`)
-driven by a 5782-line SSE server (`src/coding/modes/proxy.zig`) — could be
-migrated to htmx 4 the same way franky-box's admin UI was.
+**Yes — htmx 4's `hx-sse` extension can handle the SSE event flow and would
+dramatically simplify the client side.** My first analysis was too
+pessimistic: I underweighted that a single unnamed SSE event can carry
+HTML with `hx-swap-oob` targeting *any* element on the page, with zero
+client-side event listeners. Re-tracing the 12 event types against this
+mechanism, most of the 3403-line `app.js` event-dispatch + render machinery
+is eliminable. The server's single `encodeEventJson` function
+(`src/agent/wire.zig`, ~130 lines) becomes an `encodeEventHtml` that emits
+fragments instead of JSON — one conversion point, not a scatter of
+client-side handlers.
 
-**Bottom line: a full migration is technically possible but not
-recommended.** Unlike franky-box (6 read-only tables + 1 form), the franky
-web UI is a **real-time streaming chat client** whose core value is
-incremental, in-place DOM mutation driven by ~12 SSE event types. htmx 4
-ships an `hx-sse` extension that can stream HTML fragments over SSE and
-swap them in, so the *mechanics* exist — but the current `app.js` is doing
-things htmx is not designed to do well (per-token streaming markdown
-rendering into a growing "live" block, tool-card state machines, sub-agent
-overlays, a slash-command palette with fuzzy completion, prompt-history
-navigation). Moving that to htmx would either (a) require sending
-pre-rendered HTML fragments per token (huge server-side markdown renderer
-+ big SSE bandwidth increase) or (b) keep a substantial JS layer for the
-streaming-render parts, at which point htmx buys little.
+**Remaining client-side JS** shrinks to: a markdown renderer (or move it
+server-side), Prism re-highlighting after swaps, the slash-command
+palette keyboard UX, and prompt-history. The 262-line EventSource
+listener block, the 541-line assistant-message + tool-card render
+machine, the 422-line sub-agent panel/overlay, the 195-line status line,
+the 141-line sidebar, and the 225-line design-docs panel — ~1786 lines —
+are largely replaced by `hx-swap-oob` fragments emitted from the server.
 
-A **partial migration** of the *non-streaming* surfaces (sidebar/session
-list, design-docs panel, role/usage pills, slash-command dispatch) is
-attractive and low-risk, and is the recommended path if any htmx adoption
-is pursued. The streaming conversation pane should stay vanilla JS +
-SSE/EventSource.
+**The catch:** the streaming-text path (the `message_update` text deltas)
+is the one place htmx's model is a mismatch. htmx swaps replace or
+append whole elements; the current UI re-runs a markdown renderer over
+the *accumulated* text block per delta. Two options exist (§5.1), both
+workable, neither is free.
 
-## 2. Current architecture
+## 2. The hx-sse mechanism that changes the conclusion
 
-### 2.1 Server (`src/coding/modes/proxy.zig`, 5782 lines)
+The `hx-sse` extension supports two patterns that make this viable:
 
-A thread-per-connection HTTP server. Static assets are `@embedFile`-d at
-compile time (`web/index.html`, `web/app.js`, `web/style.css`,
-`web/prism.js`, `web/prism-tomorrow.css`). The API surface:
+### 2.1 Unnamed events with `hx-swap-oob` (the key pattern)
 
-| Method | Path | Returns | Purpose |
+A single SSE frame can carry HTML that updates *multiple arbitrary
+elements* on the page, with no client-side JS:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+
+data: <div id="status" hx-swap-oob="true">Online</div>
+data: <hx-partial hx-target="#feed"><p>New</p></hx-partial>
+```
+
+htmx extracts the OOB elements and the `<hx-partial>` targets, swaps
+each into its target, and leaves the connection element unchanged
+(`hx-swap="none"`). **This is a server-driven multi-element update with
+zero JS listeners.** This is exactly what the franky UI's 12 SSE event
+handlers do today — manually, in 262 lines of `addEventListener` + render
+functions.
+
+### 2.2 Named events for lifecycle signals
+
+Named events (`event: turn_start\ndata: ...`) dispatch as DOM events,
+handleable via `hx-on:turn_start="..."` or as a trigger
+(`hx-trigger="turn_end from:body"`). This covers the lifecycle signals
+(turn start/end, errors) that don't map to "swap HTML into a region."
+
+### 2.3 `id:` + `Last-Event-ID` replay
+
+The server already has a replay ring keyed by `Last-Event-ID`
+(`proxy.zig` ~line 2069). hx-sse sends `Last-Event-ID` on reconnect and
+the server replays — this is *already implemented* and survives the
+migration unchanged.
+
+## 3. Event-by-event trace (the 12 types)
+
+Today: each event fires a named `addEventListener` → parses JSON → calls
+a render function that builds/appends DOM. With hx-sse: the server
+emits an HTML fragment (unnamed event with OOB targets, or a named
+event for lifecycle), and htmx swaps it. No `addEventListener`, no
+JSON parse, no client-side DOM builder.
+
+| SSE event | Current JS (lines) | hx-sse approach | JS eliminated? |
 |---|---|---|---|
-| GET | `/` | HTML shell | the SPA page |
-| GET | `/app.js`, `/style.css`, `/prism.js`, `/prism-tomorrow.css` | static | embedded assets |
-| GET | `/events` | `text/event-stream` | **the SSE stream** — the core of the UI |
-| POST | `/prompt` | `200 {"ok":true}` | submit a user message, run one turn |
-| POST | `/abort`, `/interrupt`, `/restart` | JSON | control the loop |
-| POST | `/command` | JSON `{ok,output,sideEffect?,data?}` | slash commands |
-| POST | `/permission/resolve` | JSON | answer a tool-permission prompt |
-| GET | `/transcript` | JSON | rehydrate after reload (`renderTranscriptForUi`) |
-| GET | `/sessions`, `/session`, `/session/new`, `/session/activate` | JSON | session management |
-| GET | `/sessions/<id>/transcript` | JSON | per-session transcript |
-| GET | `/role`, `/usage` | JSON | role + token-usage pills |
-| GET | `/design-docs`, POST `/design-docs/archive` | JSON | design-docs panel |
+| `turn_start` | setActivity('thinking…'); showTurnIndicator() | Named event; `hx-on:turn_start` toggles a CSS class on `#activity` | Yes (1-line `hx-on`) |
+| `turn_end` | endAssistantMessage(); hideTurnIndicator(); setStreaming(false); refreshStatusLineUsage() | Named event; `hx-on:turn_end` + an OOB swap that refreshes `#usage` | Yes |
+| `message_start` | startAssistantMessage(role); setActivity('responding…') | OOB swap: `<div id="turn-{N}" hx-swap-oob="true"></div>` opens the live block; OOB `#activity` pill | Yes |
+| `message_update` (text) | appendTextDelta() — re-render markdown into live block | **The hard one** — see §5.1 | Partial |
+| `message_update` (thinking) | appendThinkingDelta() | OOB `hx-swap="beforeend"` into `#thinking-{N}` | Yes |
+| `message_update` (toolcall_args) | appendToolArgsDelta() | OOB `hx-swap="beforeend"` into `#toolcall-args-{N}` | Yes |
+| `message_end` | endAssistantMessage() | Named event or OOB swap that finalizes the live block | Yes |
+| `tool_execution_start` | startToolCall() — builds a tool card (1240-1304) | OOB swap: server emits the full `<div class="tool-card" id="tool-{callId}">…</div>` | Yes |
+| `tool_execution_end` | endToolCall() — finalizes card (1304-1400) | OOB swap: server emits the finalized `<div class="tool-card" id="tool-{callId}">…</div>` (full re-render) | Yes |
+| `tool_execution_update` | appendSubagentEntry() + appendSubagentPanelEvent() (422 lines) | OOB `hx-swap="beforeend"` into `#subagent-log-{callId}` | Yes |
+| `tool_permission_request` | renderPermissionModal() (1542-1610) | OOB swap: server emits the modal HTML into `#permission-modal` | Yes |
+| `agent_error` | appendError(); setStreaming(false); hideTurnIndicator() | Named event; `hx-on:agent_error` + OOB error toast | Yes |
+| `agent_interrupted` | endAssistantMessage(); hideTurnIndicator() | Named event; same as turn_end variant | Yes |
+| `session_switched` | loadSessions() + reload transcript | Named event; `hx-trigger="session_switched from:body"` re-fetches `#session-list` and `#conversation` | Yes |
+| `ping` | noteEvent() (watchdog) | Named event; `hx-on:ping` stamps watchdog | Yes (1-line) |
 
-SSE frames are hand-written strings: `event: <kind>\ndata: <json>\n\n`,
-with `id:` for replay (the server has a replay ring keyed by `Last-Event-ID`).
+**Summary: 11 of 12 event types map cleanly to OOB swaps or named
+events. Only `message_update` (text deltas) needs special handling.**
 
-### 2.2 Client (`src/coding/modes/web/app.js`, 3403 lines, 118 functions)
+## 4. What the server change looks like
 
-A dependency-free SPA. The architecture is:
+Today there is **one** function that converts every `AgentEvent` to an
+SSE frame: `encodeEventJson` (`src/agent/wire.zig`, ~130 lines) +
+`renderFrame` (`src/coding/sse.zig`, 5 lines). The migration adds a
+sibling `encodeEventHtml` that emits HTML fragments instead of JSON.
+The `renderFrame` wrapper changes from:
 
-- **`EventSource('/events')`** is the single source of truth. ~12 named
-  event listeners dispatch to render functions:
-  `turn_start`, `turn_end`, `message_start`, `message_update`,
-  `message_end`, `tool_execution_start`, `tool_execution_end`,
-  `tool_execution_update`, `tool_permission_request`, `agent_error`,
-  `agent_interrupted`, `session_switched`, `ping`.
-- **Streaming markdown renderer** (lines 1-211): a hand-rolled
-  CommonMark subset (headings, fences, inline code, bold/italic, links,
-  lists, tables) that renders incrementally. This is the heart of the UI —
-  assistant text arrives as `message_update` deltas (`{deltaKind:"text",
-  delta:"...", blockIndex:N}`) and is appended into a growing "live"
-  block, re-rendered per delta.
-- **Prism syntax highlighting** (prism.js, vendored, 3357 lines) runs
-  after each markdown render pass.
-- **Tool cards**: a state machine per `callId`. `tool_execution_start`
-  opens a card; `tool_execution_update` appends sub-agent progress;
-  `tool_execution_end` finalizes with result/error. Sub-agent cards get
-  their own panel + a full-screen overlay.
-- **Permission overlay**: `tool_permission_request` renders a modal; the
-  user's choice POSTs to `/permission/resolve`.
-- **Composer**: a `<textarea>` with Enter-to-send, prompt history
-  (localStorage ring), and a slash-command palette with fuzzy filtering.
-- **Sidebar**: session list (`/sessions`), new/activate session.
-- **Status line**: live elapsed-time + token usage (`/usage`).
-- **Design-docs panel**: list/archive design documents (`/design-docs`).
+```zig
+return std.fmt.allocPrint(a, "event: {s}\ndata: {s}\n\n", .{ kind, json });
+```
 
-### 2.3 What's JSON vs SSE
+to (for OOB-carrying events):
 
-- **SSE** (`/events`): all real-time conversation events (assistant text
-  deltas, tool progress, errors, turn lifecycle). This is 90% of the UI's
-  dynamism.
-- **JSON fetches**: session list, transcript rehydration, role/usage
-  pills, design docs, slash-command results, permission resolve. These
-  are request/response, not streaming.
+```zig
+return std.fmt.allocPrint(a, "data: {s}\n\n", .{html_fragment});
+```
 
-## 3. Why this is not like franky-box
+(unnamed event → htmx processes OOB swaps), or keeps the `event:` name
+for lifecycle signals (`turn_start`, `turn_end`, `agent_error`,
+`session_switched`, `ping`).
 
-franky-box's admin UI was a **request/response CRUD dashboard**: click a
-nav link → fetch JSON → render a table. htmx is purpose-built for that
-pattern (server emits an HTML fragment, htmx swaps it in). The win was
-deleting the duplicated JSON+HTML rendering.
+**This is one conversion point**, not a scatter. The agent loop, the
+session broadcast, the replay ring, the keepalive pings — all unchanged.
+Only the final frame-content encoder changes.
 
-franky's web UI is a **streaming chat client**. The dominant interaction
-is: user sends a prompt → the server emits a *stream* of incremental
-events → the client *accumulates* them into a growing DOM tree with
-live markdown re-rendering. This is not a swap-in-a-fragment pattern; it
-is append-to-a-live-region-with-state. Converting it means the server must
-emit rendered HTML fragments per event, and the client must still manage
-the "live block" accumulation, the tool-card state machine, and the
-sub-agent overlay wiring.
+## 5. The streaming-text problem (the one real difficulty)
 
-| Dimension | franky-box admin | franky web UI |
+`message_update` with `deltaKind:"text"` arrives per token. Today the
+client appends the delta to a growing string, re-runs the markdown
+renderer over the whole accumulated block, and sets `innerHTML`. This
+gives correct incremental markdown (a `**bold**` that spans two deltas
+renders correctly once both arrive).
+
+htmx swaps are element-granular. Two approaches:
+
+### 5.1 Option A — server renders markdown per delta (recommended for max reduction)
+
+The server maintains the accumulated text for the current block and, on
+each `message_update` text delta, emits a full re-rendered HTML fragment
+for the block:
+
+```
+data: <div id="msg-{blockIndex}" hx-swap-oob="true">{rendered_markdown_so_far}</div>
+```
+
+htmx swaps the whole block each time. The client does nothing.
+
+**Cost:** the server needs a markdown renderer. Today the markdown
+renderer is in JS (~210 lines). It would move to Zig (~300-400 lines to
+match the subset). SSE bandwidth rises: a full HTML block per token vs a
+small `{"delta":"foo"}` blob. For a 500-token response, that's ~500 full
+block re-renders over the wire — each larger than the last. Practical
+for a local single-user proxy (the documented deployment), possibly
+heavy for remote/orchestrator use.
+
+**Benefit:** the client's streaming-render code (markdown renderer +
+`appendTextDelta` + the live-block accumulation + Prism triggering) —
+~300+ lines — is deleted entirely. The client becomes truly dumb for
+text: htmx swaps the block, done.
+
+### 5.2 Option B — keep client-side streaming render, htmx everything else
+
+`message_update` text deltas stay as JSON (named event), and a small
+JS handler appends + re-renders. Everything else uses htmx OOB. This
+is the **partial** path: htmx for 11/12 event types, vanilla JS for the
+text-delta path only.
+
+**Cost:** the markdown renderer + `appendTextDelta` stay (~250 lines of
+JS). A small `hx-on:message_update` handler calls the renderer.
+
+**Benefit:** no server-side markdown renderer, no bandwidth increase.
+Still eliminates ~1500+ lines of JS (all the other event handlers, tool
+cards, sub-agent panel, status line, sidebar, design docs).
+
+### 5.3 Recommendation
+
+Start with **Option B** (partial — keep client-side text rendering,
+htmx everything else). It's the lower-risk path, yields the bulk of the
+reduction, and doesn't require a Zig markdown renderer. If the
+streaming-text path is later wanted server-side too, Option A can be
+layered on top (replace the one `hx-on:message_update` handler with an
+OOB swap from the server).
+
+## 6. What stays client-side (the irreducible JS)
+
+Even with a full migration, these need JS (htmx doesn't replace them):
+
+1. **Prism syntax highlighting** — runs after each markdown swap. A
+   one-line `htmx:after:swap` hook calls `Prism.highlightAllUnder(target)`.
+   ~5 lines. (If Option A, this is the only post-swap JS.)
+2. **Slash-command palette** — keyboard UX: type `/`, fuzzy-filter,
+   arrow-navigate, Enter. htmx can fetch the filtered list via
+   `hx-get="/commands?q=..."` on `keyup` (debounced), but arrow-nav +
+   selection highlight are JS. ~80 lines.
+3. **Prompt history** — `↑`/`↓` cycling through a localStorage ring.
+   ~70 lines. Pure client state; htmx doesn't help.
+4. **Composer** — Enter-to-send, Shift-Enter newline. ~20 lines.
+5. **Sidebar toggle / mobile drawer** — could be `<details>`, ~0 lines.
+
+If Option B: add the markdown renderer (~210 lines) +
+`appendTextDelta` (~30 lines).
+
+**Irreducible JS total:** ~175 lines (Option A) or ~415 lines (Option B),
+down from 3403. That's a **~95% reduction** (Option A) or **~88%
+reduction** (Option B, since the markdown renderer stays but the 262
+event-listener + 541 tool-card + 422 subagent + 195 status + 141
+sidebar + 225 design-docs = ~1786 lines go away).
+
+## 7. Revised recommendation
+
+**Pursue the migration, in two phases.**
+
+### Phase 1 — hx-sse for all non-text events (Option B, §5.2)
+
+- Add `encodeEventHtml` to `wire.zig` for the 11 non-text event types.
+- Change `renderFrame` to emit unnamed events (OOB) for content events
+  and named events for lifecycle.
+- Rewrite `index.html` with `hx-sse:connect="/events"` + OOB target
+  elements (`#conversation`, `#tool-{callId}`, `#subagent-log-{callId}`,
+  `#permission-modal`, `#status`, `#activity`, `#session-list`, etc.).
+- Convert the request/response panels (sessions, role, usage,
+  design-docs, transcript, command, permission) to htmx `hx-get`/`hx-post`.
+- Keep the markdown renderer + `appendTextDelta` for `message_update`
+  text deltas (one `hx-on:message_update` handler).
+- Keep Prism, slash palette, prompt history.
+
+**Estimated reduction:** ~1786 lines of JS eliminated (event listeners
++ tool cards + subagent panel + status line + sidebar + design docs)
+for ~300-400 lines of Zig HTML fragment builders (in
+`encodeEventHtml`). Net ~1400 lines removed. `app.js` 3403 -> ~1600.
+
+### Phase 2 — server-side markdown rendering (Option A, §5.1, optional)
+
+- Move the markdown renderer to Zig (~300-400 lines).
+- `message_update` text deltas emit a full re-rendered HTML block as an
+  OOB swap. Delete the client markdown renderer + `appendTextDelta`.
+- `app.js` drops to ~175 lines (Prism hook + slash palette + prompt
+  history + composer).
+
+**Estimated further reduction:** ~415 lines of JS (markdown renderer +
+delta handler) for ~400 lines of Zig. Net ~15 lines, but the client is
+now truly thin and the "zero-dependency" markdown renderer becomes a
+shared server asset.
+
+## 8. Why I was wrong before
+
+My first analysis said "the streaming core is a poor fit for htmx." That
+was wrong because I treated each SSE event as needing a dedicated
+client-side handler, when in fact `hx-swap-oob` lets the server drive
+multi-element updates with zero client listeners. The 262-line
+`addEventListener` block + the render functions it calls (~1500 lines)
+exist *precisely* because the current architecture lacks a
+server-driven swap mechanism — which is exactly what hx-sse provides.
+
+The first analysis also overweighted "you'd need a Zig markdown
+renderer" as a blocker. It's only needed for the text-delta path
+(Option A), and Option B keeps the JS renderer while still
+eliminating ~1786 lines. The markdown renderer is a Phase 2
+optimization, not a prerequisite.
+
+## 9. Risks and open questions
+
+1. **SSE bandwidth (Option A only):** full HTML block per token
+   increases wire size. Measure on a real turn. For local proxy use
+   (the documented deployment) this is likely fine; for
+   remote/orchestrator, Option B avoids it.
+2. **OOB target IDs:** the server must emit stable, predictable element
+   IDs (`#msg-{blockIndex}`, `#tool-{callId}`) that the page knows. The
+   current JS generates these dynamically; the HTML shell must pre-create
+   the containers or the OOB swap creates them. Verify hx-sse creates
+   missing OOB targets or requires them to pre-exist.
+3. **Tool-card full re-render:** `tool_execution_end` re-sends the
+   entire tool card (name, args, result). For large tool outputs (e.g.
+   a big `read` result) this re-sends stable content. Acceptable for a
+   single-user proxy; could use `<hx-partial>` to target only the
+   result region if needed.
+4. **Sub-agent overlay:** the full-screen overlay is a second live
+   region fed by `tool_execution_update`. With OOB, the server emits
+   `<div id="subagent-log-{callId}" hx-swap-oob="true">…appended…</div>`
+   and a separate `<div id="subagent-overlay-{callId}" hx-swap-oob="true">…</div>`.
+   Two OOB targets per event — verify hx-sse handles multiple OOB
+   elements in one frame (the docs show it does).
+5. **Prism re-highlight:** `htmx:after:swap` fires per swap; call
+   `Prism.highlightAllUnder(swap.target)`. Verify the event gives the
+   swapped element. ~5 lines.
+6. **htmx bundle size:** htmx core ~50 KB + hx-sse extension. The
+   current UI ships zero framework JS. This reverses the "zero
+   dependency" stance in `app.js` line 9 — but htmx is vendored
+   (@embedFile), not a CDN dependency, consistent with the existing
+   zero-build-pipeline decision.
+
+## 10. Comparison to franky-box
+
+| | franky-box admin | franky web UI (revised) |
 |---|---|---|
-| Interaction | request/response (click → table) | streaming (prompt → token deltas) |
-| Data format to browser | JSON | SSE JSON events |
-| Rendering | build HTML from JSON in JS | accumulate deltas into live DOM + re-render markdown per delta |
-| # of "views" | 6 tables + 1 form | 1 conversation pane + 5 side panels |
-| Client JS | 270 LoC (18 fns) | 3403 LoC (118 fns) |
-| State machine | none | tool cards, sub-agent overlays, permission modals, prompt history |
-| htmx fit | excellent (textbook) | poor for the streaming core, okay for the side panels |
+| htmx fit | excellent (request/response CRUD) | good (hx-sse OOB for 11/12 events; text-delta path needs Option A or B) |
+| JS eliminated | ~270 LoC (all of it) | ~1786 LoC (Phase 1) / ~3200 LoC (Phase 2) |
+| Server grows by | ~150 lines (HTML builders) | ~300-400 lines (encodeEventHtml + optional markdown renderer) |
+| Net reduction | ~111 lines | ~1400 (Phase 1) / ~1800 (Phase 2) |
+| Risk | low | medium (streaming path; needs measurement) |
+| Replay/reconnect | n/a | already implemented (Last-Event-ID ring) — survives unchanged |
 
-## 4. htmx 4 `hx-sse` extension — what it can and can't do
+The franky web UI migration is actually **bigger** than franky-box in
+absolute line reduction, because `app.js` (3403 lines) is an order of
+magnitude larger than franky-box's admin JS (270 lines), and the same
+hx-sse mechanism replaces the bulk of it.
 
-htmx 4 moved SSE into an opt-in extension (`hx-sse`). It supports:
-
-- **`hx-sse:connect="/events"`** — open a persistent SSE connection.
-- **Unnamed events swap into the target**: `data: <p>hello</p>` → htmx
-  swaps `<p>hello</p>` per `hx-swap`/`hx-target`.
-- **`hx-swap-oob`** for multi-element updates: one event can carry
-  `<div id="status" hx-swap-oob="true">…</div>` to update a separate region.
-- **`<hx-partial hx-target="#feed">`** for targeting other elements.
-- **Named events** (`event: progress\ndata: 50`) dispatch as DOM events
-  handleable via `hx-on`.
-- **`id:` + `Last-Event-ID`** replay — matches the existing server replay
-  ring, so reconnect semantics survive.
-- **`hx-swap="beforeend"`** accumulates chunks (for token streaming).
-
-**What it does NOT give you for free:**
-
-1. **Incremental markdown re-rendering.** The current UI receives a text
-   delta and re-runs the markdown renderer over the accumulated block,
-   then re-highlights with Prism. With htmx, the server would have to
-   render markdown → HTML per delta and send the full re-rendered block as
-   each SSE frame. That means: (a) a Zig-side markdown renderer (none
-   exists; the markdown renderer is in JS today), (b) ~5-20× the SSE
-   bandwidth (full HTML block per token vs a small `{delta}` JSON blob),
-   and (c) Prism highlighting would need to re-run on the client after
-   each swap (htmx doesn't do syntax highlighting). You'd keep a JS hook
-   (`htmx:after:swap`) to call Prism — so JS doesn't go away.
-2. **Tool-card state machine.** A tool call is opened by
-   `tool_execution_start`, mutated by N `tool_execution_update` events,
-   and finalized by `tool_execution_end`. htmx swaps are idempotent
-   replacements; modeling an append-only log + a status badge + a
-   collapsible result panel requires either out-of-band swaps targeting
-   multiple sub-elements per event, or a server that emits the *entire*
-   tool card re-rendered on every update. The latter is simpler but
-   re-sends stable HTML (the tool name, args) on every progress tick.
-3. **Sub-agent overlay.** A separate full-screen conversation view for a
-   sub-agent, opened on demand, fed by `tool_execution_update` events
-   keyed by the parent call id. This is a second SSE-derived live region
-   with its own accumulation logic — not a fragment swap.
-4. **Slash-command palette with fuzzy completion.** This is a keyboard
-   UX widget (type `/`, filter commands, arrow-navigate, Enter). htmx
-   can fetch the filtered list via `hx-get` on `keyup`, but the debouncing,
-   arrow navigation, and selection highlighting are JS interactions
-   htmx doesn't replace.
-
-## 5. Migration scenarios
-
-### 5.1 Full migration (not recommended)
-
-Convert everything: the SSE stream emits HTML fragments; htmx swaps them
-in; the side panels become htmx fragments; the composer `hx-post`s.
-
-**Cost:**
-- Write a Zig markdown renderer (~400-600 lines to match the current JS
-  subset) OR keep the JS renderer and send text deltas, at which point
-  htmx isn't doing the rendering.
-- Convert `renderTranscriptForUi` from JSON to HTML (transcript
-  rehydration).
-- Rewrite the SSE frame emitters to produce HTML fragments per event
-  instead of JSON.
-- Convert tool-card state machine to per-event full-card HTML re-renders
-  (simpler) or multi-target OOB swaps (more complex).
-- Keep JS for: Prism re-highlighting after swap, slash-command palette
-  keyboard nav, prompt-history, the sub-agent overlay accumulation.
-- Net: `app.js` shrinks by maybe ~1000-1500 lines (the JSON-fetch +
-  table-render + session-list parts), but a comparable amount of Zig is
-  added (markdown renderer + HTML fragment builders). `proxy.zig` grows.
-- SSE bandwidth rises because HTML fragments are larger than JSON deltas
-  for the streaming-text path (full re-rendered markdown block per token
-  vs `{"delta":"foo"}`).
-
-**Benefit:** removes the JSON/HTML duplication for the side panels and
-transcript. But the streaming core still needs JS, so the "zero JS" win
-from the franky-box migration is unattainable here.
-
-**Verdict:** the complexity and risk are high, the net-line reduction is
-small or negative, and the streaming UX may regress (bandwidth, highlight
-flicker). Not recommended.
-
-### 5.2 Partial migration of the side panels (recommended if pursued)
-
-The non-streaming surfaces map cleanly to htmx:
-
-| Surface | Current | htmx |
-|---|---|---|
-| Sidebar session list | `GET /sessions` → JSON → render `<li>` | `hx-get="/sessions" hx-target="#session-list"` → server emits `<li>` fragments |
-| New/activate session | `POST /session/new` → JSON → reload list | `hx-post` → server emits refreshed `<ul>` |
-| Role pill | `GET /role` → JSON → set text | `hx-get="/role" hx-target="#role-pill" hx-trigger="load, session_switched from:body"` |
-| Usage pill | `GET /usage` → JSON → set text | `hx-get="/usage" hx-target="#model-pill" hx-trigger="load, every 10s"` |
-| Design-docs panel | `GET /design-docs` → JSON → render rows | `hx-get` → server emits rows |
-| Slash-command dispatch | `POST /command` → JSON → toast | `hx-post` → server emits a toast fragment |
-| Permission resolve | `POST /permission/resolve` → JSON | `hx-post` form → server emits confirmation fragment |
-| Transcript rehydration | `GET /transcript` → JSON → render | `hx-get` → server emits the conversation HTML |
-
-These are all request/response patterns identical to franky-box. The
-server already has the data; the JSON builders become HTML builders.
-Estimated reduction: ~600-900 lines of `app.js` (the fetch/render code
-for these panels) for ~200-300 lines of Zig HTML builders. Net
-~400-600 lines removed, and the side panels gain progressive enhancement.
-
-**The streaming conversation pane stays vanilla JS + EventSource.** This
-is the key boundary: htmx owns the request/response panels; vanilla JS
-owns the streaming core. The two coexist (htmx 4 is designed to coexist
-with arbitrary JS).
-
-### 5.3 No migration (also valid)
-
-The current architecture works, has no duplicated rendering (the server
-emits JSON events; the browser is the only renderer), and the streaming
-UX is good. The franky-box migration's motivation (duplicated rendering,
-two escapers, a hand-rolled JSON scanner) does not apply here — there is
-no server-side HTML/JSON duplication to eliminate. The server emits
-SSE/JSON; the browser renders. That's a clean single-renderer design
-already.
-
-## 6. Recommendation
-
-1. **Do not pursue a full migration.** The streaming chat core is a poor
-   fit for htmx and the migration would add a Zig markdown renderer,
-   increase SSE bandwidth, and still require substantial JS.
-2. **If a code-reduction goal exists for the web UI**, pursue the
-   **partial migration (§5.2)** of the side panels only. It's low-risk,
-   mechanically the same as the franky-box migration, and yields a real
-   net reduction. The streaming conversation pane, composer, tool cards,
-   sub-agent overlay, and slash palette stay vanilla JS.
-3. **If no code-reduction pressure exists**, the current design is fine
-   as-is. It is already a single-renderer (browser) design with no
-   server-side HTML duplication to eliminate — the primary motivation
-   that drove the franky-box migration does not apply.
-
-## 7. Why the franky-box rationale does not transfer
-
-| franky-box motivation | Applies to franky web UI? |
-|---|---|
-| Duplicated rendering (server JSON + browser HTML) | **No** — server emits JSON/SSE; browser is the sole renderer |
-| Duplicated escaping (server `jsonString` + browser `escapeHtml`) | **No** — only the browser escapes (for HTML) |
-| Hand-rolled JSON input scanner (120 LoC) | **No** — `/prompt` is `text/plain`, `/command` is text; no JSON input parsing on the server |
-| No progressive enhancement (JS-only nav) | **Partially** — the side panels are JS-only, but the conversation pane is inherently JS-only (streaming) |
-| Token in a JS-readable cookie | **No** — proxy mode has no auth/cookie model in the web UI |
-| JS-only mobile nav | **Minor** — the sidebar toggle is JS, could be `<details>` |
-
-The franky-box migration's wins came from eliminating *server-side*
-duplication. The franky web UI has no server-side HTML generation to
-eliminate — it's a thin SSE/JSON emitter. htmx would *add* server-side
-HTML generation, not remove duplication.
-
-## 8. Open questions (only if §5.2 is pursued)
-
-1. **Session lifecycle events**: the sidebar refreshes on
-   `session_switched` SSE events. htmx can trigger off named SSE events
-   (`hx-trigger="session_switched from:body"`), but the event must be
-   dispatching as a DOM event. Verify the `hx-sse` extension surfaces
-   named events to `hx-trigger` or whether a small `hx-on` bridge is
-   needed.
-2. **Transcript rehydration as HTML**: `renderTranscriptForUi` currently
-   emits JSON. An HTML version would need to render the full message
-   history (text + thinking + tool calls) — a big builder. Is it worth it
-   vs keeping the JS rehydration (which already works)?
-3. **Bundle**: htmx 4 core is ~50 KB; `hx-sse` extension adds more. The
-   current UI ships ~0 JS framework (only prism.js + app.js). Adding
-   htmx reverses the "zero dependency" stance noted in `app.js` line 9.
-
-## 9. References
+## 11. References
 
 - htmx 4 `hx-sse` extension: https://four.htmx.org/extensions/hx-sse
-- htmx 4 SSE migration (from 2.0): https://four.htmx.org/extensions/hx-sse (migration notes)
+- htmx 4 SSE OOB swaps + `<hx-partial>`: https://four.htmx.org/extensions/hx-sse (section "Update Elements")
+- htmx 4 named events + `hx-on`: https://four.htmx.org/extensions/hx-sse (section "Trigger Client Events")
+- Current event encoder: `src/agent/wire.zig` `encodeEventJson` (~130 LoC)
+- Current frame renderer: `src/coding/sse.zig` `renderFrame` (5 LoC)
+- Current SSE server: `src/coding/modes/proxy.zig` (5782 LoC, replay ring at ~2069)
 - Current web UI: `src/coding/modes/web/app.js` (3403 LoC, 118 fns)
-- Current SSE server: `src/coding/modes/proxy.zig` (5782 LoC)
 - franky-box htmx migration (for comparison): `franky-box` repo, branch `rfc/htmx-admin-ui`
