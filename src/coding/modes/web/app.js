@@ -2024,184 +2024,222 @@ function highlightCodeBlocks(container) {
         updateSubagentPanelSubtitle();
     }
 
-    // ── hx-sse event wiring ───────────────────────────────────────
+    // ── SSE event wiring (dual-mode) ────────────────────────────────
     //
-    // htmx's hx-sse extension connects to `/events` and dispatches
-    // named SSE frames as DOM events on #sse-conn with
-    // `event.detail.data` / `event.detail.id`. Connection lifecycle
-    // (open/error/reconnect) is managed automatically.
-    // Unnamed frames (bare `data:`) are OOB HTML swapped by htmx.
+    // Two connection modes:
+    //   htmx  — hx-sse:connect="/events?html=1". Named events fire
+    //           as DOM events on #sse-conn with `event.detail.data`.
+    //           Unnamed frames are OOB HTML swapped automatically.
+    //   native — new EventSource("/events"). All events are named
+    //            JSON frames. The permission modal is rendered by JS.
+    //
+    // Both modes use the same event handlers defined below. The
+    // `useHtmx` flag set in connect() controls whether handlers
+    // read from e.detail.data (htmx) or e.data (native EventSource).
 
     /// v1.7.2 — refresh the watchdog timestamp on every SSE event.
     function noteEvent() { lastEventAt = Date.now(); }
 
-    function connect() {
-        // hx-sse manages the EventSource via hx-sse:connect on #sse-conn.
-        // We just listen for named events dispatched by hx-sse.
-        setStatus('live', 'status-live');
+    let es = null;         // native EventSource (null when using htmx)
+    let useHtmx = false;   // set by connect()
+
+    /** Register a named SSE event handler.
+     *  `on`  — event name string, e.g. "turn_start"
+     *  `fn`  — handler receiving parsed data object (or null for no-data events)
+     *          The handler signature is always `(data)` where data is the
+     *          JSON-parsed payload or null for events with empty body.
+     */
+    function listen(on, fn) {
+        const wrap = useHtmx
+            ? (e) => fn(parseData(e.detail.data))
+            : (e) => fn(parseData(e.data));
+        (useHtmx ? sseConn : es).addEventListener(on, wrap);
     }
 
-    sseConn.addEventListener('turn_start', () => {
-        noteEvent();
-        setActivity('thinking…');
-        if (!active.el && toolCards.size === 0) showTurnIndicator();
-    });
+    function connect() {
+        useHtmx = typeof htmx !== 'undefined' && htmx;
 
-    sseConn.addEventListener('turn_end', () => {
-        noteEvent();
-        endAssistantMessage();
-        hideTurnIndicator();
-        setStreaming(false);
-        stopStatusLineTimer();
-        refreshStatusLineUsage();
-        input.focus();
-        loadSessions();
-    });
-
-    sseConn.addEventListener('message_start', (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        startAssistantMessage(data && data.role);
-        if (data && data.role === 'assistant') setActivity('responding…');
-    });
-
-    sseConn.addEventListener('message_update', (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        if (!data) return;
-        switch (data.deltaKind) {
-            case 'text':
-                appendTextDelta(data.blockIndex || 0, data.delta || '');
-                setActivity('responding…');
-                break;
-            case 'thinking':
-                appendThinkingDelta(data.blockIndex || 0, data.delta || '');
-                setActivity('thinking…');
-                break;
-            case 'toolcall_args':
-                appendToolArgsDelta(data.blockIndex || 0, data.delta || '');
-                break;
+        if (useHtmx) {
+            // hx-sse manages the EventSource via hx-sse:connect on #sse-conn.
+            sseConn.setAttribute('hx-sse:connect', '/events?html=1');
+            sseConn.setAttribute('hx-swap', 'none');
+            // Re-process now that attributes are set.
+            htmx.trigger(sseConn, 'load');
+        } else {
+            // Native EventSource — all events are named JSON frames.
+            es = new EventSource('/events');
+            es.addEventListener('open', () => setStatus('live', 'status-live'));
+            es.addEventListener('error', () => setStatus('disconnected', 'status-error'));
         }
-    });
 
-    sseConn.addEventListener('message_end', () => {
-        noteEvent();
-        endAssistantMessage();
-    });
+        setStatus('live', 'status-live');
 
-    sseConn.addEventListener('tool_execution_start', (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        if (!data) return;
-        startToolCall(data.callId, data.name || 'tool', data.argsJson || '');
-        if (data.name === SUBAGENT_TOOL_NAME) {
-            const pending = pendingSubagentUpdates.get(data.callId);
-            if (pending) {
-                pendingSubagentUpdates.delete(data.callId);
-                for (const upd of pending) {
-                    const card = toolCards.get(data.callId);
-                    if (!card || !card.classList.contains('tool-card-subagent')) continue;
-                    const log = card.querySelector('.subagent-log');
-                    if (!log) continue;
-                    appendSubagentEntry(card, log, upd);
-                    appendSubagentPanelEvent(data.callId, upd);
+        // ── Named event handlers (shared by both modes) ────────────
+
+        listen('turn_start', () => {
+            noteEvent();
+            setActivity('thinking…');
+            if (!active.el && toolCards.size === 0) showTurnIndicator();
+        });
+
+        listen('turn_end', () => {
+            noteEvent();
+            endAssistantMessage();
+            hideTurnIndicator();
+            setStreaming(false);
+            stopStatusLineTimer();
+            refreshStatusLineUsage();
+            input.focus();
+            loadSessions();
+        });
+
+        listen('message_start', (data) => {
+            noteEvent();
+            startAssistantMessage(data && data.role);
+            if (data && data.role === 'assistant') setActivity('responding…');
+        });
+
+        listen('message_update', (data) => {
+            noteEvent();
+            if (!data) return;
+            switch (data.deltaKind) {
+                case 'text':
+                    appendTextDelta(data.blockIndex || 0, data.delta || '');
+                    setActivity('responding…');
+                    break;
+                case 'thinking':
+                    appendThinkingDelta(data.blockIndex || 0, data.delta || '');
+                    setActivity('thinking…');
+                    break;
+                case 'toolcall_args':
+                    appendToolArgsDelta(data.blockIndex || 0, data.delta || '');
+                    break;
+            }
+        });
+
+        listen('message_end', () => {
+            noteEvent();
+            endAssistantMessage();
+        });
+
+        listen('tool_execution_start', (data) => {
+            noteEvent();
+            if (!data) return;
+            startToolCall(data.callId, data.name || 'tool', data.argsJson || '');
+            if (data.name === SUBAGENT_TOOL_NAME) {
+                const pending = pendingSubagentUpdates.get(data.callId);
+                if (pending) {
+                    pendingSubagentUpdates.delete(data.callId);
+                    for (const upd of pending) {
+                        const card = toolCards.get(data.callId);
+                        if (!card || !card.classList.contains('tool-card-subagent')) continue;
+                        const log = card.querySelector('.subagent-log');
+                        if (!log) continue;
+                        appendSubagentEntry(card, log, upd);
+                        appendSubagentPanelEvent(data.callId, upd);
+                    }
                 }
             }
-        }
-        setActivity('running: ' + (data.name || 'tool'));
-    });
+            setActivity('running: ' + (data.name || 'tool'));
+        });
 
-    sseConn.addEventListener('tool_execution_end', (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        if (!data) return;
-        endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '', data.detailsJson || null);
-        setActivity('thinking…');
-    });
+        listen('tool_execution_end', (data) => {
+            noteEvent();
+            if (!data) return;
+            endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '', data.detailsJson || null);
+            setActivity('thinking…');
+        });
 
-    sseConn.addEventListener('tool_execution_update', (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        if (!data || !data.callId) return;
-        let upd;
-        try {
-            upd = typeof data.update === 'string' ? JSON.parse(data.update) : data.update;
-        } catch (_) { return; }
-        if (!upd) return;
+        listen('tool_execution_update', (data) => {
+            noteEvent();
+            if (!data || !data.callId) return;
+            let upd;
+            try {
+                upd = typeof data.update === 'string' ? JSON.parse(data.update) : data.update;
+            } catch (_) { return; }
+            if (!upd) return;
 
-        const card = toolCards.get(data.callId);
-        if (!card || !card.classList.contains('tool-card-subagent')) {
-            let buf = pendingSubagentUpdates.get(data.callId);
-            if (!buf) {
-                buf = [];
-                pendingSubagentUpdates.set(data.callId, buf);
+            const card = toolCards.get(data.callId);
+            if (!card || !card.classList.contains('tool-card-subagent')) {
+                let buf = pendingSubagentUpdates.get(data.callId);
+                if (!buf) {
+                    buf = [];
+                    pendingSubagentUpdates.set(data.callId, buf);
+                }
+                buf.push(upd);
+                return;
             }
-            buf.push(upd);
-            return;
-        }
-        const log = card.querySelector('.subagent-log');
-        if (!log) return;
-        appendSubagentEntry(card, log, upd);
-        appendSubagentPanelEvent(data.callId, upd);
-    });
+            const log = card.querySelector('.subagent-log');
+            if (!log) return;
+            appendSubagentEntry(card, log, upd);
+            appendSubagentPanelEvent(data.callId, upd);
+        });
 
-    // tool_permission_request is handled by the server as an OOB HTML
-    // fragment (swapped into #permission-modal by htmx automatically).
-    // No JS handler needed.
+        // tool_permission_request in htmx mode is OOB HTML swapped by htmx.
+        // In native mode, render the permission modal via JS.
+        listen('tool_permission_request', (data) => {
+            noteEvent();
+            if (!data || !data.callId) return;
+            if (useHtmx) return; // OOB HTML handles it
+            renderPermissionModal({
+                callId: data.callId,
+                toolName: data.toolName || 'tool',
+                argsJson: data.argsJson || '',
+                fingerprint: data.fingerprint || data.toolName || '',
+            });
+        });
 
-    sseConn.addEventListener('agent_error', (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        const msg = data ? `${data.code}: ${data.message}` : 'agent error';
-        if (!(data && (data.code === 'aborted' || data.isFatal === false))) {
-            appendError(msg);
-        }
-        setStreaming(false);
-        hideTurnIndicator();
-        endAssistantMessage();
-        stopStatusLineTimer();
-        setStatusLine('');
-    });
+        listen('agent_error', (data) => {
+            noteEvent();
+            const msg = data ? `${data.code}: ${data.message}` : 'agent error';
+            if (!(data && (data.code === 'aborted' || data.isFatal === false))) {
+                appendError(msg);
+            }
+            setStreaming(false);
+            hideTurnIndicator();
+            endAssistantMessage();
+            stopStatusLineTimer();
+            setStatusLine('');
+        });
 
-    sseConn.addEventListener('agent_interrupted', () => {
-        noteEvent();
-        endAssistantMessage();
-        hideTurnIndicator();
-        setStreaming(false);
-        stopStatusLineTimer();
-        setStatusLine('');
-        input.focus();
-    });
+        listen('agent_interrupted', () => {
+            noteEvent();
+            endAssistantMessage();
+            hideTurnIndicator();
+            setStreaming(false);
+            stopStatusLineTimer();
+            setStatusLine('');
+            input.focus();
+        });
 
-    sseConn.addEventListener('session_switched', async (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        if (!data || !data.id) return;
-        await onSessionSwitched(data.id);
-    });
+        listen('session_switched', async (data) => {
+            noteEvent();
+            if (!data || !data.id) return;
+            await onSessionSwitched(data.id);
+        });
 
-    sseConn.addEventListener('provider_retry', (e) => {
-        noteEvent();
-        const data = parseData(e.detail.data);
-        if (!data) return;
-        setStatusLine('retry ' + data.attempt + ' (' + data.reason + '…)');
-        startStatusLineTimer();
-    });
+        listen('provider_retry', (data) => {
+            noteEvent();
+            if (!data) return;
+            setStatusLine('retry ' + data.attempt + ' (' + data.reason + '…)');
+            startStatusLineTimer();
+        });
 
-    sseConn.addEventListener('ping', () => { noteEvent(); });
+        listen('ping', () => { noteEvent(); });
 
-    sseConn.addEventListener('replay_gap', async () => {
-        noteEvent();
-        if (!isStreaming) {
-            clearConversation();
-            await rehydrate();
-        } else {
-            appendSystemMessage('',
-                '_Some streamed content was lost during reconnect. ' +
-                'The response will continue from where it reconnected._',
-                false);
-        }
-    });
+        listen('replay_gap', async (data) => {
+            noteEvent();
+            if (!isStreaming) {
+                clearConversation();
+                await rehydrate();
+            } else {
+                appendSystemMessage('',
+                    '_Some streamed content was lost during reconnect. ' +
+                    'The response will continue from where it reconnected._',
+                    false);
+            }
+        });
+    }
 
     // v1.7.2 — watchdog. Every 5s, if `isStreaming` is true
     // and no SSE event has arrived for `watchdogTimeoutMs`,
