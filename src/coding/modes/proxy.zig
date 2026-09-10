@@ -4159,7 +4159,7 @@ test "proxy: GET / serves the web UI HTML" {
 test "proxy: GET /app.js serves the web UI script" {
     try runStaticAssetCase(.{
         .request_path = "/app.js",
-        .expect_substr = "sseConn.addEventListener",
+        .expect_substr = "listen('turn_start'",
         .expect_content_type = "text/javascript",
     });
 }
@@ -4288,7 +4288,7 @@ test "proxy: served app.js wires v1.7.4 ping handler + soft watchdog" {
     // v1.7.4 — `ping` SSE handler refreshes the watchdog clock
     // without UI changes; bumped timeout to 5 minutes; soft
     // (non-destructive) advisory replaces the v1.7.2 hard reset.
-    try testing.expect(std.mem.indexOf(u8, web_app_js, "addEventListener('ping'") != null);
+    try testing.expect(std.mem.indexOf(u8, web_app_js, "listen('ping'") != null);
     try testing.expect(std.mem.indexOf(u8, web_app_js, "watchdogTimeoutMs = 300_000") != null);
     try testing.expect(std.mem.indexOf(u8, web_app_js, "watchdogWarned") != null);
     try testing.expect(std.mem.indexOf(u8, web_app_js, "Model is taking longer than usual") != null);

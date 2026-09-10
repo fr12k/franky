@@ -10,12 +10,11 @@
     <script src="/hx-sse.min.js"></script>
 </head>
 <body>
-    <!-- hx-sse: persistent SSE connection. htmx processes unnamed events
-         (OOB HTML swaps) and named events (hx-on) from this stream. -->
-    <!-- hx-sse:connect to HTML mode. Named events fire as DOM events on
-         #sse-conn with event.detail.data. Unnamed frames are OOB HTML
-         fragments that htmx swaps automatically. -->
-    <div hx-sse:connect="/events?html=1" hx-swap="none" id="sse-conn"></div>
+    <!-- SSE connection element. When htmx is loaded, hx-sse connects
+         to /events?html=1 for OOB HTML swaps. Without htmx, app.js
+         creates a native EventSource to /events using JSON frames.
+         See connect() in app.js. -->
+    <div id="sse-conn"></div>
     <!-- OOB target for permission modals (tool_permission_request) -->
     <div id="permission-modal"></div>
     <header>
