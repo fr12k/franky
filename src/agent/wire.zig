@@ -166,59 +166,24 @@ fn appendHtmlEsc(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []con
     };
 }
 
-/// Encode `ev` as an HTML fragment (for hx-sse OOB swaps) or a JSON
-/// payload (for named lifecycle events handled via `hx-on`). Returns
-/// the fragment body (without SSE framing); the caller wraps it in
-/// `data: ...\n\n` (unnamed, OOB) or `event: kind\ndata: ...\n\n`
-/// (named, lifecycle). See `sse.renderFrameHtml`.
-///
-/// Strategy (Phase 1, Option B):
-///   - Lifecycle events (turn_start/end, agent_error/interrupted,
-///     provider_retry, ping) stay JSON named events (small payloads,
-///     handled by `hx-on` on the client).
-///   - Content events (message_start/end, tool_execution_*,
-///     tool_permission_request, thinking/toolcall deltas) become
-///     HTML fragments with `hx-swap-oob` targeting stable element IDs.
-///   - Text deltas (`message_update` .text) stay JSON named events —
-///     the client-side markdown renderer accumulates and re-renders
-///     (Option B; Phase 2 may move this server-side).
+/// Encode `ev` for the htmx SSE path. Named events delegate to
+/// `encodeEventJson` so JS handlers receive the same payload they
+/// expect. Unnamed events produce OOB HTML fragments that htmx
+/// swaps automatically. See `sse.renderFrameHtml` for SSE framing.
 pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
+    // Named events produce the same JSON payload as encodeEventJson.
+    // JS handlers parse `event.detail.data` for the same fields.
+    if (isNamedHtmlEvent(ev)) {
+        return encodeEventJson(allocator, ev);
+    }
+
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     switch (ev) {
-        // ── Lifecycle: named JSON events (client handles via hx-on) ──
-        .turn_start, .turn_end, .agent_interrupted => {
-            // These carry no payload; the event name is enough.
-            try buf.appendSlice(allocator, "{}");
-        },
-        .agent_error => |d| {
-            // Keep JSON so the client can read code/message/isFatal.
-            try buf.appendSlice(allocator, "{\"code\":");
-            try appendJsonStr(&buf, allocator, d.code.toString());
-            try buf.appendSlice(allocator, ",\"message\":");
-            try appendJsonStr(&buf, allocator, d.message);
-            if (!d.is_fatal) try buf.appendSlice(allocator, ",\"isFatal\":false");
-            try buf.appendSlice(allocator, "}");
-        },
-        .provider_retry => |r| {
-            try buf.appendSlice(allocator, "{\"attempt\":");
-            try appendJsonInt(&buf, allocator, @intCast(r.attempt));
-            try buf.appendSlice(allocator, ",\"reason\":");
-            try appendJsonStr(&buf, allocator, @tagName(r.reason));
-            try buf.appendSlice(allocator, "}");
-        },
-
-        // ── Text deltas: named JSON (client-side markdown render, Option B) ──
+        // ── OOB HTML: thinking/toolcall_args deltas ────────────────
         .message_update => |m| switch (m) {
-            .text => |t| {
-                try buf.appendSlice(allocator, "{\"deltaKind\":\"text\",\"blockIndex\":");
-                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
-                try buf.appendSlice(allocator, ",\"delta\":");
-                try appendJsonStr(&buf, allocator, t.delta);
-                try buf.appendSlice(allocator, "}");
-            },
-            // thinking + toolcall_args: OOB HTML append into the block.
+            .text => unreachable, // named, handled by guard above
             .thinking => |t| {
                 try buf.appendSlice(allocator, "<div id=\"thinking-");
                 try appendJsonInt(&buf, allocator, @intCast(t.block_index));
@@ -235,25 +200,7 @@ pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             },
         },
 
-        // ── Content fragments: named JSON (tool state), OOB HTML (updates) ──
-        //
-        // tool_execution_start/end stay named JSON — they manage the
-        // toolCards map and subagent panel state in JS (endToolCall needs
-        // toolCards populated by startToolCall). The HTML path still works
-        // because tool_execution_update is OOB HTML (appends log entries).
-        //
-        .tool_execution_start, .tool_execution_end => {
-            // Named JSON events — handled by JS for tool card + subagent state.
-            try buf.appendSlice(allocator, "{}");
-        },
-        .message_start, .message_end => {
-            // Named JSON events — handled by JS for message state.
-            try buf.appendSlice(allocator, "{}");
-        },
-        .tool_execution_update => {
-            // Named JSON event — handled by JS for subagent panel state.
-            try buf.appendSlice(allocator, "{}");
-        },
+        // ── OOB HTML: permission modal ────────────────────────────
         .tool_permission_request => |r| {
             try buf.appendSlice(allocator, "<div id=\"permission-modal\" hx-swap-oob=\"true\" class=\"permission-modal\">");
             try buf.appendSlice(allocator, "<div class=\"permission-card\"><h3>Permission required</h3>");
@@ -270,6 +217,11 @@ pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             try buf.appendSlice(allocator, "<button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>");
             try buf.appendSlice(allocator, "</form></div></div>");
         },
+
+        // All named events are handled by isNamedHtmlEvent guard above.
+        .turn_start, .turn_end, .agent_interrupted, .agent_error,
+        .provider_retry, .message_start, .message_end,
+        .tool_execution_start, .tool_execution_end, .tool_execution_update => unreachable,
     }
     return try buf.toOwnedSlice(allocator);
 }
@@ -416,11 +368,11 @@ test "encodeEventJson: json escaping handles quotes and newlines" {
 }
 // ─── encodeEventHtml + isNamedHtmlEvent tests ─────────────────────
 
-test "encodeEventHtml: turn_start is empty JSON" {
+test "encodeEventHtml: turn_start delegates to encodeEventJson" {
     const gpa = testing.allocator;
     const html = try encodeEventHtml(gpa, .turn_start);
     defer gpa.free(html);
-    try testing.expectEqualStrings("{}", html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"kind\":\"turn_start\"") != null);
 }
 
 test "encodeEventHtml: message_update text stays JSON (Option B)" {
@@ -447,7 +399,7 @@ test "encodeEventHtml: thinking delta is OOB HTML fragment" {
     try testing.expect(std.mem.indexOf(u8, html, "reasoning here") != null);
 }
 
-test "encodeEventHtml: tool_execution_start is JSON (named, JS-driven)" {
+test "encodeEventHtml: tool_execution_start delegates to encodeEventJson" {
     const gpa = testing.allocator;
     const html = try encodeEventHtml(gpa, .{ .tool_execution_start = .{
         .call_id = "c-1",
@@ -455,11 +407,11 @@ test "encodeEventHtml: tool_execution_start is JSON (named, JS-driven)" {
         .args_json = "{\"path\":\"foo.zig\"}",
     } });
     defer gpa.free(html);
-    // Named JSON event — no HTML.
-    try testing.expectEqualStrings("{}", html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"callId\":\"c-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "\"name\":\"read\"") != null);
 }
 
-test "encodeEventHtml: tool_execution_end is JSON (named, JS-driven)" {
+test "encodeEventHtml: tool_execution_end delegates to encodeEventJson" {
     const gpa = testing.allocator;
     const html = try encodeEventHtml(gpa, .{ .tool_execution_end = .{
         .call_id = "c-1",
@@ -471,8 +423,8 @@ test "encodeEventHtml: tool_execution_end is JSON (named, JS-driven)" {
         },
     } });
     defer gpa.free(html);
-    // Named JSON event — no HTML.
-    try testing.expectEqualStrings("{}", html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"callId\":\"c-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "\"isError\":false") != null);
 }
 
 test "encodeEventHtml: html escaping handles <, >, & in OOB permission modal" {
