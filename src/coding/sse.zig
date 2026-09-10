@@ -438,7 +438,7 @@ test "renderFrameHtml: named event (turn_start) gets event: prefix" {
     const frame = try renderFrameHtml(gpa, .turn_start);
     defer gpa.free(frame);
     try std.testing.expect(std.mem.indexOf(u8, frame, "event: turn_start\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "data: {}\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "data: {\"kind\":\"turn_start\"}\n") != null);
 }
 
 test "renderFrameHtml: text delta is named (Option B)" {
