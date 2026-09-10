@@ -276,37 +276,31 @@ pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
 
 /// Whether `ev` should be sent as a named SSE event (JSON payload,
 /// client handles via `hx-on`) vs an unnamed event (HTML fragment,
-/// htmx processes OOB swaps). Lifecycle + text-delta events are
-/// named; content events are unnamed.
+/// htmx processes OOB swaps). Named events are those that need JS
+/// state management (tool cards, subagent panel, active message);
+/// unnamed events are server-rendered HTML swapped by htmx.
 pub fn isNamedHtmlEvent(ev: at.AgentEvent) bool {
+    // ── Named: lifecycle + text deltas (JS-driven) ────────────────
     return switch (ev) {
         .turn_start,
         .turn_end,
         .agent_interrupted,
         .agent_error,
         .provider_retry,
+        .message_start,
+        .message_end,
+        .tool_execution_start,
+        .tool_execution_end,
+        .tool_execution_update,
         => true,
         // Text deltas stay JSON (Option B — client-side markdown render).
-        // thinking + toolcall_args are OOB HTML fragments (unnamed events).
         .message_update => |m| switch (m) {
             .text => true,
             .thinking => false,
             .toolcall_args => false,
         },
-        .message_start,
-        .message_end,
-        => true,
-        // tool_execution_start/end are named JSON — JS manages tool card
-        // state and subagent panel via toolCards map.
-        .tool_execution_start,
-        .tool_execution_end,
-        => true,
-        .tool_execution_update,
-        => true,
-        // tool_permission_request is OOB HTML — htmx swaps into
-        // #permission-modal automatically.
-        .tool_permission_request,
-        => false,
+        // ── Unnamed: OOB HTML (htmx auto-swap) ────────────────────
+        .tool_permission_request => false,
     };
 }
 
