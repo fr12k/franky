@@ -235,31 +235,35 @@ pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             },
         },
 
-        // ── Content: OOB HTML fragments ──
-        .message_start => |s| {
-            // Open the assistant message container.
-            try buf.appendSlice(allocator, "<div class=\"msg msg-");
-            try appendHtmlEsc(&buf, allocator, roleName(s.role));
-            try buf.appendSlice(allocator, "\"></div>");
-        },
-        .message_end => {
-            // Finalize the message container.
-            try buf.appendSlice(allocator, "</div><!-- msg-end -->");
+        // ── Content: OOB HTML fragments (swapped by htmx) ──
+        //
+        // message_start/end stay named JSON — they manage JS active state
+        // for text delta accumulation (Option B).
+        // tool_execution_end stays named JSON — it needs the toolCards map
+        // for subagent panel integration.
+        //
+        .message_start, .message_end => {
+            // Named JSON events — handled by JS for active message state.
+            // message_start carries role, message_end is empty.
         },
         .tool_execution_start => |s| {
+            // Emit the full tool card into #conversation with hx-swap-oob.
+            // Include an empty subagent-log container for updates.
             try buf.appendSlice(allocator, "<div class=\"tool-card\" id=\"tool-");
             try appendHtmlEsc(&buf, allocator, s.call_id);
-            try buf.appendSlice(allocator, "\"><div class=\"tool-head\"><span class=\"tool-name\">");
+            try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend:#conversation\"><div class=\"tool-head\"><span class=\"tool-name\">");
             try appendHtmlEsc(&buf, allocator, s.name);
             try buf.appendSlice(allocator, "</span></div><div class=\"tool-args\"><code>");
             try appendHtmlEsc(&buf, allocator, s.args_json);
-            try buf.appendSlice(allocator, "</code></div></div>");
+            try buf.appendSlice(allocator, "</code></div><div class=\"subagent-log\" id=\"subagent-log-");
+            try appendHtmlEsc(&buf, allocator, s.call_id);
+            try buf.appendSlice(allocator, "\"></div></div>");
         },
         .tool_execution_update => |u| {
             // Append to the sub-agent log inside the tool card.
-            try buf.appendSlice(allocator, "<div id=\"subagent-log-");
+            try buf.appendSlice(allocator, "<div hx-swap-oob=\"beforeend:#subagent-log-");
             try appendHtmlEsc(&buf, allocator, u.call_id);
-            try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"subagent-entry\">");
+            try buf.appendSlice(allocator, "\" class=\"subagent-entry\">");
             try appendHtmlEsc(&buf, allocator, u.update_json);
             try buf.appendSlice(allocator, "</div>");
         },
@@ -320,6 +324,9 @@ pub fn isNamedHtmlEvent(ev: at.AgentEvent) bool {
             .thinking => false,
             .toolcall_args => false,
         },
+        // message_start and message_end are named JSON events — the
+        // client-side JS manages active message state (for text deltas,
+        // Option B). Keep them as named events so the JS handlers fire.
         .message_start,
         .message_end,
         .tool_execution_start,
