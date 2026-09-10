@@ -467,10 +467,12 @@ test "renderFrameHtml: thinking delta is unnamed OOB" {
 
 test "renderFrameHtml: multi-line body split into data: lines (SSE spec)" {
     const gpa = std.testing.allocator;
-    // tool_execution_update with multi-line body (OOB HTML).
-    const frame = try renderFrameHtml(gpa, .{ .tool_execution_update = .{
+    // tool_permission_request with multi-line args (OOB HTML, unnamed).
+    const frame = try renderFrameHtml(gpa, .{ .tool_permission_request = .{
         .call_id = "c",
-        .update_json = "line1\nline2",
+        .tool_name = "read",
+        .args_json = "line1\nline2",
+        .fingerprint = "fp",
     } });
     defer gpa.free(frame);
     // Unnamed (no event: prefix), body split across data: lines.
