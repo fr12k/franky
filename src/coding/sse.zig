@@ -12,6 +12,7 @@
 const std = @import("std");
 const at = @import("../agent/types.zig");
 const wire = @import("../agent/wire.zig");
+const ai_types = @import("../ai/types.zig");
 
 pub const max_subs: usize = 32;
 pub const replay_ring_capacity: usize = 4096;
@@ -27,6 +28,11 @@ pub const SseSubscriber = struct {
     io: std.Io,
     closed: std.atomic.Value(bool) = .init(false),
     shutdown_on_close: bool = true,
+    /// When true, the subscriber receives htmx hx-sse HTML frames
+    /// (renderFrameHtml) instead of JSON frames (renderFrame). Set by
+    /// the connection handler when the client requests
+    /// GET /events?html=1 or sends Accept: text/html.
+    html_mode: bool = false,
 
     pub fn close(sub: *SseSubscriber) void {
         sub.closed.store(true, .release);
@@ -39,6 +45,11 @@ pub const SseSubscriber = struct {
 const ReplayEvent = struct {
     id: u64,
     frame: []u8,
+    /// Optional HTML-mode frame (htmx hx-sse). When null, no HTML-mode
+    /// subscriber was connected when this event was broadcast, so it
+    /// wasn't rendered. A late-joining HTML subscriber will see a
+    /// replay_gap and re-fetch the transcript via GET /transcript.
+    html_frame: ?[]u8 = null,
 };
 
 /// Broadcasts SSE frames to connected subscribers with replay support.
@@ -60,7 +71,10 @@ pub const SseBroadcaster = struct {
 
     pub fn deinit(self: *SseBroadcaster) void {
         for (self.replay_ring[0..]) |maybe| {
-            if (maybe) |entry| self.allocator.free(entry.frame);
+            if (maybe) |entry| {
+                self.allocator.free(entry.frame);
+                if (entry.html_frame) |hf| self.allocator.free(hf);
+            }
         }
     }
 
@@ -101,16 +115,18 @@ pub const SseBroadcaster = struct {
     pub fn broadcastFrame(self: *SseBroadcaster, frame: []const u8) void {
         self.events_mutex.lockUncancelable(self.io);
         defer self.events_mutex.unlock(self.io);
-        self.fanOutLocked(frame);
+        self.fanOutLocked(frame, null);
     }
 
-    fn fanOutLocked(self: *SseBroadcaster, frame: []const u8) void {
+    fn fanOutLocked(self: *SseBroadcaster, frame: []const u8, html_frame: ?[]const u8) void {
         for (self.subs[0..]) |maybe| {
             const sub = maybe orelse continue;
             if (sub.closed.load(.acquire)) continue;
+            // Send the HTML frame to HTML-mode subscribers, JSON to the rest.
+            const f = if (sub.html_mode and html_frame != null) html_frame.? else frame;
             var buf: [256]u8 = undefined;
             var w = sub.stream.writer(sub.io, &buf);
-            w.interface.writeAll(frame) catch {
+            w.interface.writeAll(f) catch {
                 sub.close();
                 continue;
             };
@@ -125,6 +141,18 @@ pub const SseBroadcaster = struct {
     /// subscribers. Replay-eligible — every real `AgentEvent` frame
     /// should go through here.
     pub fn broadcastEvent(self: *SseBroadcaster, frame_body: []const u8) void {
+        self.broadcastEventImpl(frame_body, null);
+    }
+
+    /// Like `broadcastEvent`, but also stamps an HTML-mode frame for
+    /// htmx hx-sse subscribers. `html_frame_body` is the htmx-rendered
+    /// equivalent of `frame_body` (from `renderFrameHtml`). Both are
+    /// stored in the replay ring so either mode can replay.
+    pub fn broadcastEventDual(self: *SseBroadcaster, frame_body: []const u8, html_frame_body: []const u8) void {
+        self.broadcastEventImpl(frame_body, html_frame_body);
+    }
+
+    fn broadcastEventImpl(self: *SseBroadcaster, frame_body: []const u8, html_frame_body: ?[]const u8) void {
         self.events_mutex.lockUncancelable(self.io);
         defer self.events_mutex.unlock(self.io);
 
@@ -134,19 +162,31 @@ pub const SseBroadcaster = struct {
         var id_buf: [32]u8 = undefined;
         const id_str = std.fmt.bufPrint(&id_buf, "id: {d}\n", .{id}) catch unreachable;
         const stamped = self.allocator.alloc(u8, id_str.len + frame_body.len) catch {
-            self.fanOutLocked(frame_body);
+            self.fanOutLocked(frame_body, html_frame_body);
             return;
         };
         @memcpy(stamped[0..id_str.len], id_str);
         @memcpy(stamped[id_str.len..], frame_body);
 
+        // Stamp the HTML frame too (if provided).
+        const stamped_html: ?[]u8 = blk: {
+            if (html_frame_body) |hfb| {
+                const sh = self.allocator.alloc(u8, id_str.len + hfb.len) catch break :blk null;
+                @memcpy(sh[0..id_str.len], id_str);
+                @memcpy(sh[id_str.len..], hfb);
+                break :blk sh;
+            }
+            break :blk null;
+        };
+
         const slot: usize = @intCast(id % replay_ring_capacity);
         if (self.replay_ring[slot]) |old| {
             self.allocator.free(old.frame);
+            if (old.html_frame) |hf| self.allocator.free(hf);
         }
-        self.replay_ring[slot] = .{ .id = id, .frame = stamped };
+        self.replay_ring[slot] = .{ .id = id, .frame = stamped, .html_frame = stamped_html };
 
-        self.fanOutLocked(stamped);
+        self.fanOutLocked(stamped, stamped_html);
     }
 
     /// Return the oldest event id still in the ring (1-based).
@@ -154,6 +194,18 @@ pub const SseBroadcaster = struct {
         if (self.next_event_id > replay_ring_capacity)
             return self.next_event_id - replay_ring_capacity;
         return 1;
+    }
+
+    /// True when at least one live subscriber is in HTML mode (htmx).
+    /// Callers use this to decide whether to render the HTML frame
+    /// alongside the JSON frame before broadcasting.
+    pub fn hasHtmlSubscriber(self: *SseBroadcaster) bool {
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
+        for (self.subs[0..]) |maybe| {
+            if (maybe) |sub| if (sub.html_mode and !sub.closed.load(.acquire)) return true;
+        }
+        return false;
     }
 };
 
@@ -347,4 +399,87 @@ pub fn renderFrame(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
     defer allocator.free(json);
     const kind = @tagName(ev);
     return std.fmt.allocPrint(allocator, "event: {s}\ndata: {s}\n\n", .{ kind, json });
+}
+
+/// Render one `AgentEvent` as an SSE frame for the htmx hx-sse UI.
+/// Named events (lifecycle + text deltas) keep the `event: kind\n`
+/// prefix so the client can handle them via `hx-on`. Content events
+/// are unnamed (`data: ...\n\n`) carrying HTML with `hx-swap-oob`
+/// that htmx swaps into targets automatically. Owned by the caller.
+pub fn renderFrameHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
+    const body = try wire.encodeEventHtml(allocator, ev);
+    defer allocator.free(body);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    if (wire.isNamedHtmlEvent(ev)) {
+        const kind = @tagName(ev);
+        try buf.appendSlice(allocator, "event: ");
+        try buf.appendSlice(allocator, kind);
+        try buf.appendSlice(allocator, "\n");
+    }
+    // SSE spec: a `data:` field containing embedded newlines must be
+    // split into one `data:` line per row — the client rejoins them
+    // with `\n`. A bare `\n` in the body would terminate the data
+    // field prematurely and break the frame.
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        try buf.appendSlice(allocator, "data: ");
+        try buf.appendSlice(allocator, line);
+        try buf.appendSlice(allocator, "\n");
+    }
+    try buf.appendSlice(allocator, "\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+// ─── renderFrameHtml tests ────────────────────────────────────────
+
+test "renderFrameHtml: named event (turn_start) gets event: prefix" {
+    const gpa = std.testing.allocator;
+    const frame = try renderFrameHtml(gpa, .turn_start);
+    defer gpa.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event: turn_start\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "data: {\"kind\":\"turn_start\"}\n") != null);
+}
+
+test "renderFrameHtml: text delta is named (Option B)" {
+    const gpa = std.testing.allocator;
+    const frame = try renderFrameHtml(gpa, .{ .message_update = .{ .text = .{
+        .block_index = 0,
+        .delta = "hi",
+    } } });
+    defer gpa.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event: message_update\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"deltaKind\":\"text\"") != null);
+}
+
+test "renderFrameHtml: thinking delta is unnamed OOB" {
+    const gpa = std.testing.allocator;
+    const frame = try renderFrameHtml(gpa, .{ .message_update = .{ .thinking = .{
+        .block_index = 0,
+        .delta = "x",
+    } } });
+    defer gpa.free(frame);
+    // No event: prefix for unnamed OOB events.
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "data: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "hx-swap-oob") != null);
+}
+
+test "renderFrameHtml: multi-line body split into data: lines (SSE spec)" {
+    const gpa = std.testing.allocator;
+    // tool_permission_request with multi-line args (OOB HTML, unnamed).
+    const frame = try renderFrameHtml(gpa, .{ .tool_permission_request = .{
+        .call_id = "c",
+        .tool_name = "read",
+        .args_json = "line1\nline2",
+        .fingerprint = "fp",
+    } });
+    defer gpa.free(frame);
+    // Unnamed (no event: prefix), body split across data: lines.
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "line2") != null);
+    try std.testing.expect(frame.len >= 2);
+    try std.testing.expect(frame[frame.len - 1] == '\n');
+    try std.testing.expect(frame[frame.len - 2] == '\n');
 }

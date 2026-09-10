@@ -6,8 +6,17 @@
     <title>franky</title>
     <link rel="stylesheet" href="/style.css">
     <link rel="stylesheet" href="/prism-tomorrow.css">
+    <script src="/htmx.min.js"></script>
+    <script src="/hx-sse.min.js"></script>
 </head>
 <body>
+    <!-- SSE connection element. When htmx is loaded, hx-sse connects
+         to /events?html=1 for OOB HTML swaps. Without htmx, app.js
+         creates a native EventSource to /events using JSON frames.
+         See connect() in app.js. -->
+    <div id="sse-conn"></div>
+    <!-- OOB target for permission modals (tool_permission_request) -->
+    <div id="permission-modal"></div>
     <header>
         <button id="sidebar-toggle" type="button" aria-label="Toggle sidebar" title="Toggle sidebar">☰</button>
         <h1>franky</h1>
