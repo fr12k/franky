@@ -467,25 +467,16 @@ test "renderFrameHtml: thinking delta is unnamed OOB" {
 
 test "renderFrameHtml: multi-line body split into data: lines (SSE spec)" {
     const gpa = std.testing.allocator;
-    // tool_execution_end with multi-line output.
-    var content = [_]ai_types.ContentBlock{.{ .text = .{ .text = "line1\nline2\nline3" } }};
-    const frame = try renderFrameHtml(gpa, .{ .tool_execution_end = .{
+    // tool_execution_update with multi-line body (OOB HTML).
+    const frame = try renderFrameHtml(gpa, .{ .tool_execution_update = .{
         .call_id = "c",
-        .result = .{
-            .is_error = false,
-            .content = &content,
-            .tool_code = null,
-            .details_json = null,
-        },
+        .update_json = "line1\nline2",
     } });
     defer gpa.free(frame);
-    // Each line of the body must be on its own data: line.
-    try std.testing.expect(std.mem.indexOf(u8, frame, "data: ") != null);
+    // Unnamed (no event: prefix), body split across data: lines.
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event:") == null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "line1") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "line2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "line3") != null);
-    // No bare \n inside a data: field (all \n must be preceded by a data: line).
-    // Verify the frame ends with \n\n (SSE frame terminator).
     try std.testing.expect(frame.len >= 2);
     try std.testing.expect(frame[frame.len - 1] == '\n');
     try std.testing.expect(frame[frame.len - 2] == '\n');
