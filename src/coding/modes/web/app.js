@@ -1,8 +1,10 @@
 // franky web UI — talks to the streamProxy listener (§4.7).
 //
 // Wire format: each SSE frame is `event: <kind>\ndata: <json>\n\n`,
-// matching what the in-process agent loop emits. We reuse browser-
-// native EventSource and just dispatch by event name.
+// matching what the in-process agent loop emits. hx-sse connects to
+// `/events` and dispatches named events as DOM events on #sse-conn.
+// Unnamed events (bare `data:` without `event:`) are OOB HTML that
+// htmx swaps automatically.
 
 // ─── Markdown renderer (v1.6.0) ──────────────────────────────────
 //
@@ -280,6 +282,9 @@ function highlightCodeBlocks(container) {
     const saOverlayBadge    = saOverlayEl.querySelector('.sa-overlay-badge');
     const saOverlayTitle    = saOverlayEl.querySelector('.sa-overlay-title');
     const saOverlayProfile   = saOverlayEl.querySelector('.sa-overlay-profile');
+
+    // htmx hx-sse:connect="/events" — listen for named SSE events here.
+    const sseConn = document.getElementById('sse-conn');
 
     /**
      * State for the in-progress assistant message.
@@ -1533,76 +1538,11 @@ function highlightCodeBlocks(container) {
         return '<span class="fd-ctn">' + (text.length === 0 ? '&nbsp;' : escHtml(text)) + '</span>';
     }
 
-    // v1.11.4 — permission-prompt modal. Renders an inline card
-    // in the conversation pane (not a dialog overlay) so the
-    // request stays in the transcript context. Buttons POST to
-    // /permission/resolve and dismiss the card on success;
-    // server-side resolve wakes the worker, the next tool event
-    // appends below.
-    function renderPermissionModal(req) {
-        const el = document.createElement('div');
-        el.className = 'permission-modal';
-        el.dataset.callId = req.callId;
-
-        const head = document.createElement('div');
-        head.className = 'permission-head';
-        head.textContent = '🔒 permission required: ' + req.toolName +
-            ' (fingerprint: ' + req.fingerprint + ')';
-        el.appendChild(head);
-
-        const args = document.createElement('pre');
-        args.className = 'permission-args';
-        args.textContent = req.argsJson;
-        el.appendChild(args);
-
-        const buttons = document.createElement('div');
-        buttons.className = 'permission-buttons';
-        const choices = [
-            { key: 'allow_once', label: 'Allow once', kind: 'allow' },
-            { key: 'always_allow', label: 'Always allow', kind: 'allow' },
-            { key: 'deny_once', label: 'Deny once', kind: 'deny' },
-            { key: 'always_deny', label: 'Always deny', kind: 'deny' },
-        ];
-        let resolving = false;
-        for (const c of choices) {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'permission-btn permission-btn-' + c.kind;
-            btn.textContent = c.label;
-            btn.addEventListener('click', async () => {
-                if (resolving) return;
-                resolving = true;
-                for (const b of buttons.querySelectorAll('button')) b.disabled = true;
-                try {
-                    const r = await fetch('/permission/resolve', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ call_id: req.callId, resolution: c.key }),
-                    });
-                    if (r.ok) {
-                        // Replace the modal with a compact result line.
-                        const result = document.createElement('div');
-                        result.className = 'permission-result permission-result-' + c.kind;
-                        result.textContent = (c.kind === 'allow' ? '✓ allowed: ' : '✗ denied: ') +
-                            req.toolName + ' (' + c.key + ')';
-                        el.replaceWith(result);
-                    } else {
-                        head.textContent = '⚠ resolve failed (HTTP ' + r.status + ') — try again';
-                        for (const b of buttons.querySelectorAll('button')) b.disabled = false;
-                        resolving = false;
-                    }
-                } catch (_) {
-                    head.textContent = '⚠ network error — try again';
-                    for (const b of buttons.querySelectorAll('button')) b.disabled = false;
-                    resolving = false;
-                }
-            });
-            buttons.appendChild(btn);
-        }
-        el.appendChild(buttons);
-
-        conversation.appendChild(el);
-        scrollToBottom();
+    // v1.11.4 — permission-prompt modal.
+    // REMOVED: now handled server-side via OOB HTML fragment in
+    // wire.zig encodeEventHtml + htmx auto-swap into #permission-modal.
+    function renderPermissionModal(_req) {
+        // no-op; server renders OOB HTML into #permission-modal.
     }
 
     // ── v2.6 helpers ─────────────────────────────────────────────
@@ -2084,259 +2024,199 @@ function highlightCodeBlocks(container) {
         updateSubagentPanelSubtitle();
     }
 
-    // ── EventSource wiring ───────────────────────────────────────
+    // ── hx-sse event wiring ───────────────────────────────────────
+    //
+    // htmx's hx-sse extension connects to `/events` and dispatches
+    // named SSE frames as DOM events on #sse-conn with
+    // `event.detail.data` / `event.detail.id`. Connection lifecycle
+    // (open/error/reconnect) is managed automatically.
+    // Unnamed frames (bare `data:`) are OOB HTML swapped by htmx.
+
+    /// v1.7.2 — refresh the watchdog timestamp on every SSE event.
+    function noteEvent() { lastEventAt = Date.now(); }
 
     function connect() {
-        setStatus('connecting…', 'status-idle');
-        const es = new EventSource('/events');
-
-        es.addEventListener('open', () => setStatus('live', 'status-live'));
-
-        es.addEventListener('error', () => {
-            setStatus('disconnected', 'status-error');
-        });
-
-        // v1.7.2 — refresh the watchdog timestamp on every SSE
-        // frame. Each named handler below stamps `lastEventAt`
-        // inline. The watchdog tick reads it to decide whether
-        // a missed `turn_end` left us hanging.
-        function noteEvent() { lastEventAt = Date.now(); }
-
-        es.addEventListener('turn_start', () => {
-            noteEvent();
-            // v1.7.2 — header pill replaces the in-flow "thinking…"
-            // indicator as the canonical activity cue. We keep the
-            // in-flow indicator too for backwards compat but the
-            // pill is what users see when they've scrolled away.
-            setActivity('thinking…');
-            if (!active.el && toolCards.size === 0) showTurnIndicator();
-        });
-
-        es.addEventListener('turn_end', () => {
-            noteEvent();
-            endAssistantMessage();
-            hideTurnIndicator();
-            setStreaming(false);            // v1.7.2 (replaces v1.7.1 plumbing)
-            stopStatusLineTimer();          // v1.7.7
-            refreshStatusLineUsage();
-            input.focus();
-        });
-
-        es.addEventListener('message_start', (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            startAssistantMessage(data && data.role);
-            // v1.7.2 — assistant just started speaking; flip the
-            // pill from "thinking…" to "responding…".
-            if (data && data.role === 'assistant') setActivity('responding…');
-        });
-
-        es.addEventListener('message_update', (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            if (!data) return;
-            switch (data.deltaKind) {
-                case 'text':
-                    appendTextDelta(data.blockIndex || 0, data.delta || '');
-                    setActivity('responding…');
-                    break;
-                case 'thinking':
-                    appendThinkingDelta(data.blockIndex || 0, data.delta || '');
-                    setActivity('thinking…');
-                    break;
-                case 'toolcall_args':
-                    // v1.6.2 — open a pending tool card on first
-                    // delta for this block_index, append further
-                    // deltas into it. `tool_execution_start` claims
-                    // the card later by binding a call_id.
-                    appendToolArgsDelta(data.blockIndex || 0, data.delta || '');
-                    break;
-            }
-        });
-
-        es.addEventListener('message_end', () => {
-            noteEvent();
-            endAssistantMessage();
-        });
-
-        es.addEventListener('tool_execution_start', (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            if (!data) return;
-            startToolCall(data.callId, data.name || 'tool', data.argsJson || '');
-            // v2.31 — replay any sub-agent progress events that arrived
-            // before the tool card was created (timing race).
-            if (data.name === SUBAGENT_TOOL_NAME) {
-                const pending = pendingSubagentUpdates.get(data.callId);
-                if (pending) {
-                    pendingSubagentUpdates.delete(data.callId);
-                    for (const upd of pending) {
-                        const card = toolCards.get(data.callId);
-                        if (!card || !card.classList.contains('tool-card-subagent')) continue;
-                        const log = card.querySelector('.subagent-log');
-                        if (!log) continue;
-                        appendSubagentEntry(card, log, upd);
-                        appendSubagentPanelEvent(data.callId, upd);
-                    }
-                }
-            }
-            setActivity('running: ' + (data.name || 'tool'));
-        });
-
-        es.addEventListener('tool_execution_end', (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            if (!data) return;
-            endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '', data.detailsJson || null);
-            // After a tool completes the loop usually starts the
-            // next assistant turn — show "thinking…" until the
-            // next message_start arrives.
-            setActivity('thinking…');
-        });
-
-        // v2.6 — sub-agent progress updates. The server wraps each
-        // sub-agent structural event in a `tool_execution_update`
-        // event keyed by the parent subagent call's callId. The
-        // payload's `update` field contains the sub-agent JSON blob.
-        es.addEventListener('tool_execution_update', (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            if (!data || !data.callId) return;
-            let upd;
-            try {
-                upd = typeof data.update === 'string' ? JSON.parse(data.update) : data.update;
-            } catch (_) { return; }
-            if (!upd) return;
-
-            const card = toolCards.get(data.callId);
-            if (!card || !card.classList.contains('tool-card-subagent')) {
-                // v2.31 — tool_execution_start hasn't arrived yet (async
-                // race with sub-agent worker). Buffer the update and
-                // replay it when the start event creates the tool card.
-                let buf = pendingSubagentUpdates.get(data.callId);
-                if (!buf) {
-                    buf = [];
-                    pendingSubagentUpdates.set(data.callId, buf);
-                }
-                buf.push(upd);
-                return;
-            }
-            const log = card.querySelector('.subagent-log');
-            if (!log) return;
-            appendSubagentEntry(card, log, upd);
-            appendSubagentPanelEvent(data.callId, upd);
-        });
-
-        // v1.11.4 — pause-and-prompt permission overlay. Server
-        // suspends the worker on `ask`; we render a modal in the
-        // conversation pane and POST the user's choice to
-        // /permission/resolve to wake it.
-        es.addEventListener('tool_permission_request', (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            if (!data || !data.callId) return;
-            renderPermissionModal({
-                callId: data.callId,
-                toolName: data.toolName || 'tool',
-                argsJson: data.argsJson || '',
-                fingerprint: data.fingerprint || data.toolName || '',
-            });
-        });
-
-        es.addEventListener('agent_error', (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            const msg = data ? `${data.code}: ${data.message}` : 'agent error';
-            // Suppress the banner for aborted (user-driven stop) and for
-            // non-fatal advisory errors (isFatal===false) — those already
-            // appear in the guardrail tool card.
-            if (!(data && (data.code === 'aborted' || data.isFatal === false))) {
-                appendError(msg);
-            }
-            setStreaming(false);            // v1.7.2
-            hideTurnIndicator();
-            endAssistantMessage();
-            stopStatusLineTimer();          // v1.7.7
-            setStatusLine('');
-        });
-
-        // vN — graceful interrupt: the loop finished the current
-        // turn cleanly then stopped (user clicked Stop). Transition
-        // back to idle, same as turn_end but without queueing a
-        // follow-up.
-        es.addEventListener('agent_interrupted', (e) => {
-            noteEvent();
-            endAssistantMessage();
-            hideTurnIndicator();
-            setStreaming(false);
-            stopStatusLineTimer();
-            setStatusLine('');
-            input.focus();
-        });
-
-        // v1.7.0 — server fires this when the active session
-        // changes (via /session/activate or /session/new). Wipe
-        // the conversation and rehydrate from the new transcript.
-        es.addEventListener('session_switched', async (e) => {
-            noteEvent();
-            const data = parseData(e.data);
-            if (!data || !data.id) return;
-            await onSessionSwitched(data.id);
-        });
-
-        // v1.7.0 — refresh the sidebar after every turn ends so
-        // the message-count + updated-at timestamps stay current.
-        es.addEventListener('turn_end', () => loadSessions());
-
-        // v1.7.2 — watchdog. Every 5s, if `isStreaming` is true
-        // and no SSE event has arrived for `watchdogTimeoutMs`,
-        // surface an advisory. v1.7.4 made this non-destructive:
-        // we used to wipe the active assistant bubble and reset
-        // streaming state, but that produced false positives on
-        // long thinking phases AND fragmented mid-turn output
-        // when events resumed. The current behavior leaves all
-        // state untouched and just gives the user a one-time
-        // heads-up — they can wait or click Stop.
-        setInterval(function () {
-            if (!isStreaming) return;
-            if (lastEventAt === 0) return;
-            if (Date.now() - lastEventAt < watchdogTimeoutMs) return;
-            if (watchdogWarned) return;
-            watchdogWarned = true;
-            console.warn('franky watchdog: no SSE events for ' + watchdogTimeoutMs + 'ms while streaming — model is taking longer than usual.');
-            appendSystemMessage('',
-                '_Model is taking longer than usual to respond. Click **Stop** to cancel, or keep waiting._',
-                false);
-        }, 5_000);
-
-        // v1.7.4 — server-side keepalive: refresh the watchdog
-        // clock without doing anything user-visible. Server
-        // broadcasts `event: ping` every 15s while a turn is
-        // running.
-        es.addEventListener('ping', () => { noteEvent(); });
-
-        // v1.16.0 — the server fires `replay_gap` when a reconnecting
-        // client's Last-Event-ID is older than the oldest ring entry
-        // (ring overflow, typically from a large thinking-delta burst).
-        // For completed turns: wipe the pane and rehydrate from the
-        // persisted transcript so the user sees the full conversation.
-        // For in-flight turns: warn that some streamed content was lost
-        // and let the current stream continue from wherever it resumes.
-        es.addEventListener('replay_gap', async () => {
-            noteEvent();
-            if (!isStreaming) {
-                clearConversation();
-                await rehydrate();
-            } else {
-                appendSystemMessage('',
-                    '_Some streamed content was lost during reconnect. ' +
-                    'The response will continue from where it reconnected._',
-                    false);
-            }
-        });
-
-        return es;
+        // hx-sse manages the EventSource via hx-sse:connect on #sse-conn.
+        // We just listen for named events dispatched by hx-sse.
+        setStatus('live', 'status-live');
     }
+
+    sseConn.addEventListener('turn_start', () => {
+        noteEvent();
+        setActivity('thinking…');
+        if (!active.el && toolCards.size === 0) showTurnIndicator();
+    });
+
+    sseConn.addEventListener('turn_end', () => {
+        noteEvent();
+        endAssistantMessage();
+        hideTurnIndicator();
+        setStreaming(false);
+        stopStatusLineTimer();
+        refreshStatusLineUsage();
+        input.focus();
+        loadSessions();
+    });
+
+    sseConn.addEventListener('message_start', (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        startAssistantMessage(data && data.role);
+        if (data && data.role === 'assistant') setActivity('responding…');
+    });
+
+    sseConn.addEventListener('message_update', (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        if (!data) return;
+        switch (data.deltaKind) {
+            case 'text':
+                appendTextDelta(data.blockIndex || 0, data.delta || '');
+                setActivity('responding…');
+                break;
+            case 'thinking':
+                appendThinkingDelta(data.blockIndex || 0, data.delta || '');
+                setActivity('thinking…');
+                break;
+            case 'toolcall_args':
+                appendToolArgsDelta(data.blockIndex || 0, data.delta || '');
+                break;
+        }
+    });
+
+    sseConn.addEventListener('message_end', () => {
+        noteEvent();
+        endAssistantMessage();
+    });
+
+    sseConn.addEventListener('tool_execution_start', (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        if (!data) return;
+        startToolCall(data.callId, data.name || 'tool', data.argsJson || '');
+        if (data.name === SUBAGENT_TOOL_NAME) {
+            const pending = pendingSubagentUpdates.get(data.callId);
+            if (pending) {
+                pendingSubagentUpdates.delete(data.callId);
+                for (const upd of pending) {
+                    const card = toolCards.get(data.callId);
+                    if (!card || !card.classList.contains('tool-card-subagent')) continue;
+                    const log = card.querySelector('.subagent-log');
+                    if (!log) continue;
+                    appendSubagentEntry(card, log, upd);
+                    appendSubagentPanelEvent(data.callId, upd);
+                }
+            }
+        }
+        setActivity('running: ' + (data.name || 'tool'));
+    });
+
+    sseConn.addEventListener('tool_execution_end', (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        if (!data) return;
+        endToolCall(data.callId, !!data.isError, data.toolCode || null, data.resultText || '', data.detailsJson || null);
+        setActivity('thinking…');
+    });
+
+    sseConn.addEventListener('tool_execution_update', (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        if (!data || !data.callId) return;
+        let upd;
+        try {
+            upd = typeof data.update === 'string' ? JSON.parse(data.update) : data.update;
+        } catch (_) { return; }
+        if (!upd) return;
+
+        const card = toolCards.get(data.callId);
+        if (!card || !card.classList.contains('tool-card-subagent')) {
+            let buf = pendingSubagentUpdates.get(data.callId);
+            if (!buf) {
+                buf = [];
+                pendingSubagentUpdates.set(data.callId, buf);
+            }
+            buf.push(upd);
+            return;
+        }
+        const log = card.querySelector('.subagent-log');
+        if (!log) return;
+        appendSubagentEntry(card, log, upd);
+        appendSubagentPanelEvent(data.callId, upd);
+    });
+
+    // tool_permission_request is handled by the server as an OOB HTML
+    // fragment (swapped into #permission-modal by htmx automatically).
+    // No JS handler needed.
+
+    sseConn.addEventListener('agent_error', (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        const msg = data ? `${data.code}: ${data.message}` : 'agent error';
+        if (!(data && (data.code === 'aborted' || data.isFatal === false))) {
+            appendError(msg);
+        }
+        setStreaming(false);
+        hideTurnIndicator();
+        endAssistantMessage();
+        stopStatusLineTimer();
+        setStatusLine('');
+    });
+
+    sseConn.addEventListener('agent_interrupted', () => {
+        noteEvent();
+        endAssistantMessage();
+        hideTurnIndicator();
+        setStreaming(false);
+        stopStatusLineTimer();
+        setStatusLine('');
+        input.focus();
+    });
+
+    sseConn.addEventListener('session_switched', async (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        if (!data || !data.id) return;
+        await onSessionSwitched(data.id);
+    });
+
+    sseConn.addEventListener('provider_retry', (e) => {
+        noteEvent();
+        const data = parseData(e.detail.data);
+        if (!data) return;
+        setStatusLine('retry ' + data.attempt + ' (' + data.reason + '…)');
+        startStatusLineTimer();
+    });
+
+    sseConn.addEventListener('ping', () => { noteEvent(); });
+
+    sseConn.addEventListener('replay_gap', async () => {
+        noteEvent();
+        if (!isStreaming) {
+            clearConversation();
+            await rehydrate();
+        } else {
+            appendSystemMessage('',
+                '_Some streamed content was lost during reconnect. ' +
+                'The response will continue from where it reconnected._',
+                false);
+        }
+    });
+
+    // v1.7.2 — watchdog. Every 5s, if `isStreaming` is true
+    // and no SSE event has arrived for `watchdogTimeoutMs`,
+    // surface an advisory.
+    setInterval(function () {
+        if (!isStreaming) return;
+        if (lastEventAt === 0) return;
+        if (Date.now() - lastEventAt < watchdogTimeoutMs) return;
+        if (watchdogWarned) return;
+        watchdogWarned = true;
+        console.warn('franky watchdog: no SSE events for ' + watchdogTimeoutMs + 'ms while streaming — model is taking longer than usual.');
+        appendSystemMessage('',
+            '_Model is taking longer than usual to respond. Click **Stop** to cancel, or keep waiting._',
+            false);
+    }, 5_000);
 
     function parseData(raw) {
         try {

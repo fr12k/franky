@@ -4159,7 +4159,7 @@ test "proxy: GET / serves the web UI HTML" {
 test "proxy: GET /app.js serves the web UI script" {
     try runStaticAssetCase(.{
         .request_path = "/app.js",
-        .expect_substr = "EventSource('/events')",
+        .expect_substr = "sseConn.addEventListener",
         .expect_content_type = "text/javascript",
     });
 }
