@@ -250,13 +250,9 @@ pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             // Named JSON events — handled by JS for message state.
             try buf.appendSlice(allocator, "{}");
         },
-        .tool_execution_update => |u| {
-            // OOB HTML: append a subagent log entry into the tool card.
-            try buf.appendSlice(allocator, "<div hx-swap-oob=\"beforeend:tool-");
-            try appendHtmlEsc(&buf, allocator, u.call_id);
-            try buf.appendSlice(allocator, "\" class=\"subagent-entry\">");
-            try appendHtmlEsc(&buf, allocator, u.update_json);
-            try buf.appendSlice(allocator, "</div>");
+        .tool_execution_update => {
+            // Named JSON event — handled by JS for subagent panel state.
+            try buf.appendSlice(allocator, "{}");
         },
         .tool_permission_request => |r| {
             try buf.appendSlice(allocator, "<div id=\"permission-modal\" hx-swap-oob=\"true\" class=\"permission-modal\">");
@@ -305,9 +301,10 @@ pub fn isNamedHtmlEvent(ev: at.AgentEvent) bool {
         .tool_execution_start,
         .tool_execution_end,
         => true,
-        // tool_execution_update is OOB HTML — htmx swaps into the
-        // subagent-log container inside the existing tool card.
         .tool_execution_update,
+        => true,
+        // tool_permission_request is OOB HTML — htmx swaps into
+        // #permission-modal automatically.
         .tool_permission_request,
         => false,
     };
@@ -484,11 +481,13 @@ test "encodeEventHtml: tool_execution_end is JSON (named, JS-driven)" {
     try testing.expectEqualStrings("{}", html);
 }
 
-test "encodeEventHtml: html escaping handles <, >, & in OOB update" {
+test "encodeEventHtml: html escaping handles <, >, & in OOB permission modal" {
     const gpa = testing.allocator;
-    const html = try encodeEventHtml(gpa, .{ .tool_execution_update = .{
+    const html = try encodeEventHtml(gpa, .{ .tool_permission_request = .{
         .call_id = "c-2",
-        .update_json = "<script>alert(1)</script>",
+        .tool_name = "edit",
+        .args_json = "<script>alert(1)</script>",
+        .fingerprint = "fp",
     } });
     defer gpa.free(html);
     try testing.expect(std.mem.indexOf(u8, html, "&lt;script&gt;") != null);
@@ -516,7 +515,7 @@ test "isNamedHtmlEvent: text is named, thinking/toolcall are unnamed" {
         .block_index = 0,
         .delta = "x",
     } } }));
-    // tool_execution_start/end are named (JS manages toolCards map).
+    // tool_execution_start/end and tool_execution_update are named.
     try testing.expect(isNamedHtmlEvent(.{ .tool_execution_start = .{
         .call_id = "c",
         .name = "read",
@@ -526,8 +525,8 @@ test "isNamedHtmlEvent: text is named, thinking/toolcall are unnamed" {
         .call_id = "c",
         .result = .{ .is_error = false, .content = &.{}, .tool_code = null, .details_json = null },
     } }));
-    // tool_execution_update is OOB HTML (unnamed).
-    try testing.expect(!isNamedHtmlEvent(.{ .tool_execution_update = .{
+    // tool_execution_update is named JSON (subagent panel state).
+    try testing.expect(isNamedHtmlEvent(.{ .tool_execution_update = .{
         .call_id = "c",
         .update_json = "{}",
     } }));
