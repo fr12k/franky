@@ -1539,10 +1539,41 @@ function highlightCodeBlocks(container) {
     }
 
     // v1.11.4 — permission-prompt modal.
-    // REMOVED: now handled server-side via OOB HTML fragment in
-    // wire.zig encodeEventHtml + htmx auto-swap into #permission-modal.
-    function renderPermissionModal(_req) {
-        // no-op; server renders OOB HTML into #permission-modal.
+    // In htmx mode this is server-rendered OOB HTML. In native mode
+    // (no htmx), we render a modal inline and POST to /permission/resolve.
+    function renderPermissionModal(req) {
+        const el = document.createElement('div');
+        el.className = 'permission-modal';
+        el.dataset.callId = req.callId;
+        const head = document.createElement('div');
+        head.className = 'permission-head';
+        head.textContent = '🔒 permission required: ' + req.toolName;
+        el.appendChild(head);
+        const args = document.createElement('pre');
+        args.className = 'permission-args';
+        args.textContent = req.argsJson;
+        el.appendChild(args);
+        const buttons = document.createElement('div');
+        buttons.className = 'permission-buttons';
+        for (const c of [{ key: 'allow_once', label: 'Allow once', kind: 'allow' }, { key: 'always_allow', label: 'Always allow', kind: 'allow' }, { key: 'deny_once', label: 'Deny once', kind: 'deny' }, { key: 'always_deny', label: 'Always deny', kind: 'deny' }]) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'permission-btn permission-btn-' + c.kind;
+            btn.textContent = c.label;
+            btn.addEventListener('click', async () => {
+                try {
+                    await fetch('/permission/resolve', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: new URLSearchParams({ callId: req.callId, decision: c.key }),
+                    });
+                } catch (_) {}
+            });
+            buttons.appendChild(btn);
+        }
+        el.appendChild(buttons);
+        conversation.appendChild(el);
+        scrollToBottom();
     }
 
     // ── v2.6 helpers ─────────────────────────────────────────────
@@ -2063,8 +2094,8 @@ function highlightCodeBlocks(container) {
             // hx-sse manages the EventSource via hx-sse:connect on #sse-conn.
             sseConn.setAttribute('hx-sse:connect', '/events?html=1');
             sseConn.setAttribute('hx-swap', 'none');
-            // Re-process now that attributes are set.
-            htmx.trigger(sseConn, 'load');
+            // Process the element so hx-sse picks up the new attributes.
+            htmx.process(sseConn);
         } else {
             // Native EventSource — all events are named JSON frames.
             es = new EventSource('/events');
