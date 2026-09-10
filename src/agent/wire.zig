@@ -269,9 +269,10 @@ pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             if (e.result.is_error) try buf.appendSlice(allocator, " tool-card-error");
             try buf.appendSlice(allocator, "\" id=\"tool-");
             try appendHtmlEsc(&buf, allocator, e.call_id);
-            try buf.appendSlice(allocator, "\"><div class=\"tool-head\"><span class=\"tool-name\">");
-            // Tool name not carried in tool_execution_end; omit.
-            try buf.appendSlice(allocator, "</span></div><div class=\"tool-result\"><pre>");
+            // tool_execution_end does not carry the tool name (it was in
+            // tool_execution_start). Emit only the result region so the
+            // OOB swap replaces the result, not the whole card.
+            try buf.appendSlice(allocator, "\"><div class=\"tool-result\"><pre>");
             var combined: std.ArrayListUnmanaged(u8) = .empty;
             defer combined.deinit(allocator);
             for (e.result.content) |cb| {
@@ -311,8 +312,14 @@ pub fn isNamedHtmlEvent(ev: at.AgentEvent) bool {
         .agent_interrupted,
         .agent_error,
         .provider_retry,
-        .message_update, // text deltas stay JSON (Option B)
         => true,
+        // Text deltas stay JSON (Option B — client-side markdown render).
+        // thinking + toolcall_args are OOB HTML fragments (unnamed events).
+        .message_update => |m| switch (m) {
+            .text => true,
+            .thinking => false,
+            .toolcall_args => false,
+        },
         .message_start,
         .message_end,
         .tool_execution_start,
@@ -432,4 +439,109 @@ test "encodeEventJson: json escaping handles quotes and newlines" {
     defer gpa.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\\\"hi\\\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\\n") != null);
+}
+// ─── encodeEventHtml + isNamedHtmlEvent tests ─────────────────────
+
+test "encodeEventHtml: turn_start is empty JSON" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .turn_start);
+    defer gpa.free(html);
+    try testing.expectEqualStrings("{}", html);
+}
+
+test "encodeEventHtml: message_update text stays JSON (Option B)" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .message_update = .{ .text = .{
+        .block_index = 2,
+        .delta = "hello",
+    } } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"deltaKind\":\"text\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "\"delta\":\"hello\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<") == null); // no HTML
+}
+
+test "encodeEventHtml: thinking delta is OOB HTML fragment" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .message_update = .{ .thinking = .{
+        .block_index = 1,
+        .delta = "reasoning here",
+    } } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"thinking-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "hx-swap-oob=\"beforeend\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "reasoning here") != null);
+}
+
+test "encodeEventHtml: tool_execution_start emits tool card" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .tool_execution_start = .{
+        .call_id = "c-1",
+        .name = "read",
+        .args_json = "{\"path\":\"foo.zig\"}",
+    } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"tool-c-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "tool-name") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "read") != null);
+}
+
+test "encodeEventHtml: tool_execution_end emits result (no empty name span)" {
+    const gpa = testing.allocator;
+    var content = [_]ai_types.ContentBlock{.{ .text = .{ .text = "line1\nline2" } }};
+    const html = try encodeEventHtml(gpa, .{ .tool_execution_end = .{
+        .call_id = "c-1",
+        .result = .{
+            .is_error = false,
+            .content = &content,
+            .tool_code = null,
+            .details_json = null,
+        },
+    } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"tool-c-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "tool-result") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "line1") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "tool-name") == null); // no empty name span
+}
+
+test "encodeEventHtml: html escaping handles <, >, &" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .tool_execution_start = .{
+        .call_id = "c-2",
+        .name = "edit",
+        .args_json = "<script>alert(1)</script>",
+    } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "&lt;script&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<script>") == null); // no raw injection
+}
+
+test "isNamedHtmlEvent: text is named, thinking/toolcall are unnamed" {
+    try testing.expect(isNamedHtmlEvent(.turn_start));
+    try testing.expect(isNamedHtmlEvent(.turn_end));
+    try testing.expect(isNamedHtmlEvent(.agent_interrupted));
+    try testing.expect(isNamedHtmlEvent(.{ .agent_error = .{
+        .code = .compilation_failed,
+        .message = "err",
+    } }));
+    try testing.expect(isNamedHtmlEvent(.{ .message_update = .{ .text = .{
+        .block_index = 0,
+        .delta = "x",
+    } } }));
+    // thinking + toolcall_args are OOB HTML (unnamed).
+    try testing.expect(!isNamedHtmlEvent(.{ .message_update = .{ .thinking = .{
+        .block_index = 0,
+        .delta = "x",
+    } } }));
+    try testing.expect(!isNamedHtmlEvent(.{ .message_update = .{ .toolcall_args = .{
+        .block_index = 0,
+        .delta = "x",
+    } } }));
+    // content events are unnamed.
+    try testing.expect(!isNamedHtmlEvent(.{ .tool_execution_start = .{
+        .call_id = "c",
+        .name = "read",
+        .args_json = "{}",
+    } }));
 }
