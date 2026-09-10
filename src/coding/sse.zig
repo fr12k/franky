@@ -12,6 +12,7 @@
 const std = @import("std");
 const at = @import("../agent/types.zig");
 const wire = @import("../agent/wire.zig");
+const ai_types = @import("../ai/types.zig");
 
 pub const max_subs: usize = 32;
 pub const replay_ring_capacity: usize = 4096;
@@ -408,9 +409,84 @@ pub fn renderFrame(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
 pub fn renderFrameHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
     const body = try wire.encodeEventHtml(allocator, ev);
     defer allocator.free(body);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
     if (wire.isNamedHtmlEvent(ev)) {
         const kind = @tagName(ev);
-        return std.fmt.allocPrint(allocator, "event: {s}\ndata: {s}\n\n", .{ kind, body });
+        try buf.appendSlice(allocator, "event: ");
+        try buf.appendSlice(allocator, kind);
+        try buf.appendSlice(allocator, "\n");
     }
-    return std.fmt.allocPrint(allocator, "data: {s}\n\n", .{body});
+    // SSE spec: a `data:` field containing embedded newlines must be
+    // split into one `data:` line per row — the client rejoins them
+    // with `\n`. A bare `\n` in the body would terminate the data
+    // field prematurely and break the frame.
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        try buf.appendSlice(allocator, "data: ");
+        try buf.appendSlice(allocator, line);
+        try buf.appendSlice(allocator, "\n");
+    }
+    try buf.appendSlice(allocator, "\n");
+    return buf.toOwnedSlice(allocator);
+}
+
+// ─── renderFrameHtml tests ────────────────────────────────────────
+
+test "renderFrameHtml: named event (turn_start) gets event: prefix" {
+    const gpa = std.testing.allocator;
+    const frame = try renderFrameHtml(gpa, .turn_start);
+    defer gpa.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event: turn_start\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "data: {}\n") != null);
+}
+
+test "renderFrameHtml: text delta is named (Option B)" {
+    const gpa = std.testing.allocator;
+    const frame = try renderFrameHtml(gpa, .{ .message_update = .{ .text = .{
+        .block_index = 0,
+        .delta = "hi",
+    } } });
+    defer gpa.free(frame);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event: message_update\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "\"deltaKind\":\"text\"") != null);
+}
+
+test "renderFrameHtml: thinking delta is unnamed OOB" {
+    const gpa = std.testing.allocator;
+    const frame = try renderFrameHtml(gpa, .{ .message_update = .{ .thinking = .{
+        .block_index = 0,
+        .delta = "x",
+    } } });
+    defer gpa.free(frame);
+    // No event: prefix for unnamed OOB events.
+    try std.testing.expect(std.mem.indexOf(u8, frame, "event:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "data: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "hx-swap-oob") != null);
+}
+
+test "renderFrameHtml: multi-line body split into data: lines (SSE spec)" {
+    const gpa = std.testing.allocator;
+    // tool_execution_end with multi-line output.
+    var content = [_]ai_types.ContentBlock{.{ .text = .{ .text = "line1\nline2\nline3" } }};
+    const frame = try renderFrameHtml(gpa, .{ .tool_execution_end = .{
+        .call_id = "c",
+        .result = .{
+            .is_error = false,
+            .content = &content,
+            .tool_code = null,
+            .details_json = null,
+        },
+    } });
+    defer gpa.free(frame);
+    // Each line of the body must be on its own data: line.
+    try std.testing.expect(std.mem.indexOf(u8, frame, "data: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "line2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "line3") != null);
+    // No bare \n inside a data: field (all \n must be preceded by a data: line).
+    // Verify the frame ends with \n\n (SSE frame terminator).
+    try std.testing.expect(frame.len >= 2);
+    try std.testing.expect(frame[frame.len - 1] == '\n');
+    try std.testing.expect(frame[frame.len - 2] == '\n');
 }

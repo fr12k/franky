@@ -1813,15 +1813,16 @@ fn subagentProgressForward(
     if (session.hasHtmlSubscriber()) {
         const html_frame = sse_mod.renderFrameHtml(allocator, ev) catch null;
         defer if (html_frame) |hf| allocator.free(hf);
+        // ev.deinit after broadcast (frames are standalone strings, not
+        // backed by ev's owned data).
         if (html_frame) |hf| {
-            ev.deinit(allocator);
             session.broadcastEventDual(allocator, frame, hf);
+            ev.deinit(allocator);
             return;
         }
     }
-    ev.deinit(allocator);
-
     session.broadcastEvent(allocator, frame);
+    ev.deinit(allocator);
 }
 
 // ─── connection handling ─────────────────────────────────────────
@@ -1934,7 +1935,7 @@ fn handleConnection(arg: ConnArg) void {
             return;
         }
     }
-    if (std.mem.eql(u8, req.method, "GET") and std.mem.startsWith(u8, req.path, "/events")) {
+    if (std.mem.eql(u8, req.method, "GET") and (std.mem.eql(u8, req.path, "/events") or std.mem.startsWith(u8, req.path, "/events?"))) {
         // Detect ?html=1 to switch the SSE stream to htmx hx-sse mode
         // (HTML frames with OOB swaps instead of JSON).
         const html_mode = std.mem.indexOf(u8, req.path, "html=1") != null;
