@@ -105,6 +105,14 @@ pub fn buildRequestJson(
     }
     try buf.append(allocator, ']');
 
+    // §session-id — provider-agnostic session identifier for tracing
+    // and sticky routing (OpenRouter Broadcast, proxy sticky sessions,
+    // etc.). Providers that don't recognise the field silently ignore it.
+    if (options.session_id) |sid| {
+        try buf.appendSlice(allocator, ",\"session_id\":");
+        try utils.appendJsonStr(&buf, allocator, sid);
+    }
+
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
 }

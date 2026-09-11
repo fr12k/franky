@@ -401,6 +401,7 @@ fn runPrint(
             .retry_policy = resolved.retry_policy,
             .http_trace_dir = config_mod.resolveHttpTraceDir(cfg, environ_map),
             .headers = resolved.attribution_headers,
+            .session_id = session_state.id(),
         },
     };
     if (config_mod.resolveMaxTurns(cfg, environ_map)) |v| loop_cfg.max_turns = v;

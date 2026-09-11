@@ -774,6 +774,7 @@ fn runPrompt(
                     .retry_policy = print_mode.resolveRetryPolicyFromMap(session.cfg, null),
                     .http_trace_dir = print_mode.resolveHttpTraceDirFromMap(session.cfg, session.environ_map),
                     .headers = session.attribution_headers,
+                    .session_id = session.session_id,
                 },
             };
             // v3.0 — wire compression into the agent loop via DI.
