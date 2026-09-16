@@ -153,6 +153,109 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
     return try buf.toOwnedSlice(allocator);
 }
 
+/// HTML-escape `s` into `buf`. Replaces the browser-side `escapeHtml`
+/// for all server-rendered fragments. Escapes &, <, >, ", '.
+fn appendHtmlEsc(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '&' => try buf.appendSlice(allocator, "&amp;"),
+        '<' => try buf.appendSlice(allocator, "&lt;"),
+        '>' => try buf.appendSlice(allocator, "&gt;"),
+        '"' => try buf.appendSlice(allocator, "&quot;"),
+        '\'' => try buf.appendSlice(allocator, "&#39;"),
+        else => try buf.append(allocator, c),
+    };
+}
+
+/// Encode `ev` for the htmx SSE path. Named events delegate to
+/// `encodeEventJson` so JS handlers receive the same payload they
+/// expect. Unnamed events produce OOB HTML fragments that htmx
+/// swaps automatically. See `sse.renderFrameHtml` for SSE framing.
+pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
+    // Named events produce the same JSON payload as encodeEventJson.
+    // JS handlers parse `event.detail.data` for the same fields.
+    if (isNamedHtmlEvent(ev)) {
+        return encodeEventJson(allocator, ev);
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    switch (ev) {
+        // ── OOB HTML: thinking/toolcall_args deltas ────────────────
+        .message_update => |m| switch (m) {
+            .text => unreachable, // named, handled by guard above
+            .thinking => |t| {
+                try buf.appendSlice(allocator, "<div id=\"thinking-");
+                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
+                try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"thinking-delta\">");
+                try appendHtmlEsc(&buf, allocator, t.delta);
+                try buf.appendSlice(allocator, "</div>");
+            },
+            .toolcall_args => |t| {
+                try buf.appendSlice(allocator, "<span id=\"toolcall-args-");
+                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
+                try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"toolcall-args-delta\">");
+                try appendHtmlEsc(&buf, allocator, t.delta);
+                try buf.appendSlice(allocator, "</span>");
+            },
+        },
+
+        // ── OOB HTML: permission modal ────────────────────────────
+        .tool_permission_request => |r| {
+            try buf.appendSlice(allocator, "<div id=\"permission-modal\" hx-swap-oob=\"true\" class=\"permission-modal\">");
+            try buf.appendSlice(allocator, "<div class=\"permission-card\"><h3>Permission required</h3>");
+            try buf.appendSlice(allocator, "<p>Tool: <code>");
+            try appendHtmlEsc(&buf, allocator, r.tool_name);
+            try buf.appendSlice(allocator, "</code></p><p>Args: <code>");
+            try appendHtmlEsc(&buf, allocator, r.args_json);
+            try buf.appendSlice(allocator, "</code></p>");
+            try buf.appendSlice(allocator, "<form hx-post=\"/permission/resolve\" hx-target=\"#permission-modal\" hx-swap=\"outerHTML\">");
+            try buf.appendSlice(allocator, "<input type=\"hidden\" name=\"callId\" value=\"");
+            try appendHtmlEsc(&buf, allocator, r.call_id);
+            try buf.appendSlice(allocator, "\" />");
+            try buf.appendSlice(allocator, "<button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>");
+            try buf.appendSlice(allocator, "<button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>");
+            try buf.appendSlice(allocator, "</form></div></div>");
+        },
+
+        // All named events are handled by isNamedHtmlEvent guard above.
+        .turn_start, .turn_end, .agent_interrupted, .agent_error,
+        .provider_retry, .message_start, .message_end,
+        .tool_execution_start, .tool_execution_end, .tool_execution_update => unreachable,
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Whether `ev` should be sent as a named SSE event (JSON payload,
+/// client handles via `hx-on`) vs an unnamed event (HTML fragment,
+/// htmx processes OOB swaps). Named events are those that need JS
+/// state management (tool cards, subagent panel, active message);
+/// unnamed events are server-rendered HTML swapped by htmx.
+pub fn isNamedHtmlEvent(ev: at.AgentEvent) bool {
+    // ── Named: lifecycle + text deltas (JS-driven) ────────────────
+    return switch (ev) {
+        .turn_start,
+        .turn_end,
+        .agent_interrupted,
+        .agent_error,
+        .provider_retry,
+        .message_start,
+        .message_end,
+        .tool_execution_start,
+        .tool_execution_end,
+        .tool_execution_update,
+        => true,
+        // Text deltas stay JSON (Option B — client-side markdown render).
+        .message_update => |m| switch (m) {
+            .text => true,
+            .thinking => false,
+            .toolcall_args => false,
+        },
+        // ── Unnamed: OOB HTML (htmx auto-swap) ────────────────────
+        .tool_permission_request => false,
+    };
+}
+
 fn roleName(r: ai_types.Role) []const u8 {
     return switch (r) {
         .user => "user",
@@ -262,4 +365,115 @@ test "encodeEventJson: json escaping handles quotes and newlines" {
     defer gpa.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\\\"hi\\\"") != null);
     try testing.expect(std.mem.indexOf(u8, json, "\\n") != null);
+}
+// ─── encodeEventHtml + isNamedHtmlEvent tests ─────────────────────
+
+test "encodeEventHtml: turn_start delegates to encodeEventJson" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .turn_start);
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"kind\":\"turn_start\"") != null);
+}
+
+test "encodeEventHtml: message_update text stays JSON (Option B)" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .message_update = .{ .text = .{
+        .block_index = 2,
+        .delta = "hello",
+    } } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"deltaKind\":\"text\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "\"delta\":\"hello\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<") == null); // no HTML
+}
+
+test "encodeEventHtml: thinking delta is OOB HTML fragment" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .message_update = .{ .thinking = .{
+        .block_index = 1,
+        .delta = "reasoning here",
+    } } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "id=\"thinking-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "hx-swap-oob=\"beforeend\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "reasoning here") != null);
+}
+
+test "encodeEventHtml: tool_execution_start delegates to encodeEventJson" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .tool_execution_start = .{
+        .call_id = "c-1",
+        .name = "read",
+        .args_json = "{\"path\":\"foo.zig\"}",
+    } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"callId\":\"c-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "\"name\":\"read\"") != null);
+}
+
+test "encodeEventHtml: tool_execution_end delegates to encodeEventJson" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .tool_execution_end = .{
+        .call_id = "c-1",
+        .result = .{
+            .is_error = false,
+            .content = &.{},
+            .tool_code = null,
+            .details_json = null,
+        },
+    } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "\"callId\":\"c-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "\"isError\":false") != null);
+}
+
+test "encodeEventHtml: html escaping handles <, >, & in OOB permission modal" {
+    const gpa = testing.allocator;
+    const html = try encodeEventHtml(gpa, .{ .tool_permission_request = .{
+        .call_id = "c-2",
+        .tool_name = "edit",
+        .args_json = "<script>alert(1)</script>",
+        .fingerprint = "fp",
+    } });
+    defer gpa.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "&lt;script&gt;") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "<script>") == null);
+}
+
+test "isNamedHtmlEvent: text is named, thinking/toolcall are unnamed" {
+    try testing.expect(isNamedHtmlEvent(.turn_start));
+    try testing.expect(isNamedHtmlEvent(.turn_end));
+    try testing.expect(isNamedHtmlEvent(.agent_interrupted));
+    try testing.expect(isNamedHtmlEvent(.{ .agent_error = .{
+        .code = .compilation_failed,
+        .message = "err",
+    } }));
+    try testing.expect(isNamedHtmlEvent(.{ .message_update = .{ .text = .{
+        .block_index = 0,
+        .delta = "x",
+    } } }));
+    // thinking + toolcall_args are OOB HTML (unnamed).
+    try testing.expect(!isNamedHtmlEvent(.{ .message_update = .{ .thinking = .{
+        .block_index = 0,
+        .delta = "x",
+    } } }));
+    try testing.expect(!isNamedHtmlEvent(.{ .message_update = .{ .toolcall_args = .{
+        .block_index = 0,
+        .delta = "x",
+    } } }));
+    // tool_execution_start/end and tool_execution_update are named.
+    try testing.expect(isNamedHtmlEvent(.{ .tool_execution_start = .{
+        .call_id = "c",
+        .name = "read",
+        .args_json = "{}",
+    } }));
+    try testing.expect(isNamedHtmlEvent(.{ .tool_execution_end = .{
+        .call_id = "c",
+        .result = .{ .is_error = false, .content = &.{}, .tool_code = null, .details_json = null },
+    } }));
+    // tool_execution_update is named JSON (subagent panel state).
+    try testing.expect(isNamedHtmlEvent(.{ .tool_execution_update = .{
+        .call_id = "c",
+        .update_json = "{}",
+    } }));
 }
