@@ -10,10 +10,9 @@
     <script src="/hx-sse.min.js"></script>
 </head>
 <body>
-    <!-- SSE connection element. When htmx is loaded, hx-sse connects
-         to /events?html=1 for OOB HTML swaps. Without htmx, app.js
-         creates a native EventSource to /events using JSON frames.
-         See connect() in app.js. -->
+    <!-- SSE connection element. connect() in app.js sets
+         hx-sse:connect="/events?html=1" dynamically so htmx's hx-sse
+         extension can pick up the attribute. -->
     <div id="sse-conn"></div>
     <!-- OOB target for permission modals (tool_permission_request) -->
     <div id="permission-modal"></div>

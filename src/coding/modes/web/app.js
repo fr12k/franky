@@ -1539,42 +1539,9 @@ function highlightCodeBlocks(container) {
     }
 
     // v1.11.4 — permission-prompt modal.
-    // In htmx mode this is server-rendered OOB HTML. In native mode
-    // (no htmx), we render a modal inline and POST to /permission/resolve.
-    function renderPermissionModal(req) {
-        const el = document.createElement('div');
-        el.className = 'permission-modal';
-        el.dataset.callId = req.callId;
-        const head = document.createElement('div');
-        head.className = 'permission-head';
-        head.textContent = '🔒 permission required: ' + req.toolName;
-        el.appendChild(head);
-        const args = document.createElement('pre');
-        args.className = 'permission-args';
-        args.textContent = req.argsJson;
-        el.appendChild(args);
-        const buttons = document.createElement('div');
-        buttons.className = 'permission-buttons';
-        for (const c of [{ key: 'allow_once', label: 'Allow once', kind: 'allow' }, { key: 'always_allow', label: 'Always allow', kind: 'allow' }, { key: 'deny_once', label: 'Deny once', kind: 'deny' }, { key: 'always_deny', label: 'Always deny', kind: 'deny' }]) {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'permission-btn permission-btn-' + c.kind;
-            btn.textContent = c.label;
-            btn.addEventListener('click', async () => {
-                try {
-                    await fetch('/permission/resolve', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: new URLSearchParams({ callId: req.callId, decision: c.key }),
-                    });
-                } catch (_) {}
-            });
-            buttons.appendChild(btn);
-        }
-        el.appendChild(buttons);
-        conversation.appendChild(el);
-        scrollToBottom();
-    }
+    // Handled server-side via OOB HTML fragment in wire.zig
+    // encodeEventHtml + htmx auto-swap into #permission-modal.
+    // No JS handler needed.
 
     // ── v2.6 helpers ─────────────────────────────────────────────
 
@@ -2055,57 +2022,33 @@ function highlightCodeBlocks(container) {
         updateSubagentPanelSubtitle();
     }
 
-    // ── SSE event wiring (dual-mode) ────────────────────────────────
+    // ── hx-sse event wiring ───────────────────────────────────────
     //
-    // Two connection modes:
-    //   htmx  — hx-sse:connect="/events?html=1". Named events fire
-    //           as DOM events on #sse-conn with `event.detail.data`.
-    //           Unnamed frames are OOB HTML swapped automatically.
-    //   native — new EventSource("/events"). All events are named
-    //            JSON frames. The permission modal is rendered by JS.
-    //
-    // Both modes use the same event handlers defined below. The
-    // `useHtmx` flag set in connect() controls whether handlers
-    // read from e.detail.data (htmx) or e.data (native EventSource).
+    // htmx's hx-sse extension connects to `/events?html=1` and
+    // dispatches named SSE frames as DOM events on #sse-conn with
+    // `event.detail.data`. Unnamed frames (bare `data:`) are OOB
+    // HTML swapped automatically by htmx.
 
     /// v1.7.2 — refresh the watchdog timestamp on every SSE event.
     function noteEvent() { lastEventAt = Date.now(); }
 
-    let es = null;         // native EventSource (null when using htmx)
-    let useHtmx = false;   // set by connect()
-
-    /** Register a named SSE event handler.
+    /** Register a named SSE event handler on #sse-conn.
      *  `on`  — event name string, e.g. "turn_start"
-     *  `fn`  — handler receiving parsed data object (or null for no-data events)
-     *          The handler signature is always `(data)` where data is the
-     *          JSON-parsed payload or null for events with empty body.
+     *  `fn`  — handler receiving parsed data object (or null)
      */
     function listen(on, fn) {
-        const wrap = useHtmx
-            ? (e) => fn(parseData(e.detail.data))
-            : (e) => fn(parseData(e.data));
-        (useHtmx ? sseConn : es).addEventListener(on, wrap);
+        sseConn.addEventListener(on, (e) => fn(parseData(e.detail.data)));
     }
 
     function connect() {
-        useHtmx = typeof htmx !== 'undefined' && htmx;
-
-        if (useHtmx) {
-            // hx-sse manages the EventSource via hx-sse:connect on #sse-conn.
-            sseConn.setAttribute('hx-sse:connect', '/events?html=1');
-            sseConn.setAttribute('hx-swap', 'none');
-            // Process the element so hx-sse picks up the new attributes.
-            htmx.process(sseConn);
-        } else {
-            // Native EventSource — all events are named JSON frames.
-            es = new EventSource('/events');
-            es.addEventListener('open', () => setStatus('live', 'status-live'));
-            es.addEventListener('error', () => setStatus('disconnected', 'status-error'));
-        }
-
+        // hx-sse manages the EventSource via hx-sse:connect on #sse-conn.
+        sseConn.setAttribute('hx-sse:connect', '/events?html=1');
+        sseConn.setAttribute('hx-swap', 'none');
+        // Process the element so hx-sse picks up the attributes.
+        htmx.process(sseConn);
         setStatus('live', 'status-live');
 
-        // ── Named event handlers (shared by both modes) ────────────
+        // ── Named event handlers ────────────────────────────────────
 
         listen('turn_start', () => {
             noteEvent();
@@ -2206,19 +2149,8 @@ function highlightCodeBlocks(container) {
             appendSubagentPanelEvent(data.callId, upd);
         });
 
-        // tool_permission_request in htmx mode is OOB HTML swapped by htmx.
-        // In native mode, render the permission modal via JS.
-        listen('tool_permission_request', (data) => {
-            noteEvent();
-            if (!data || !data.callId) return;
-            if (useHtmx) return; // OOB HTML handles it
-            renderPermissionModal({
-                callId: data.callId,
-                toolName: data.toolName || 'tool',
-                argsJson: data.argsJson || '',
-                fingerprint: data.fingerprint || data.toolName || '',
-            });
-        });
+        // tool_permission_request is OOB HTML — htmx swaps it into
+        // #permission-modal automatically. No JS handler needed.
 
         listen('agent_error', (data) => {
             noteEvent();
