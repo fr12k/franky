@@ -451,12 +451,13 @@ test "faux matcher selects by last_user_has_image" {
 
     // Build a user message: one text + one image block.
     const content = try gpa.alloc(types.ContentBlock, 2);
-    defer gpa.free(content);
     content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "look") } };
     content[1] = .{ .image = .{ .data = try gpa.dupe(u8, "QkFTRTY="), .mime_type = try gpa.dupe(u8, "image/png") } };
     const msgs = try gpa.alloc(types.Message, 1);
     defer gpa.free(msgs);
     msgs[0] = .{ .role = .user, .content = content, .timestamp = 0 };
+    // Message.deinit frees the content array + block payloads.
+    // Do NOT separately free `content` — that would double-free.
     defer {
         var m = msgs[0];
         m.deinit(gpa);
