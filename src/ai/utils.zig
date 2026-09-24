@@ -137,6 +137,101 @@ test "sanitizeJsonString: \\c gets doubled to \\\\c" {
     try testing.expectEqualStrings("<|\\\\const utils", out);
 }
 
+// ─── v3.x image-input helpers ─────────────────────────────────────
+//
+// Shared utilities for loading, validating, and base64-encoding image
+// bytes so that every entry point (CLI `--image`, RPC `images` param,
+// SDK `imageBlock`) builds `ImageContent` consistently. These live in
+// the `ai` layer (not `coding`) so the SDK can call them without
+// pulling the coding layer.
+
+/// Sniff a MIME type from a filename extension. Returns
+/// `application/octet-stream` for unknown extensions so callers can
+/// still attempt to send it (the provider may accept or reject).
+pub fn mimeFromPath(path: []const u8) []const u8 {
+    // Find the last '.'.
+    var i: usize = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i] == '.') return mimeFromExtension(path[i + 1 ..]);
+        if (path[i] == '/' or path[i] == '\\') break;
+    }
+    return "application/octet-stream";
+}
+
+/// Lowercase-tolerant extension → mime map.
+pub fn mimeFromExtension(ext: []const u8) []const u8 {
+    if (eqIgnoreCase(ext, "png")) return "image/png";
+    if (eqIgnoreCase(ext, "jpg") or eqIgnoreCase(ext, "jpeg")) return "image/jpeg";
+    if (eqIgnoreCase(ext, "gif")) return "image/gif";
+    if (eqIgnoreCase(ext, "webp")) return "image/webp";
+    if (eqIgnoreCase(ext, "bmp")) return "image/bmp";
+    return "application/octet-stream";
+}
+
+/// Is `mime` a type we accept for inline image input?
+pub fn isAcceptableImageMime(mime: []const u8) bool {
+    return std.mem.eql(u8, mime, "image/png") or
+        std.mem.eql(u8, mime, "image/jpeg") or
+        std.mem.eql(u8, mime, "image/gif") or
+        std.mem.eql(u8, mime, "image/webp") or
+        std.mem.eql(u8, mime, "image/bmp");
+}
+
+/// Validate image bytes against size + mime limits. Returns
+/// `error.PayloadTooLarge` / `error.RequestInvalid` on violation.
+/// `max_bytes` of 0 disables the size check.
+pub fn validateImage(data_len: usize, mime: []const u8, max_bytes: usize) !void {
+    if (!isAcceptableImageMime(mime)) return error.RequestInvalid;
+    if (max_bytes != 0 and data_len > max_bytes) return error.PayloadTooLarge;
+}
+
+/// Base64-encode `raw` into a freshly-allocated, caller-owned slice.
+pub fn base64Encode(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const out_len = enc.calcSize(raw.len);
+    const out = try allocator.alloc(u8, out_len);
+    _ = enc.encode(out, raw);
+    return out;
+}
+
+fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
+test "mimeFromPath: common extensions" {
+    try testing.expectEqualStrings("image/png", mimeFromPath("foo.png"));
+    try testing.expectEqualStrings("image/jpeg", mimeFromPath("a/b/photo.JPG"));
+    try testing.expectEqualStrings("image/webp", mimeFromPath("x.webp"));
+    try testing.expectEqualStrings("application/octet-stream", mimeFromPath("noext"));
+    try testing.expectEqualStrings("application/octet-stream", mimeFromPath("dir/"));
+}
+
+test "isAcceptableImageMime: accepts known, rejects unknown" {
+    try testing.expect(isAcceptableImageMime("image/png"));
+    try testing.expect(isAcceptableImageMime("image/jpeg"));
+    try testing.expect(!isAcceptableImageMime("application/pdf"));
+    try testing.expect(!isAcceptableImageMime("image/svg+xml"));
+}
+
+test "validateImage: enforces size + mime" {
+    try validateImage(100, "image/png", 0);
+    try validateImage(100, "image/png", 200);
+    try testing.expectError(error.PayloadTooLarge, validateImage(300, "image/png", 200));
+    try testing.expectError(error.RequestInvalid, validateImage(100, "application/pdf", 0));
+}
+
+test "base64Encode: round-trips" {
+    const gpa = testing.allocator;
+    const enc = try base64Encode(gpa, "hello");
+    defer gpa.free(enc);
+    try testing.expectEqualStrings("aGVsbG8=", enc);
+}
+
 test "sanitizeJsonString: trailing lone backslash is escaped" {
     const gpa = testing.allocator;
     const input = "trailing\\";

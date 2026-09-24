@@ -129,6 +129,12 @@ pub const Settings = struct {
     /// > profile `max_turns` > settings `max_turns` > built-in default 100.
     max_turns: ?u32 = null,
 
+    /// v3.x — `max_image_bytes: int`. Per-image byte cap for `--image` /
+    /// `--image-stdin` / RPC `images` / SDK `imageBlock`. 0 = use the
+    /// built-in default (`default_max_image_bytes`). Precedence:
+    /// settings `max_image_bytes` > built-in default.
+    max_image_bytes: ?usize = null,
+
     /// v2.13 — retry policy overrides. Parsed from `tools.retry.*`.
     /// CLI flags `--retry-max-attempts` / `--retry-max-total-ms` still win.
     retry_max_attempts: ?u32 = null,
@@ -198,6 +204,9 @@ pub const default_thinking: []const u8 = "off";
 pub const default_auto_compact: bool = true;
 pub const default_keybindings: KeybindingPreset = .emacs;
 pub const default_theme: []const u8 = "default";
+/// v3.x — 20 MiB per-image cap for inline image input. Override via
+/// settings `max_image_bytes`.
+pub const default_max_image_bytes: usize = 20 * 1024 * 1024;
 
 /// Built-in defaults. Every layer can override any subset; missing
 /// fields fall through.
@@ -438,6 +447,11 @@ fn applyLayerBytes(settings: *Settings, bytes: []const u8) !void {
 
     if (obj.get("max_turns")) |v| if (v == .integer and v.integer >= 1 and v.integer <= std.math.maxInt(u32)) {
         settings.max_turns = @intCast(v.integer);
+    };
+
+    // v3.x — per-image byte cap.
+    if (obj.get("max_image_bytes")) |v| if (v == .integer and v.integer >= 0) {
+        settings.max_image_bytes = @intCast(v.integer);
     };
 
     try applyReviewSection(settings, obj);

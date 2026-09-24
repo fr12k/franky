@@ -318,9 +318,34 @@ fn runPrint(
 
     // Append the new user prompt (if any — an empty prompt under --resume
     // means "continue with whatever is in the transcript").
-    if (cfg.prompt.len > 0) {
-        const content = try allocator.alloc(ai.types.ContentBlock, 1);
-        content[0] = .{ .text = .{ .text = try allocator.dupe(u8, cfg.prompt) } };
+    //
+    // v3.x — when `--image` / `--image-stdin` are present, attach the
+    // images as `.image` content blocks after the text block.
+    const has_images = cfg.images.len > 0 or cfg.image_stdin;
+    if (cfg.prompt.len > 0 or has_images) {
+        const text_block: ?ai.types.ContentBlock = if (cfg.prompt.len > 0)
+            .{ .text = .{ .text = try allocator.dupe(u8, cfg.prompt) } }
+        else
+            null;
+
+        var image_blocks: std.ArrayList(ai.types.ContentBlock) = .empty;
+        defer image_blocks.deinit(allocator);
+        if (has_images) {
+            const max_bytes = resolveMaxImageBytes(allocator, io, environ);
+            try loadImageBlocks(allocator, io, cfg, max_bytes, &image_blocks);
+        }
+
+        const total = (if (text_block != null) @as(usize, 1) else 0) + image_blocks.items.len;
+        const content = try allocator.alloc(ai.types.ContentBlock, total);
+        var wi: usize = 0;
+        if (text_block) |tb| {
+            content[wi] = tb;
+            wi += 1;
+        }
+        for (image_blocks.items) |ib| {
+            content[wi] = ib;
+            wi += 1;
+        }
         try session_state.transcript.append(.{
             .role = .user,
             .content = content,
@@ -404,6 +429,8 @@ fn runPrint(
             .session_id = session_state.id(),
         },
     };
+    // v3.x — bypass the vision capability gate when --force-image is set.
+    loop_cfg.force_image = cfg.force_image;
     if (config_mod.resolveMaxTurns(cfg, environ_map)) |v| loop_cfg.max_turns = v;
     const worker_args: WorkerArgs = .{
         .allocator = allocator,
@@ -933,6 +960,99 @@ pub fn loadSettingsForOverlay(
     const pwd = environ.getPosix("PWD");
     return settings_mod.loadLayered(allocator, io, pwd, home) catch
         try settings_mod.defaults(allocator);
+}
+
+/// v3.x — resolve the per-image byte cap. Precedence:
+/// settings `max_image_bytes` > built-in default.
+pub fn resolveMaxImageBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+) usize {
+    var settings = loadSettingsForOverlay(allocator, io, environ) catch
+        return settings_mod.default_max_image_bytes;
+    defer settings.deinit();
+    return settings.max_image_bytes orelse settings_mod.default_max_image_bytes;
+}
+
+/// v3.x — same as `resolveMaxImageBytes` but takes the environ *map*
+/// (the form stored on `Session`). Used by RPC/proxy mode drivers that
+/// only retain `environ_map`, not the `Environ` handle.
+pub fn resolveMaxImageBytesFromMap(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+) usize {
+    const home = environ_map.get("FRANKY_HOME") orelse environ_map.get("HOME");
+    const pwd = environ_map.get("PWD");
+    var settings = settings_mod.loadLayered(allocator, io, pwd, home) catch
+        return settings_mod.default_max_image_bytes;
+    defer settings.deinit();
+    return settings.max_image_bytes orelse settings_mod.default_max_image_bytes;
+}
+
+/// v3.x — load every `--image <path>` file plus the optional stdin
+/// image, base64-encode them, and append `.image` content blocks to
+/// `out`. Each block owns its `data` + `mime_type` from `allocator`;
+/// ownership transfers to the caller (typically into a transcript
+/// message, freed via `Message.deinit`).
+///
+/// Errors surface as Zig errors; the mode driver maps them to a
+/// stderr message + non-zero exit.
+fn loadImageBlocks(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *const cli_mod.Config,
+    max_bytes: usize,
+    out: *std.ArrayList(ai.types.ContentBlock),
+) !void {
+    const utils = ai.utils;
+    const cwd = std.Io.Dir.cwd();
+    // File paths.
+    for (cfg.images) |path| {
+        const file = cwd.openFile(io, path, .{}) catch |err| {
+            ai.log.log(.warn, "image", "load", "open {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        defer file.close(io);
+        const flen = file.length(io) catch |err| {
+            ai.log.log(.warn, "image", "load", "stat {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        if (flen > max_bytes) return error.PayloadTooLarge;
+        const raw = try allocator.alloc(u8, @intCast(flen));
+        defer allocator.free(raw);
+        _ = file.readPositionalAll(io, raw, 0) catch |err| {
+            ai.log.log(.warn, "image", "load", "read {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+        const mime = utils.mimeFromPath(path);
+        try utils.validateImage(raw.len, mime, max_bytes);
+        const b64 = try utils.base64Encode(allocator, raw);
+        const mime_owned = try allocator.dupe(u8, mime);
+        try out.append(allocator, .{ .image = .{ .data = b64, .mime_type = mime_owned } });
+    }
+    // stdin image.
+    if (cfg.image_stdin) {
+        const stdin = std.Io.File.stdin();
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(allocator);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = std.posix.read(stdin.handle, &chunk) catch |err| {
+                ai.log.log(.warn, "image", "stdin", "read: {s}", .{@errorName(err)});
+                return err;
+            };
+            if (n == 0) break;
+            try raw.appendSlice(allocator, chunk[0..n]);
+            if (max_bytes != 0 and raw.items.len > max_bytes) return error.PayloadTooLarge;
+        }
+        const mime = cfg.image_stdin_mime;
+        try utils.validateImage(raw.items.len, mime, max_bytes);
+        const b64 = try utils.base64Encode(allocator, raw.items);
+        const mime_owned = try allocator.dupe(u8, mime);
+        try out.append(allocator, .{ .image = .{ .data = b64, .mime_type = mime_owned } });
+    }
 }
 
 /// v1.19.0 — copy the relevant settings.json overlay fields onto
@@ -2671,4 +2791,83 @@ test "resolvePromptsDefault: CLI wins; settings only when CLI is off" {
     // CLI on, settings on → true.
     settings.prompts_default = true;
     try testing.expect(resolvePromptsDefault(&cfg, &settings));
+}
+
+test "loadImageBlocks: loads + base64-encodes a file image" {
+    // Write a tiny temp file with a .png extension.
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(root);
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, root) catch {};
+    const path = try std.fmt.allocPrint(gpa, "{s}/test.png", .{root});
+    defer gpa.free(path);
+    {
+        var f = try cwd.createFile(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, &.{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a });
+    }
+
+    // Build a minimal config pointing at the temp file.
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    defer cfg.deinit();
+    const a = cfg.arena.allocator();
+    const imgs = try a.alloc([]const u8, 1);
+    imgs[0] = try a.dupe(u8, path);
+    cfg.images = imgs;
+
+    var blocks: std.ArrayList(ai.types.ContentBlock) = .empty;
+    defer {
+        for (blocks.items) |cb| cb.deinit(gpa);
+        blocks.deinit(gpa);
+    }
+    try loadImageBlocks(gpa, io, &cfg, 1024, &blocks);
+    try testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try testing.expect(blocks.items[0] == .image);
+    try testing.expectEqualStrings("image/png", blocks.items[0].image.mime_type);
+    // base64 of the 8 PNG header bytes.
+    try testing.expectEqualStrings("iVBORw0KGgo=", blocks.items[0].image.data);
+}
+
+test "loadImageBlocks: rejects oversize image" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(root);
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, root) catch {};
+    const path = try std.fmt.allocPrint(gpa, "{s}/big.png", .{root});
+    defer gpa.free(path);
+    {
+        var f = try cwd.createFile(io, path, .{});
+        defer f.close(io);
+        var big_buf: [16]u8 = undefined;
+        @memset(&big_buf, 0x89);
+        try f.writeStreamingAll(io, &big_buf);
+    }
+
+    var cfg: cli_mod.Config = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    defer cfg.deinit();
+    const a = cfg.arena.allocator();
+    const imgs = try a.alloc([]const u8, 1);
+    imgs[0] = try a.dupe(u8, path);
+    cfg.images = imgs;
+
+    var blocks: std.ArrayList(ai.types.ContentBlock) = .empty;
+    defer blocks.deinit(gpa);
+    // max_bytes=4 but file is 16 → PayloadTooLarge.
+    try testing.expectError(error.PayloadTooLarge, loadImageBlocks(gpa, io, &cfg, 4, &blocks));
 }

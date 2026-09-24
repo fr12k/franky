@@ -125,6 +125,16 @@ fn appendInputItem(
                         try utils.appendJsonStr(buf, allocator, t.text);
                         try buf.append(allocator, '}');
                     },
+                    .image => |img| {
+                        // OpenAI Responses API accepts inline `input_image`
+                        // parts with a `data:` URI — same base64 convention
+                        // as Chat Completions `image_url`.
+                        try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":\"data:");
+                        try utils.appendJsonRaw(buf, allocator, img.mime_type);
+                        try buf.appendSlice(allocator, ";base64,");
+                        try utils.appendJsonRaw(buf, allocator, img.data);
+                        try buf.appendSlice(allocator, "\"}");
+                    },
                     else => try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":\"[unsupported]\"}"),
                 }
             }
@@ -480,6 +490,29 @@ test "buildRequestJson: stream=true + instructions + input/message shape" {
     try testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"you are helpful\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"type\":\"message\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"type\":\"input_text\"") != null);
+}
+
+test "buildRequestJson: image block serialized as input_image part" {
+    const gpa = testing.allocator;
+    // Build a user message with one text + one image block.
+    const img_data = try gpa.dupe(u8, "QkFTRTY=");
+    defer gpa.free(img_data);
+    const img_mime = try gpa.dupe(u8, "image/png");
+    defer gpa.free(img_mime);
+    var uc = [_]types.ContentBlock{
+        .{ .text = .{ .text = "describe this" } },
+        .{ .image = .{ .data = img_data, .mime_type = img_mime } },
+    };
+    var msgs = [_]types.Message{.{ .role = .user, .content = &uc, .timestamp = 0 }};
+    const ctx: types.Context = .{ .system_prompt = "", .messages = &msgs, .tools = &.{} };
+    const model: types.Model = .{ .id = "o1", .provider = "openai", .api = "openai-responses" };
+    const body = try buildRequestJson(gpa, model, ctx, .{});
+    defer gpa.free(body);
+
+    // Image block must NOT be dropped as [unsupported].
+    try testing.expect(std.mem.indexOf(u8, body, "\"type\":\"input_image\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"image_url\":\"data:image/png;base64,QkFTRTY=\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "[unsupported]") == null);
 }
 
 test "buildRequestJson: reasoning.effort mapped from thinking level" {

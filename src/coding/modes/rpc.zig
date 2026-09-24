@@ -688,9 +688,64 @@ fn runPrompt(
         return;
     };
 
-    // Append user message to transcript.
-    const content = try allocator.alloc(ai.types.ContentBlock, 1);
+    // v3.x — parse optional `images` array from params. Entries are
+    // `{"path":"..."}` (loaded from disk) or
+    // `{"base64":"...","mimeType":"..."}` (pre-encoded).
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rpc_images = try extractPromptImages(arena.allocator(), req.params_raw);
+
+    // Append user message to transcript. When images are present they
+    // become `.image` blocks after the text block.
+    const utils = ai.utils;
+    var image_blocks: std.ArrayList(ai.types.ContentBlock) = .empty;
+    defer image_blocks.deinit(allocator);
+    const max_bytes = print_mode.resolveMaxImageBytesFromMap(allocator, io, session.environ_map);
+    for (rpc_images) |img| switch (img) {
+        .path => |p| {
+            const cwd = std.Io.Dir.cwd();
+            const file = cwd.openFile(io, p, .{}) catch |err| {
+                try writeErrorFrame(allocator, io, stdout, req.id, err);
+                return;
+            };
+            defer file.close(io);
+            const flen = file.length(io) catch |err| {
+                try writeErrorFrame(allocator, io, stdout, req.id, err);
+                return;
+            };
+            if (flen > max_bytes) {
+                try writeErrorFrame(allocator, io, stdout, req.id, error.PayloadTooLarge);
+                return;
+            }
+            const raw = try allocator.alloc(u8, @intCast(flen));
+            defer allocator.free(raw);
+            _ = file.readPositionalAll(io, raw, 0) catch |err| {
+                try writeErrorFrame(allocator, io, stdout, req.id, err);
+                return;
+            };
+            const mime = utils.mimeFromPath(p);
+            utils.validateImage(raw.len, mime, max_bytes) catch |err| {
+                try writeErrorFrame(allocator, io, stdout, req.id, err);
+                return;
+            };
+            const b64 = try utils.base64Encode(allocator, raw);
+            const mime_owned = try allocator.dupe(u8, mime);
+            try image_blocks.append(allocator, .{ .image = .{ .data = b64, .mime_type = mime_owned } });
+        },
+        .inline_b64 => |b| {
+            utils.validateImage(b.data.len, b.mime_type, 0) catch |err| {
+                try writeErrorFrame(allocator, io, stdout, req.id, err);
+                return;
+            };
+            const data_owned = try allocator.dupe(u8, b.data);
+            const mime_owned = try allocator.dupe(u8, b.mime_type);
+            try image_blocks.append(allocator, .{ .image = .{ .data = data_owned, .mime_type = mime_owned } });
+        },
+    };
+
+    const content = try allocator.alloc(ai.types.ContentBlock, 1 + image_blocks.items.len);
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    for (image_blocks.items, 0..) |ib, k| content[1 + k] = ib;
     try session.transcript.append(.{
         .role = .user,
         .content = content,
@@ -777,6 +832,8 @@ fn runPrompt(
                     .session_id = session.session_id,
                 },
             };
+            // v3.x — bypass the vision capability gate when --force-image is set.
+            lc.force_image = session.cfg.force_image;
             // v3.0 — wire compression into the agent loop via DI.
             if (session.cfg.compress) {
                 session.compression_ctx.config = .{
@@ -882,6 +939,47 @@ fn extractPromptText(params: ?[]const u8) ?[]const u8 {
     const val_start = start + key.len;
     const val_end = std.mem.indexOfScalarPos(u8, haystack, val_start, '"') orelse return null;
     return haystack[val_start..val_end];
+}
+
+/// v3.x — Parsed image attachment from an RPC `prompt` params blob.
+/// Either a filesystem `path` (loaded + base64-encoded by the caller)
+/// or a pre-encoded `base64` + `mimeType` pair.
+const RpcImage = union(enum) {
+    path: []const u8,
+    inline_b64: struct { data: []const u8, mime_type: []const u8 },
+};
+
+/// v3.x — extract the optional `images` array from `prompt` params.
+/// Accepts entries of the form `{"path":"..."}` or
+/// `{"base64":"...","mimeType":"..."}`. Returns an arena-owned
+/// slice the caller does not need to free (tied to `arena.allocator()`).
+fn extractPromptImages(
+    arena: std.mem.Allocator,
+    params: ?[]const u8,
+) ![]RpcImage {
+    if (params == null) return &.{};
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, params.?, .{}) catch return &.{};
+    if (parsed.value != .object) return &.{};
+    const arr_val = parsed.value.object.get("images") orelse return &.{};
+    if (arr_val != .array) return &.{};
+    var out: std.ArrayList(RpcImage) = .empty;
+    for (arr_val.array.items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        if (obj.get("path")) |p| if (p == .string) {
+            try out.append(arena, .{ .path = try arena.dupe(u8, p.string) });
+            continue;
+        };
+        if (obj.get("base64")) |b| if (b == .string) {
+            const mime_v = obj.get("mimeType") orelse obj.get("mime_type");
+            const mime = if (mime_v) |m| (if (m == .string) m.string else "application/octet-stream") else "application/octet-stream";
+            try out.append(arena, .{ .inline_b64 = .{
+                .data = try arena.dupe(u8, b.string),
+                .mime_type = try arena.dupe(u8, mime),
+            } });
+        };
+    }
+    return out.toOwnedSlice(arena);
 }
 
 // ─── frame writers ──────────────────────────────────────────────
@@ -991,4 +1089,32 @@ test "extractStringField: ignores escaped quote inside string" {
     const body = "{\"call_id\":\"c\\\"x\"}";
     // The extractor doesn't unescape; it just walks past `\"`.
     try testing.expectEqualStrings("c\\\"x", extractStringField(body, "call_id").?);
+}
+
+test "extractPromptImages: path + inline entries" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const params = "{\"text\":\"look\",\"images\":[{\"path\":\"/a.png\"},{\"base64\":\"QkFTRTY=\",\"mimeType\":\"image/jpeg\"}]}";
+    const imgs = try extractPromptImages(arena.allocator(), params);
+    try testing.expectEqual(@as(usize, 2), imgs.len);
+    try testing.expectEqualStrings("/a.png", imgs[0].path);
+    try testing.expectEqualStrings("QkFTRTY=", imgs[1].inline_b64.data);
+    try testing.expectEqualStrings("image/jpeg", imgs[1].inline_b64.mime_type);
+}
+
+test "extractPromptImages: no images key → empty" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const imgs = try extractPromptImages(arena.allocator(), "{\"text\":\"hi\"}");
+    try testing.expectEqual(@as(usize, 0), imgs.len);
+}
+
+test "extractPromptImages: null params → empty" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const imgs = try extractPromptImages(arena.allocator(), null);
+    try testing.expectEqual(@as(usize, 0), imgs.len);
 }
