@@ -699,41 +699,27 @@ fn runPrompt(
     // become `.image` blocks after the text block.
     const utils = ai.utils;
     var image_blocks: std.ArrayList(ai.types.ContentBlock) = .empty;
-    defer image_blocks.deinit(allocator);
+    // On error, free each block's owned payload, then the array.
+    errdefer {
+        for (image_blocks.items) |cb| cb.deinit(allocator);
+        image_blocks.deinit(allocator);
+    }
     const max_bytes = print_mode.resolveMaxImageBytesFromMap(allocator, io, session.environ_map);
     for (rpc_images) |img| switch (img) {
         .path => |p| {
-            const cwd = std.Io.Dir.cwd();
-            const file = cwd.openFile(io, p, .{}) catch |err| {
+            const cb = utils.loadImageBlockFromPath(allocator, io, p, max_bytes) catch |err| {
                 try writeErrorFrame(allocator, io, stdout, req.id, err);
                 return;
             };
-            defer file.close(io);
-            const flen = file.length(io) catch |err| {
-                try writeErrorFrame(allocator, io, stdout, req.id, err);
-                return;
-            };
-            if (flen > max_bytes) {
-                try writeErrorFrame(allocator, io, stdout, req.id, error.PayloadTooLarge);
-                return;
-            }
-            const raw = try allocator.alloc(u8, @intCast(flen));
-            defer allocator.free(raw);
-            _ = file.readPositionalAll(io, raw, 0) catch |err| {
-                try writeErrorFrame(allocator, io, stdout, req.id, err);
-                return;
-            };
-            const mime = utils.mimeFromPath(p);
-            utils.validateImage(raw.len, mime, max_bytes) catch |err| {
-                try writeErrorFrame(allocator, io, stdout, req.id, err);
-                return;
-            };
-            const b64 = try utils.base64Encode(allocator, raw);
-            const mime_owned = try allocator.dupe(u8, mime);
-            try image_blocks.append(allocator, .{ .image = .{ .data = b64, .mime_type = mime_owned } });
+            try image_blocks.append(allocator, cb);
         },
         .inline_b64 => |b| {
-            utils.validateImage(b.data.len, b.mime_type, 0) catch |err| {
+            // Validate against max_bytes too (not 0) so RPC clients
+            // can't bypass the size limit with pre-encoded payloads.
+            // The base64 string length is ~4/3 of the raw size, so
+            // approximate the decoded length for the size check.
+            const approx_raw = b.data.len * 3 / 4;
+            utils.validateImage(approx_raw, b.mime_type, max_bytes) catch |err| {
                 try writeErrorFrame(allocator, io, stdout, req.id, err);
                 return;
             };
@@ -746,11 +732,14 @@ fn runPrompt(
     const content = try allocator.alloc(ai.types.ContentBlock, 1 + image_blocks.items.len);
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
     for (image_blocks.items, 0..) |ib, k| content[1 + k] = ib;
+    // Ownership of content blocks transfers to the transcript on success.
     try session.transcript.append(.{
         .role = .user,
         .content = content,
         .timestamp = ai.stream.nowMillis(),
     });
+    // Prevent the errdefer from double-freeing — ownership transferred.
+    image_blocks.clearRetainingCapacity();
 
     // Seed faux if needed. Both `reply` and `faux_events` MUST live
     // at function scope — the faux provider stores the event slice by

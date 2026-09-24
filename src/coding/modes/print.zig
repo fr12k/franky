@@ -323,13 +323,20 @@ fn runPrint(
     // images as `.image` content blocks after the text block.
     const has_images = cfg.images.len > 0 or cfg.image_stdin;
     if (cfg.prompt.len > 0 or has_images) {
-        const text_block: ?ai.types.ContentBlock = if (cfg.prompt.len > 0)
-            .{ .text = .{ .text = try allocator.dupe(u8, cfg.prompt) } }
-        else
-            null;
+        const text_block: ?ai.types.ContentBlock = blk: {
+            if (cfg.prompt.len == 0) break :blk null;
+            const text_owned = try allocator.dupe(u8, cfg.prompt);
+            errdefer allocator.free(text_owned);
+            break :blk .{ .text = .{ .text = text_owned } };
+        };
 
         var image_blocks: std.ArrayList(ai.types.ContentBlock) = .empty;
-        defer image_blocks.deinit(allocator);
+        // On error, free each block's owned payload, then the array.
+        errdefer {
+            for (image_blocks.items) |cb| cb.deinit(allocator);
+            if (text_block) |tb| tb.deinit(allocator);
+            image_blocks.deinit(allocator);
+        }
         if (has_images) {
             const max_bytes = resolveMaxImageBytes(allocator, io, environ);
             try loadImageBlocks(allocator, io, cfg, max_bytes, &image_blocks);
@@ -346,11 +353,14 @@ fn runPrint(
             content[wi] = ib;
             wi += 1;
         }
+        // Ownership of content blocks transfers to the transcript on success.
         try session_state.transcript.append(.{
             .role = .user,
             .content = content,
             .timestamp = ai.stream.nowMillis(),
         });
+        // Prevent the errdefer from double-freeing — ownership transferred.
+        image_blocks.clearRetainingCapacity();
     }
 
     // ── Agent loop ─────────────────────────────────────────────────
@@ -969,10 +979,9 @@ pub fn resolveMaxImageBytes(
     io: std.Io,
     environ: std.process.Environ,
 ) usize {
-    var settings = loadSettingsForOverlay(allocator, io, environ) catch
-        return settings_mod.default_max_image_bytes;
-    defer settings.deinit();
-    return settings.max_image_bytes orelse settings_mod.default_max_image_bytes;
+    const home = environ.getPosix("FRANKY_HOME") orelse environ.getPosix("HOME");
+    const pwd = environ.getPosix("PWD");
+    return resolveMaxImageBytesDirs(allocator, io, pwd, home);
 }
 
 /// v3.x — same as `resolveMaxImageBytes` but takes the environ *map*
@@ -985,6 +994,17 @@ pub fn resolveMaxImageBytesFromMap(
 ) usize {
     const home = environ_map.get("FRANKY_HOME") orelse environ_map.get("HOME");
     const pwd = environ_map.get("PWD");
+    return resolveMaxImageBytesDirs(allocator, io, pwd, home);
+}
+
+/// Shared implementation — loads settings from the given dirs and
+/// returns `max_image_bytes` or the built-in default.
+fn resolveMaxImageBytesDirs(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pwd: ?[]const u8,
+    home: ?[]const u8,
+) usize {
     var settings = settings_mod.loadLayered(allocator, io, pwd, home) catch
         return settings_mod.default_max_image_bytes;
     defer settings.deinit();
@@ -1007,30 +1027,14 @@ fn loadImageBlocks(
     out: *std.ArrayList(ai.types.ContentBlock),
 ) !void {
     const utils = ai.utils;
-    const cwd = std.Io.Dir.cwd();
-    // File paths.
+    // File paths — delegate to the shared helper so the
+    // open/stat/read/validate/encode sequence lives in one place.
     for (cfg.images) |path| {
-        const file = cwd.openFile(io, path, .{}) catch |err| {
-            ai.log.log(.warn, "image", "load", "open {s}: {s}", .{ path, @errorName(err) });
+        const cb = utils.loadImageBlockFromPath(allocator, io, path, max_bytes) catch |err| {
+            ai.log.log(.warn, "image", "load", "{s}: {s}", .{ path, @errorName(err) });
             return err;
         };
-        defer file.close(io);
-        const flen = file.length(io) catch |err| {
-            ai.log.log(.warn, "image", "load", "stat {s}: {s}", .{ path, @errorName(err) });
-            return err;
-        };
-        if (flen > max_bytes) return error.PayloadTooLarge;
-        const raw = try allocator.alloc(u8, @intCast(flen));
-        defer allocator.free(raw);
-        _ = file.readPositionalAll(io, raw, 0) catch |err| {
-            ai.log.log(.warn, "image", "load", "read {s}: {s}", .{ path, @errorName(err) });
-            return err;
-        };
-        const mime = utils.mimeFromPath(path);
-        try utils.validateImage(raw.len, mime, max_bytes);
-        const b64 = try utils.base64Encode(allocator, raw);
-        const mime_owned = try allocator.dupe(u8, mime);
-        try out.append(allocator, .{ .image = .{ .data = b64, .mime_type = mime_owned } });
+        try out.append(allocator, cb);
     }
     // stdin image.
     if (cfg.image_stdin) {
@@ -1044,14 +1048,12 @@ fn loadImageBlocks(
                 return err;
             };
             if (n == 0) break;
+            // Check before appending for strict max_bytes enforcement.
+            if (max_bytes != 0 and raw.items.len + n > max_bytes) return error.PayloadTooLarge;
             try raw.appendSlice(allocator, chunk[0..n]);
-            if (max_bytes != 0 and raw.items.len > max_bytes) return error.PayloadTooLarge;
         }
-        const mime = cfg.image_stdin_mime;
-        try utils.validateImage(raw.items.len, mime, max_bytes);
-        const b64 = try utils.base64Encode(allocator, raw.items);
-        const mime_owned = try allocator.dupe(u8, mime);
-        try out.append(allocator, .{ .image = .{ .data = b64, .mime_type = mime_owned } });
+        const cb = try utils.imageBlockFromBytes(allocator, raw.items, cfg.image_stdin_mime, max_bytes);
+        try out.append(allocator, cb);
     }
 }
 

@@ -206,29 +206,19 @@ const ai_utils = @import("ai/utils.zig");
 
 /// Load an image file from `path`, base64-encode it, sniff the mime
 /// type from the extension, and return an owned `.image` content
-/// block. `max_bytes` of 0 skips the size check.
+/// block. `max_bytes` of 0 skips the size check. Delegates to the
+/// shared `ai.utils.loadImageBlockFromPath` so the open/stat/read/
+/// validate/encode sequence lives in one place.
 pub fn imageBlock(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) !ContentBlock {
-    const cwd = std.Io.Dir.cwd();
-    const file = try cwd.openFile(io, path, .{});
-    defer file.close(io);
-    const flen = try file.length(io);
-    if (max_bytes != 0 and flen > max_bytes) return error.PayloadTooLarge;
-    const raw = try allocator.alloc(u8, @intCast(flen));
-    defer allocator.free(raw);
-    _ = try file.readPositionalAll(io, raw, 0);
-    return imageBlockFromBytes(allocator, raw, ai_utils.mimeFromPath(path), max_bytes);
+    return ai_utils.loadImageBlockFromPath(allocator, io, path, max_bytes);
 }
 
 /// Build an `.image` content block from in-memory bytes. `data_raw` is
 /// base64-encoded internally; the caller still owns `data_raw`. `mime`
 /// is validated against the accepted set. `max_bytes` of 0 skips the
-/// size check.
+/// size check. Delegates to the shared `ai.utils.imageBlockFromBytes`.
 pub fn imageBlockFromBytes(allocator: std.mem.Allocator, data_raw: []const u8, mime: []const u8, max_bytes: usize) !ContentBlock {
-    try ai_utils.validateImage(data_raw.len, mime, max_bytes);
-    const b64 = try ai_utils.base64Encode(allocator, data_raw);
-    errdefer allocator.free(b64);
-    const mime_owned = try allocator.dupe(u8, mime);
-    return .{ .image = .{ .data = b64, .mime_type = mime_owned } };
+    return ai_utils.imageBlockFromBytes(allocator, data_raw, mime, max_bytes);
 }
 
 // ─── version surface ─────────────────────────────────────────────

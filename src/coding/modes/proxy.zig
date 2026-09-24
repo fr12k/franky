@@ -1560,7 +1560,7 @@ fn renderTranscriptMarkdown(
                 try out.appendSlice(allocator, "[image: ");
                 try out.appendSlice(allocator, img.mime_type);
                 var sz_buf: [32]u8 = undefined;
-                const sz = std.fmt.bufPrint(&sz_buf, ", {d} bytes]\n\n", .{img.data.len}) catch unreachable;
+                const sz = std.fmt.bufPrint(&sz_buf, ", {d} base64-bytes]\n\n", .{img.data.len}) catch unreachable;
                 try out.appendSlice(allocator, sz);
             },
         };

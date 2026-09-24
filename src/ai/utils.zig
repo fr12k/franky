@@ -1,6 +1,7 @@
 //! Shared JSON and Utility functions for all AI providers.
 
 const std = @import("std");
+const types = @import("types.zig");
 
 /// Appends a JSON-encoded string to the buffer, escaping necessary characters.
 pub fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -193,6 +194,53 @@ pub fn base64Encode(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, out_len);
     _ = enc.encode(out, raw);
     return out;
+}
+
+/// v3.x — Load an image file from `path`, validate it, base64-encode the
+/// bytes, and return an owned `.image` `ContentBlock`. The returned block
+/// owns its `data` + `mime_type` from `allocator`; free via
+/// `ContentBlock.deinit(allocator)`.
+///
+/// This is the single shared implementation used by the CLI (`--image`),
+/// RPC (`images` param with `path`), and SDK (`imageBlock`) so the
+/// open/stat/read/validate/encode sequence lives in one place.
+///
+/// `max_bytes` of 0 disables the size check. Errors:
+/// `error.PayloadTooLarge`, `error.RequestInvalid` (bad mime), plus
+/// file-system errors from `openFile`/`length`/`readPositionalAll`.
+pub fn loadImageBlockFromPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    max_bytes: usize,
+) !types.ContentBlock {
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.openFile(io, path, .{});
+    defer file.close(io);
+    const flen = try file.length(io);
+    if (max_bytes != 0 and flen > max_bytes) return error.PayloadTooLarge;
+    const mime = mimeFromPath(path);
+    try validateImage(@intCast(flen), mime, max_bytes);
+    const raw = try allocator.alloc(u8, @intCast(flen));
+    defer allocator.free(raw);
+    _ = try file.readPositionalAll(io, raw, 0);
+    return imageBlockFromBytes(allocator, raw, mime, max_bytes);
+}
+
+/// v3.x — Build an owned `.image` `ContentBlock` from raw bytes. Validates
+/// mime + size, base64-encodes, and dupes the mime string. The returned
+/// block owns its `data` + `mime_type` from `allocator`.
+pub fn imageBlockFromBytes(
+    allocator: std.mem.Allocator,
+    data_raw: []const u8,
+    mime: []const u8,
+    max_bytes: usize,
+) !types.ContentBlock {
+    try validateImage(data_raw.len, mime, max_bytes);
+    const b64 = try base64Encode(allocator, data_raw);
+    errdefer allocator.free(b64);
+    const mime_owned = try allocator.dupe(u8, mime);
+    return .{ .image = .{ .data = b64, .mime_type = mime_owned } };
 }
 
 fn eqIgnoreCase(a: []const u8, b: []const u8) bool {

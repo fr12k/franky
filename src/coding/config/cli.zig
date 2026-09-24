@@ -718,7 +718,6 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
         else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
         else if (std.mem.eql(u8, v, "worker")) cfg.mode = .worker
-        else if (std.mem.eql(u8, v, "worker")) cfg.mode = .worker
         else return error.UnknownMode;
     } else if (std.mem.eql(u8, name, "--image-stdin-mime")) {
         cfg.image_stdin_mime = try a.dupe(u8, try takeValue(argv, i, inline_value));
