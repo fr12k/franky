@@ -21,7 +21,7 @@
         }
     },
     "review": {
-        "profiles": ["ollama-cloud/deepseek-v4-flash:cloud", "ollama-cloud/kimi-k2.6:cloud", "ollama-cloud/deepseek-v4-pro:cloud", "ollama-cloud/gemma4:31b-cloud", "ollama-cloud/minimax-m3:cloud", "ollama-cloud/glm-5.1:cloud"],
+        "profiles": ["ollama-cloud/deepseek-v4-flash:cloud", "ollama-cloud/kimi-k2.6:cloud", "ollama-cloud/deepseek-v4-pro:cloud", "ollama-cloud/gemma4:31b-cloud", "ollama-cloud/minimax-m3:cloud", "ollama-cloud/glm-5.2:cloud"],
         "min_models": 2,
         "max_models": 4,
         "timeout_ms": 180000
@@ -38,6 +38,7 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "vision": false,
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "300000"
             }
@@ -53,6 +54,10 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "model_vision": {
+                "@cf/moonshotai/kimi-k2.6": true,
+                "@cf/nvidia/nemotron-3-120b-a12b": true
+            },
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "300000"
             }
@@ -68,6 +73,10 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "model_vision": {
+                "gemma4:latest": true,
+                "granite4.1:30b": false
+            },
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
@@ -83,6 +92,10 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "model_vision": {
+                "gemma4:31b": true,
+                "qwen3.6:latest": false
+            },
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
@@ -98,6 +111,14 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "model_vision": {
+                "deepseek-v4-flash:cloud": false,
+                "kimi-k2.6:cloud": true,
+                "deepseek-v4-pro:cloud": false,
+                "gemma4:31b-cloud": true,
+                "minimax-m3:cloud": true,
+                "glm-5.2:cloud": false
+            },
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
@@ -105,7 +126,7 @@
         "mistral": {
             "provider": "gateway",
             "base-url": "https://api.mistral.ai/v1/chat/completions",
-            "models": ["devstral-2512", "mistral-medium-3-5", "codestral-2508", "labs-leanstral-2603"],
+            "models": ["devstral-2512", "mistral-medium:3:5", "codestral-2508", "labs-leanstral-2603"],
             "api-key-env": "MISTRAL_API_KEY",
             "ask-tools": "all",
             "role": "full",
@@ -113,6 +134,12 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "model_vision": {
+                "devstral-2512": false,
+                "mistral-medium:3:5": true,
+                "codestral-2508": false,
+                "labs-leanstral-2603": false
+            },
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             },
@@ -131,6 +158,7 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "vision": false,
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
@@ -144,6 +172,7 @@
             "prompts": true,
             "log-level": "trace",
             "thinking": "xhigh",
+            "vision": true,
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }
@@ -158,6 +187,7 @@
             "log-level": "trace",
             "thinking": "xhigh",
             "http-trace-dir": "${HOME}/.franky/log-trace",
+            "vision": true,
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000",
                 "FRANKY_CA_BUNDLE": "/etc/ssl/certs/proxy-ca.pem"
@@ -173,6 +203,7 @@
             "log-level": "trace",
             "http-trace-dir": "${HOME}/.franky/log-trace",
             "thinking": "xhigh",
+            "vision": true,
             "env": {
                 "FRANKY_FIRST_BYTE_TIMEOUT_MS": "1200000"
             }

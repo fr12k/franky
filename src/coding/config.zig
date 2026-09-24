@@ -848,6 +848,9 @@ fn finalize(
             .reasoning = cfg.thinking != .off,
         };
     }
+    // v3.x — apply profile-level vision override. Wins over both the
+    // catalog default and the else-branch default.
+    if (cfg.vision_override) |v| info.capabilities.vision = v;
     return info;
 }
 

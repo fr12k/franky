@@ -328,6 +328,13 @@ pub const Config = struct {
     /// `vision = false`. Useful for gateways that misreport capabilities.
     force_image: bool = false,
 
+    /// v3.x — vision capability override from the applied profile.
+    /// When non-null, `finalize` uses this instead of the model-catalog
+    /// `capabilities.vision`. Set by `profiles.applyProfile` from the
+    /// profile's `vision` field (or `model_vision` map for the selected
+    /// model). Null = no override (use catalog default).
+    vision_override: ?bool = null,
+
     /// Ownership bookkeeping: every non-null []const u8 above and the
     /// `prompt` slice was allocated with this allocator.
     arena: std.heap.ArenaAllocator,
