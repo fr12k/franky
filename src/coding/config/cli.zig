@@ -309,6 +309,32 @@ pub const Config = struct {
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
 
+    /// v3.x — `--image <path>` (repeatable). Image file paths to
+    /// attach to the initial user message as `.image` content blocks.
+    /// Loaded + base64-encoded by the mode driver; stored here as raw
+    /// paths (arena-owned dupes) so the CLI layer stays free of file IO.
+    images: []const []const u8 = &.{},
+
+    /// v3.x — `--image-stdin`. Read a binary image from stdin and attach
+    /// it to the initial user message. Pairs with `--image-stdin-mime`.
+    image_stdin: bool = false,
+
+    /// v3.x — `--image-stdin-mime <mime>`. MIME type for the stdin image
+    /// (default `image/png`). Ignored unless `--image-stdin` is set.
+    image_stdin_mime: []const u8 = "image/png",
+
+    /// v3.x — `--force-image`. Bypass the pre-flight `vision` capability
+    /// gate so image blocks are sent even to models that report
+    /// `vision = false`. Useful for gateways that misreport capabilities.
+    force_image: bool = false,
+
+    /// v3.x — vision capability override from the applied profile.
+    /// When non-null, `finalize` uses this instead of the model-catalog
+    /// `capabilities.vision`. Set by `profiles.applyProfile` from the
+    /// profile's `vision` field (or `model_vision` map for the selected
+    /// model). Null = no override (use catalog default).
+    vision_override: ?bool = null,
+
     /// Ownership bookkeeping: every non-null []const u8 above and the
     /// `prompt` slice was allocated with this allocator.
     arena: std.heap.ArenaAllocator,
@@ -339,6 +365,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
     var positionals: std.ArrayList([]const u8) = .empty;
     defer positionals.deinit(a);
 
+    // v3.x — accumulated `--image <path>` values.
+    var images: std.ArrayList([]const u8) = .empty;
+    defer images.deinit(a);
+
     var i: usize = if (argv.len > 0) 1 else 0;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
@@ -365,6 +395,14 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
             name = arg[0..eq];
             inline_value = arg[eq + 1 ..];
+        }
+
+        // v3.x — --image <path> (repeatable). Handled inline because it
+        // accumulates into a list rather than a single field.
+        if (std.mem.eql(u8, name, "--image")) {
+            const v = try takeValue(argv, &i, inline_value);
+            try images.append(a, try a.dupe(u8, v));
+            continue;
         }
 
         if (try dispatchFlag(&cfg, name, inline_value, &i, argv, a)) continue;
@@ -394,6 +432,11 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             w += p.len;
         }
         cfg.prompt = buf;
+    }
+
+    // v3.x — materialize the accumulated image paths.
+    if (images.items.len > 0) {
+        cfg.images = try a.dupe([]const u8, images.items);
     }
 
     return cfg;
@@ -455,6 +498,15 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--no-standards")) {
         cfg.no_standards = true;
+        return true;
+    }
+    // v3.x — image-input flags.
+    if (std.mem.eql(u8, name, "--image-stdin")) {
+        cfg.image_stdin = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--force-image")) {
+        cfg.force_image = true;
         return true;
     }
     if (std.mem.eql(u8, name, "--autocontinue")) {
@@ -666,8 +718,9 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
         else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
         else if (std.mem.eql(u8, v, "worker")) cfg.mode = .worker
-        else if (std.mem.eql(u8, v, "worker")) cfg.mode = .worker
         else return error.UnknownMode;
+    } else if (std.mem.eql(u8, name, "--image-stdin-mime")) {
+        cfg.image_stdin_mime = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else {
         return false;
     }
@@ -764,6 +817,11 @@ pub const usage_text: []const u8 =
     \\  --no-memory                  Disable persistent memory tools
     \\  --memory-nudge               Nudge agent to save memory before finish_task (default on)
     \\  --no-memory-nudge            Disable memory save nudge
+    \\  --image PATH                 Attach an image file to the initial prompt
+    \\                               (repeatable; png/jpg/gif/webp/bmp).
+    \\  --image-stdin                Read a binary image from stdin and attach it
+    \\  --image-stdin-mime MIME       MIME for --image-stdin (default image/png)
+    \\  --force-image                Send images even to non-vision models
     \\  --verbose                    Extra logging to stderr
     \\  -h, --help                   Show this help
     \\      --version                Print version and exit
@@ -887,6 +945,33 @@ test "parse: --continue sets the flag" {
     var cfg = try parse(testing.allocator, &.{ "franky", "--continue" });
     defer cfg.deinit();
     try testing.expect(cfg.continue_session);
+}
+
+test "parse: --image repeatable + --force-image + --image-stdin" {
+    var cfg = try parse(testing.allocator, &.{
+        "franky",
+        "--image", "/a.png",
+        "--image", "/b.jpg",
+        "--image-stdin",
+        "--image-stdin-mime", "image/jpeg",
+        "--force-image",
+        "look",
+    });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 2), cfg.images.len);
+    try testing.expectEqualStrings("/a.png", cfg.images[0]);
+    try testing.expectEqualStrings("/b.jpg", cfg.images[1]);
+    try testing.expect(cfg.image_stdin);
+    try testing.expectEqualStrings("image/jpeg", cfg.image_stdin_mime);
+    try testing.expect(cfg.force_image);
+    try testing.expectEqualStrings("look", cfg.prompt);
+}
+
+test "parse: --image=path inline form" {
+    var cfg = try parse(testing.allocator, &.{ "franky", "--image=/x.png", "hi" });
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 1), cfg.images.len);
+    try testing.expectEqualStrings("/x.png", cfg.images[0]);
 }
 
 test "parse: --fork captures the branch name" {

@@ -1554,7 +1554,15 @@ fn renderTranscriptMarkdown(
                 try out.appendSlice(allocator, tc.arguments_json);
                 try out.appendSlice(allocator, "\n```\n\n");
             },
-            .image => {},
+            .image => |img| {
+                // v3.x — terminal/markdown has no image viewer; emit a
+                // placeholder so the user sees an image was attached.
+                try out.appendSlice(allocator, "[image: ");
+                try out.appendSlice(allocator, img.mime_type);
+                var sz_buf: [32]u8 = undefined;
+                const sz = std.fmt.bufPrint(&sz_buf, ", {d} base64-bytes]\n\n", .{img.data.len}) catch unreachable;
+                try out.appendSlice(allocator, sz);
+            },
         };
     }
 }
@@ -2332,6 +2340,8 @@ fn runOneTurnInternal(
                     .session_id = session.session_id,
                 },
             };
+            // v3.x — bypass the vision capability gate when --force-image is set.
+            lc.force_image = session.cfg.force_image;
             // v3.0 — wire compression into the agent loop via DI.
             // The loop holds an opaque fn pointer + ctx; the coding
             // layer provides the concrete implementation.
@@ -2627,11 +2637,19 @@ fn writeMessageForUi(
                 try appendUiJsonStr(buf, allocator, tc.arguments_json);
                 try buf.append(allocator, '}');
             },
-            // Image blocks are intentionally omitted — the v1.6.1
-            // UI has no artifact viewer. Adding requires a base64
-            // emit + a `<img>` renderer; deferred to a later UI
-            // round.
-            .image => {},
+            // v3.x — emit a lightweight image descriptor (mime + byte
+            // count) so the UI can render a placeholder. The base64
+            // payload is omitted to keep the event frame small; a future
+            // UI round can fetch it from the persisted transcript.
+            .image => |img| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                try buf.appendSlice(allocator, "{\"kind\":\"image\",\"mimeType\":");
+                try appendUiJsonStr(buf, allocator, img.mime_type);
+                var sz_buf: [32]u8 = undefined;
+                const sz = std.fmt.bufPrint(&sz_buf, ",\"bytes\":{d}}}", .{img.data.len}) catch unreachable;
+                try buf.appendSlice(allocator, sz);
+            },
         }
     }
     try buf.append(allocator, ']');

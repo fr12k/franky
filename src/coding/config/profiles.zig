@@ -59,6 +59,17 @@ pub const Profile = struct {
     append_system_prompt: ?[]const u8 = null,
     text_tool_call_fallback: ?bool = null,
     http_trace_dir: ?[]const u8 = null,
+    /// v3.x — vision capability override. When non-null, this value
+    /// overrides the model-catalog `capabilities.vision` for every
+    /// model in this profile. Used for gateway-served models that
+    /// aren't in the built-in catalog. For profiles with mixed
+    /// vision/non-vision models, use `model_vision` instead.
+    vision: ?bool = null,
+    /// v3.x — per-model vision overrides. Maps model id → bool. When
+    /// the selected model has an entry here, it wins over both the
+    /// catalog default and the profile-level `vision` field. Keys are
+    /// model ids as they appear in the `models` array.
+    model_vision: ?std.StringHashMap(bool) = null,
     /// OpenRouter app-attribution overrides (see `ai/openrouter_attribution.zig`).
     /// When the resolved `base_url` is an OpenRouter endpoint, these stamp
     /// `HTTP-Referer` / `X-OpenRouter-Title` / `X-OpenRouter-Categories`
@@ -357,6 +368,18 @@ fn parseProfileObject(
     if (try optString(arena, environ_map, obj, "append_system_prompt")) |v| p.append_system_prompt = v;
     if (optBool(obj, "text_tool_call_fallback")) |v| p.text_tool_call_fallback = v;
     if (try optString(arena, environ_map, obj, "http_trace_dir")) |v| p.http_trace_dir = v;
+    // v3.x — vision capability overrides.
+    if (optBool(obj, "vision")) |v| p.vision = v;
+    if (obj.get("model_vision")) |mv| if (mv == .object) {
+        var map = std.StringHashMap(bool).init(arena);
+        var it = mv.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .bool) continue;
+            const k = try arena.dupe(u8, entry.key_ptr.*);
+            try map.put(k, entry.value_ptr.bool);
+        }
+        p.model_vision = map;
+    };
     if (try optString(arena, environ_map, obj, "http_referer")) |v| p.http_referer = v;
     if (try optString(arena, environ_map, obj, "openrouter_title")) |v| p.openrouter_title = v;
     if (try optString(arena, environ_map, obj, "openrouter_categories")) |v| p.openrouter_categories = v;
@@ -494,6 +517,16 @@ pub fn applyToCfg(
     try applyProfileStringFields(cfg, profile, environ_map);
     applyProfileBoolFields(cfg, profile);
     applyProfileNumericFields(cfg, profile);
+    // v3.x — vision capability override. Precedence: per-model map
+    // (for the selected model) > profile-level `vision` field.
+    if (profile.model_vision) |mv| {
+        if (profile.model()) |model_id| {
+            if (mv.get(model_id)) |v| cfg.vision_override = v;
+        }
+    }
+    if (cfg.vision_override == null) if (profile.vision) |v| {
+        cfg.vision_override = v;
+    };
     try applyProfileThinking(cfg, profile);
     try applyProfileMode(cfg, profile);
 }
@@ -1212,6 +1245,62 @@ test "applyToCfg: CLI max_turns wins over profile" {
     try applyToCfg(&cfg, profile, &env);
 
     try testing.expectEqual(@as(?u32, 10), cfg.max_turns);
+}
+
+test "applyToCfg: profile vision override sets cfg.vision_override" {
+    const gpa = testing.allocator;
+    var cfg = try cli.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    const profile = Profile{ .vision = true };
+    try applyToCfg(&cfg, profile, &env);
+    try testing.expectEqual(@as(?bool, true), cfg.vision_override);
+}
+
+test "applyToCfg: model_vision map wins over profile vision" {
+    const gpa = testing.allocator;
+    var cfg = try cli.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    var mv = std.StringHashMap(bool).init(cfg.arena.allocator());
+    try mv.put("gemma4:latest", true);
+    try mv.put("granite4.1:30b", false);
+    const models = [_][]const u8{ "gemma4:latest", "granite4.1:30b" };
+    const profile = Profile{
+        .models = @constCast(&models),
+        .selected_model_idx = 1, // granite → false
+        .vision = true, // profile says true, but model_vision wins
+        .model_vision = mv,
+    };
+    try applyToCfg(&cfg, profile, &env);
+    try testing.expectEqual(@as(?bool, false), cfg.vision_override);
+}
+
+test "applyToCfg: model_vision falls back to profile vision when model not in map" {
+    const gpa = testing.allocator;
+    var cfg = try cli.parse(gpa, &.{"franky"});
+    defer cfg.deinit();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    var mv = std.StringHashMap(bool).init(cfg.arena.allocator());
+    try mv.put("other-model", false);
+    const models = [_][]const u8{"gemma4:latest"};
+    const profile = Profile{
+        .models = @constCast(&models),
+        .selected_model_idx = 0,
+        .vision = true,
+        .model_vision = mv,
+    };
+    try applyToCfg(&cfg, profile, &env);
+    try testing.expectEqual(@as(?bool, true), cfg.vision_override);
 }
 
 test "applyProfile: CLI flags win over profile values" {

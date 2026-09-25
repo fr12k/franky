@@ -24,6 +24,11 @@ pub const Match = struct {
     system_prompt_contains: ?[]const u8 = null,
     last_user_text_equals: ?[]const u8 = null,
     messages_count: ?usize = null,
+    /// v3.x — when non-null, the step only matches if the last user
+    /// message contains at least one `.image` content block (`true`)
+    /// or contains none (`false`). Used by image-input tests to assert
+    /// the image block reached the provider.
+    last_user_has_image: ?bool = null,
 };
 
 pub const Event = union(enum) {
@@ -255,11 +260,31 @@ pub const FauxProvider = struct {
                 }
                 if (!found) continue;
             }
+            if (m.last_user_has_image) |want_img| {
+                const has_img = lastUserHasImage(context.messages);
+                if (has_img != want_img) continue;
+            }
             return i;
         }
         return null;
     }
 };
+
+/// v3.x — scan from the end for the last `.user` message and report
+/// whether it carries at least one `.image` content block. Used by
+/// `Match.last_user_has_image`.
+fn lastUserHasImage(messages: []const types.Message) bool {
+    var j: usize = messages.len;
+    while (j > 0) {
+        j -= 1;
+        const msg = messages[j];
+        if (msg.role == .user) {
+            for (msg.content) |cb| if (cb == .image) return true;
+            return false;
+        }
+    }
+    return false;
+}
 
 // ─── tests ────────────────────────────────────────────────────────────
 
@@ -402,6 +427,54 @@ test "faux matcher selects by last_user_text_equals" {
     var msg = try stream_mod.drainToMessage(&ch, io, gpa, null, null, null);
     defer msg.deinit(gpa);
     try std.testing.expectEqualStrings("see ya", msg.content[0].text.text);
+}
+
+test "faux matcher selects by last_user_has_image" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const gpa = @import("../../global_allocator.zig").gpa;
+    var faux = FauxProvider.init(gpa);
+    defer faux.deinit();
+
+    // Step A: matches a user message WITH an image.
+    try faux.push(.{
+        .match = .{ .last_user_has_image = true },
+        .events = &.{.{ .text = .{ .text = "got an image" } }},
+    });
+    // Step B: matches a user message WITHOUT an image.
+    try faux.push(.{
+        .match = .{ .last_user_has_image = false },
+        .events = &.{.{ .text = .{ .text = "no image" } }},
+    });
+
+    // Build a user message: one text + one image block.
+    const content = try gpa.alloc(types.ContentBlock, 2);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "look") } };
+    content[1] = .{ .image = .{ .data = try gpa.dupe(u8, "QkFTRTY="), .mime_type = try gpa.dupe(u8, "image/png") } };
+    const msgs = try gpa.alloc(types.Message, 1);
+    defer gpa.free(msgs);
+    msgs[0] = .{ .role = .user, .content = content, .timestamp = 0 };
+    // Message.deinit frees the content array + block payloads.
+    // Do NOT separately free `content` — that would double-free.
+    defer {
+        var m = msgs[0];
+        m.deinit(gpa);
+    }
+
+    var ch = try newFauxChannel(gpa);
+    defer ch.deinit();
+    try faux.runSync(io, .{
+        .system_prompt = "",
+        .messages = msgs,
+        .tools = &.{},
+    }, &ch);
+
+    var msg = try stream_mod.drainToMessage(&ch, io, gpa, null, null, null);
+    defer msg.deinit(gpa);
+    // Step A should have matched (image present).
+    try std.testing.expectEqualStrings("got an image", msg.content[0].text.text);
 }
 
 test "channel deinit with undrained faux events does not leak" {

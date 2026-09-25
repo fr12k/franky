@@ -227,6 +227,13 @@ pub const Config = struct {
     /// requested during the between-turns hook is caught promptly.
     stop_requested_fn: ?*const fn (userdata: ?*anyopaque) bool = null,
     stream_options: ai.registry.StreamOptions = .{},
+    /// v3.x — when false (default), the loop pre-flights image input:
+    /// if any message in the context carries an `.image` block and
+    /// `model.capabilities.vision` is false, the loop emits an
+    /// `agent_error{request_invalid}` instead of dispatching a request
+    /// that the provider would reject. Set true (`--force-image`) to
+    /// bypass the gate for gateways that misreport capabilities.
+    force_image: bool = false,
     /// Hard cap on turn count — guards against infinite loops.
     /// User-configurable via `--max-turns` (CLI), `Settings.max_turns`,
     /// the `max_turns` profile field, or the `Agent.Config.max_turns`
@@ -788,6 +795,19 @@ fn runTurn(
     };
     var ctx_mut = context;
     defer ctx_mut.deinit(allocator);
+
+    // v3.x — pre-flight vision capability gate. If the context carries
+    // an `.image` block but the resolved model reports
+    // `capabilities.vision == false` (and `force_image` is not set),
+    // short-circuit with a structured `agent_error` instead of wasting
+    // a provider round-trip that would 400.
+    if (!config.force_image and !config.model.capabilities.vision) {
+        if (contextHasImage(context.messages)) {
+            ai.log.log(.warn, "loop", "vision_gate", "model={s} has no vision capability but image block present", .{config.model.id});
+            try pushAgentError(out, io, allocator, .request_invalid, "model does not support image input; use a vision-capable model or --force-image");
+            return false;
+        }
+    }
 
     // Call provider via registry, draining into a Reducer while forwarding
     // deltas as agent events.
@@ -2179,7 +2199,7 @@ fn logMessageTrace(direction: []const u8, index: usize, msg: ai.types.Message) v
     for (msg.content, 0..) |cb, bi| switch (cb) {
         .text => |t| ai.log.body(.trace, "message", "text", t.text, 4096),
         .thinking => |th| ai.log.body(.trace, "message", "thinking", th.thinking, 4096),
-        .image => ai.log.log(.trace, "message", "image", "block={d}", .{bi}),
+        .image => |img| ai.log.log(.trace, "message", "image", "block={d} mime={s} bytes={d}", .{ bi, img.mime_type, img.data.len }),
         .tool_call => |tc| {
             ai.log.log(.trace, "message", "tool_call", "block={d} id={s} name={s}", .{ bi, tc.id, tc.name });
             ai.log.body(.trace, "message", "tool_args", tc.arguments_json, 4096);
@@ -2196,6 +2216,15 @@ fn pushAgentError(
 ) !void {
     const owned = try allocator.dupe(u8, message);
     out.closeWithFinal(io, .{ .agent_error = .{ .code = code, .message = owned } });
+}
+
+/// v3.x — does any message in the context carry an `.image` content
+/// block? Used by the pre-flight vision capability gate.
+fn contextHasImage(messages: []const ai.types.Message) bool {
+    for (messages) |m| {
+        for (m.content) |cb| if (cb == .image) return true;
+    }
+    return false;
 }
 
 /// vN — emit the graceful interrupt event and close the channel.
@@ -2317,6 +2346,26 @@ fn dupeMessage(allocator: std.mem.Allocator, m: ai.types.Message) !ai.types.Mess
 // ─── tests ──────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "contextHasImage: detects image block across messages" {
+    const gpa = testing.allocator;
+    // text-only message → false.
+    var c_text = [_]ai.types.ContentBlock{.{ .text = .{ .text = "hi" } }};
+    const m_text = [_]ai.types.Message{.{ .role = .user, .content = &c_text, .timestamp = 0 }};
+    try testing.expect(!contextHasImage(&m_text));
+
+    // message with an image block → true.
+    const img_data = try gpa.dupe(u8, "QkFTRTY=");
+    defer gpa.free(img_data);
+    const img_mime = try gpa.dupe(u8, "image/png");
+    defer gpa.free(img_mime);
+    var c_img = [_]ai.types.ContentBlock{
+        .{ .text = .{ .text = "look" } },
+        .{ .image = .{ .data = img_data, .mime_type = img_mime } },
+    };
+    const m_img = [_]ai.types.Message{.{ .role = .user, .content = &c_img, .timestamp = 0 }};
+    try testing.expect(contextHasImage(&m_img));
+}
 
 test "defaultConvertToLlm: compaction_summary rewritten to user + prefix" {
     const gpa = testing.allocator;

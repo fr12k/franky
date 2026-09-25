@@ -188,6 +188,39 @@ pub fn createSession(
     };
 }
 
+// ─── v3.x image-input helpers ─────────────────────────────────────
+//
+// Convenience constructors so SDK callers can attach images to a user
+// message without hand-rolling base64 + mime sniffing:
+//
+//   var blocks = [_]ContentBlock{
+//       .{ .text = .{ .text = "describe this" } },
+//       try sdk.imageBlock(gpa, io, "/tmp/chart.png"),
+//   };
+//   var msg = Message{ .role = .user, .content = &blocks, .timestamp = sdk.nowMillis() };
+//
+// The returned `ContentBlock.image` owns its `data` + `mime_type` from
+// `allocator`; free via `msg.deinit(allocator)` as usual.
+
+const ai_utils = @import("ai/utils.zig");
+
+/// Load an image file from `path`, base64-encode it, sniff the mime
+/// type from the extension, and return an owned `.image` content
+/// block. `max_bytes` of 0 skips the size check. Delegates to the
+/// shared `ai.utils.loadImageBlockFromPath` so the open/stat/read/
+/// validate/encode sequence lives in one place.
+pub fn imageBlock(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) !ContentBlock {
+    return ai_utils.loadImageBlockFromPath(allocator, io, path, max_bytes);
+}
+
+/// Build an `.image` content block from in-memory bytes. `data_raw` is
+/// base64-encoded internally; the caller still owns `data_raw`. `mime`
+/// is validated against the accepted set. `max_bytes` of 0 skips the
+/// size check. Delegates to the shared `ai.utils.imageBlockFromBytes`.
+pub fn imageBlockFromBytes(allocator: std.mem.Allocator, data_raw: []const u8, mime: []const u8, max_bytes: usize) !ContentBlock {
+    return ai_utils.imageBlockFromBytes(allocator, data_raw, mime, max_bytes);
+}
+
 // ─── version surface ─────────────────────────────────────────────
 pub const version = @import("root.zig").version;
 
@@ -250,4 +283,19 @@ fn testFauxStream(ctx: StreamCtx) anyerror!void {
     try ctx.out.push(ctx.io, .start);
     try ctx.out.push(ctx.io, .{ .text_delta = .{ .block_index = 0, .delta = delta } });
     ctx.out.closeWithFinal(ctx.io, .{ .done = .{ .stop_reason = .stop } });
+}
+
+test "sdk: imageBlockFromBytes builds owned image block" {
+    const gpa = @import("global_allocator.zig").gpa;
+    var cb = try imageBlockFromBytes(gpa, "hello", "image/png", 0);
+    defer cb.deinit(gpa);
+    try std.testing.expect(cb == .image);
+    try std.testing.expectEqualStrings("aGVsbG8=", cb.image.data);
+    try std.testing.expectEqualStrings("image/png", cb.image.mime_type);
+}
+
+test "sdk: imageBlockFromBytes rejects bad mime + oversize" {
+    const gpa = @import("global_allocator.zig").gpa;
+    try std.testing.expectError(error.RequestInvalid, imageBlockFromBytes(gpa, "x", "application/pdf", 0));
+    try std.testing.expectError(error.PayloadTooLarge, imageBlockFromBytes(gpa, "xxxxx", "image/png", 2));
 }
