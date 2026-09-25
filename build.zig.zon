@@ -16,7 +16,7 @@
             .hash = "zompress-0.0.1-hHj4JvKLAQD99DOqFg8rU0NfnwqGflzoPr0m_2A0ZmVG",
         },
         .agent_memory = .{
-            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.5.1).
+            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory).
             // v0.5.0 adds L1 memory deletion: deleteL1 (soft by default /
             // hard opt-in), restoreL1, purgeDeletedL1, a `deleted` column
             // with in-place ALTER TABLE migration of existing databases, a
@@ -26,16 +26,17 @@
             // refactor (shared execRecordStatement for delete/restore) —
             // behavior-preserving, same API.
             //
-            // v0.6.0-list (franky-agent/franky-memory#28) adds the listL1
-            // metadata projection: MemoryStore.listL1 / MemoryContext.list
-            // return only {scene_name, created_time, updated_time,
-            // metadata_json} for live records, with optional L1QueryFilter
-            // narrowing (session_id, type, time range, limit/offset). This
-            // is a pre-release tag on the fork pending upstream merge; the
-            // URL points at a reproducible git-archive release asset (GitHub
-            // auto-generated tarballs are non-deterministic). Flip back to a
-            // fr12k/ tag URL once the upstream PR is released.
-            .url = "https://github.com/franky-agent/franky-memory/releases/download/v0.6.0-list/franky-memory-v0.6.0-list.tar.gz",
+            // v0.6.0 adds the listL1 metadata projection (PR #28):
+            // MemoryStore.listL1 / MemoryContext.list return only
+            // {scene_name, created_time, updated_time, metadata_json} for
+            // live records, with optional L1QueryFilter narrowing
+            // (session_id, type, time range, limit/offset).
+            //
+            // v0.7.0 adds limit=0 = all matching records to listL1 (PR #29):
+            // the SQL LIMIT clause is omitted when filter.limit = 0. Used by
+            // franky's memory_list tool for its no-hard-limit mode (large
+            // results are CCR-compressed by the agent loop).
+            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.7.0.tar.gz",
             .hash = "agent_memory-0.5.0-yf36fgS-nQCaVqqL2V84X4bPV6fA82wpaWGR9jfxm7ga",
         },
         .franky_box = .{
