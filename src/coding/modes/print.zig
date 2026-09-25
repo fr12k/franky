@@ -1803,7 +1803,9 @@ pub fn buildSystemPromptIo(
             "- **memory_list**: List existing memories (metadata only: scene_name,\n" ++
             "  created_time, updated_time, metadata_json), newest first. Use this to\n" ++
             "  browse what's already stored before saving duplicates or to audit which\n" ++
-            "  memories exist. Unlike memory_search, this does not rank by relevance.\n\n" ++
+            "  memories exist. Unlike memory_search, this does not rank by relevance.\n" ++
+            "  Default limit is 100; pass limit=0 to list ALL memories. Large listings\n" ++
+            "  are compressed automatically (use ccr_retrieve if you need the full text).\n\n" ++
             "When you finish a task, consider whether anything worth remembering happened.\n" ++
             "If so, save it with memory_save before calling finish_task. Likewise, if you\n" ++
             "notice an existing memory is now wrong or superseded, delete it with\n" ++

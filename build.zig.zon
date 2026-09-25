@@ -36,7 +36,7 @@
             // auto-generated tarballs are non-deterministic). Flip back to a
             // fr12k/ tag URL once the upstream PR is released.
             .url = "https://github.com/franky-agent/franky-memory/releases/download/v0.6.0-list/franky-memory-v0.6.0-list.tar.gz",
-            .hash = "agent_memory-0.5.0-yf36fuu0nQB53z1gBt96m7k3VL61x9oJ7c21UjhpL5oy",
+            .hash = "agent_memory-0.5.0-yf36fgS-nQCaVqqL2V84X4bPV6fA82wpaWGR9jfxm7ga",
         },
         .franky_box = .{
             // v0.6.1 (from the original fr12k/franky-box repo) — on top of

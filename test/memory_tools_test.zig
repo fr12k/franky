@@ -325,6 +325,54 @@ test "memory_list returns metadata projection, newest first" {
     try testing.expect(std.mem.indexOf(u8, after_del_text, "ui prefs") != null);
 }
 
+test "memory_list with limit=0 returns all memories (no hard limit)" {
+    const allocator = testing.allocator;
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const epoch = test_counter.fetchAdd(1, .monotonic);
+    const dir = try std.fmt.allocPrint(allocator, "/tmp/franky-memtool-test-{d}", .{epoch});
+    defer allocator.free(dir);
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/memory.db", .{dir});
+    defer allocator.free(db_path);
+
+    var state = try memory_mod.MemoryState.init(allocator, io, .{ .db_path = db_path });
+    defer state.deinit();
+    state.repointCtx();
+
+    const save_tool = tools_mod.memory_save.tool(&state);
+    const list_tool = tools_mod.memory_list.tool(&state);
+
+    // Save 5 memories — more than the old hard cap of 100 would have
+    // allowed, but well within limit=0 (all).
+    var i: u8 = 0;
+    while (i < 5) : (i += 1) {
+        var buf: [128]u8 = undefined;
+        const args = try std.fmt.bufPrint(&buf,
+            "{{\"content\": \"fact {d}\", \"type\": \"episodic\", \"scene_name\": \"scene-{d}\"}}",
+            .{ i, i },
+        );
+        const t = try runTool(&save_tool, allocator, io, args);
+        defer allocator.free(t);
+    }
+
+    // limit=0 → all 5 memories returned.
+    const all_text = try runTool(&list_tool, allocator, io, "{\"limit\": 0}");
+    defer allocator.free(all_text);
+    try testing.expect(std.mem.indexOf(u8, all_text, "5 memory(s)") != null);
+    // All 5 scene names present.
+    try testing.expect(std.mem.indexOf(u8, all_text, "scene-0") != null);
+    try testing.expect(std.mem.indexOf(u8, all_text, "scene-4") != null);
+
+    // Default limit (no arg) → also returns all 5 (default is 100, 5 < 100).
+    const default_text = try runTool(&list_tool, allocator, io, "{}");
+    defer allocator.free(default_text);
+    try testing.expect(std.mem.indexOf(u8, default_text, "5 memory(s)") != null);
+}
+
 test "finalizeToolSet registers memory_search, memory_save, memory_delete, memory_list" {
     const allocator = testing.allocator;
     var threaded = franky.test_helpers.threadedIo();

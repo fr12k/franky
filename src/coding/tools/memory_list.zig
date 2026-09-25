@@ -16,7 +16,13 @@
 //! Soft-deleted records are excluded automatically (the store filters
 //! `deleted = 0`). The result is ordered newest-first by created_time.
 //!
-//! Schema: `{limit?, type?, scene_name?}` (all optional).
+//! There is no hard limit on the result size. The default limit is 100;
+//! pass `limit: 0` to return **all** matching memories. Large results are
+//! compressed by the CCR (Context Compression & Retrieval) layer before
+//! they reach the model context — the full original listing is stored and
+//! can be retrieved via `ccr_retrieve` if needed.
+//!
+//! Schema: `{limit?, type?}` (all optional).
 
 const std = @import("std");
 const ct = @import("../types.zig");
@@ -32,8 +38,8 @@ pub const parameters_json: []const u8 =
     \\  "properties": {
     \\    "limit": {
     \\      "type": "integer",
-    \\      "description": "Maximum number of memories to return (default 20, max 100). Newest first.",
-    \\      "default": 20
+    \\      "description": "Maximum number of memories to return (default 100). Pass 0 to return ALL memories — large results are compressed by the CCR layer automatically. Newest first.",
+    \\      "default": 100
     \\    },
     \\    "type": {
     \\      "type": "string",
@@ -53,12 +59,15 @@ pub fn tool(ctx: *memory_mod.MemoryState) at.AgentTool {
             "before saving duplicates or to audit which memories exist. " ++
             "Results are newest-first and exclude soft-deleted memories. " ++
             "Unlike memory_search, this does not rank by relevance — it enumerates. " ++
-            "Optional: filter by type, cap with limit (default 20).",
+            "Default limit is 100; pass limit=0 to return ALL memories. " ++
+            "Large results are compressed by the CCR layer automatically.",
         .parameters_json = parameters_json,
         .execution_mode = .parallel,
         .ctx = @ptrCast(ctx),
         .execute = execute,
-        .skip_compression = true, // listing output should stay intact
+        // Do NOT skip compression — a limit=0 listing can be large, and the
+        // CCR layer should compress it (storing the original for ccr_retrieve).
+        .skip_compression = false,
     };
 }
 
@@ -83,14 +92,12 @@ fn execute(
     };
     const root = parsed.value;
 
-    // limit (optional, default 20, clamp 1..100).
+    // limit (optional, default 100, no hard max). limit=0 means "all".
+    // Negative or non-integer values fall back to the default.
     const limit: u32 = if (root.object.get("limit")) |v| blk: {
-        if (v == .integer and v.integer >= 1) {
-            const clamped: u32 = @min(@as(u32, @intCast(v.integer)), 100);
-            break :blk clamped;
-        }
-        break :blk 20;
-    } else 20;
+        if (v == .integer and v.integer >= 0) break :blk @intCast(v.integer);
+        break :blk 100;
+    } else 100;
 
     // type filter (optional).
     var filter = agent_memory.L1QueryFilter{ .limit = limit };
