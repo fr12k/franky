@@ -1800,6 +1800,10 @@ pub fn buildSystemPromptIo(
             "  appearing in search and recall but can be recovered. Never delete\n" ++
             "  a memory just because it is currently not relevant — stale memories are\n" ++
             "  the problem, not topical ones.\n\n" ++
+            "- **memory_list**: List existing memories (metadata only: scene_name,\n" ++
+            "  created_time, updated_time, metadata_json), newest first. Use this to\n" ++
+            "  browse what's already stored before saving duplicates or to audit which\n" ++
+            "  memories exist. Unlike memory_search, this does not rank by relevance.\n\n" ++
             "When you finish a task, consider whether anything worth remembering happened.\n" ++
             "If so, save it with memory_save before calling finish_task. Likewise, if you\n" ++
             "notice an existing memory is now wrong or superseded, delete it with\n" ++

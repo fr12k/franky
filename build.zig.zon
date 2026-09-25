@@ -25,8 +25,18 @@
             // vtable + MemoryContext helpers. v0.5.1 is the follow-up
             // refactor (shared execRecordStatement for delete/restore) —
             // behavior-preserving, same API.
-            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.5.1.tar.gz",
-            .hash = "agent_memory-0.5.0-yf36fk5mnQBWhXALo2RH-lQdZHQliXiASDdAg69RMwAs",
+            //
+            // v0.6.0-list (franky-agent/franky-memory#28) adds the listL1
+            // metadata projection: MemoryStore.listL1 / MemoryContext.list
+            // return only {scene_name, created_time, updated_time,
+            // metadata_json} for live records, with optional L1QueryFilter
+            // narrowing (session_id, type, time range, limit/offset). This
+            // is a pre-release tag on the fork pending upstream merge; the
+            // URL points at a reproducible git-archive release asset (GitHub
+            // auto-generated tarballs are non-deterministic). Flip back to a
+            // fr12k/ tag URL once the upstream PR is released.
+            .url = "https://github.com/franky-agent/franky-memory/releases/download/v0.6.0-list/franky-memory-v0.6.0-list.tar.gz",
+            .hash = "agent_memory-0.5.0-yf36fuu0nQB53z1gBt96m7k3VL61x9oJ7c21UjhpL5oy",
         },
         .franky_box = .{
             // v0.6.1 (from the original fr12k/franky-box repo) — on top of

@@ -1,5 +1,6 @@
-//! End-to-end test for the memory tools: memory_search, memory_save, and
-//! memory_delete (agent_memory v0.5.0) against a real SQLite database.
+//! End-to-end test for the memory tools: memory_search, memory_save,
+//! memory_delete (agent_memory v0.5.0), and memory_list (agent_memory
+//! v0.6.0-list) against a real SQLite database.
 //!
 //! Exercises the full franky integration path:
 //!   MemoryState (store + MemoryContext) → AgentTool.execute → store
@@ -10,7 +11,9 @@
 //! - delete is always soft — an explicit `hard: true` arg is ignored,
 //!   the row stays restorable via the operator-level store API
 //! - unknown id → clear non-error message
-//! - finalizeToolSet registers all three memory tools when memory is on
+//! - list → metadata projection (scene_name, created_time, updated_time,
+//!   metadata_json), newest first, excludes soft-deleted, optional type filter
+//! - finalizeToolSet registers all four memory tools when memory is on
 
 const std = @import("std");
 const franky = @import("franky");
@@ -233,7 +236,96 @@ test "memory tools: unknown id and invalid args return clear errors" {
     try testing.expect(result.is_error == true);
 }
 
-test "finalizeToolSet registers memory_search, memory_save, memory_delete" {
+test "memory_list returns metadata projection, newest first" {
+    const allocator = testing.allocator;
+    var threaded = franky.test_helpers.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const epoch = test_counter.fetchAdd(1, .monotonic);
+    const dir = try std.fmt.allocPrint(allocator, "/tmp/franky-memtool-test-{d}", .{epoch});
+    defer allocator.free(dir);
+    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/memory.db", .{dir});
+    defer allocator.free(db_path);
+
+    var state = try memory_mod.MemoryState.init(allocator, io, .{ .db_path = db_path });
+    defer state.deinit();
+    state.repointCtx();
+
+    const save_tool = tools_mod.memory_save.tool(&state);
+    const list_tool = tools_mod.memory_list.tool(&state);
+    const delete_tool = tools_mod.memory_delete.tool(&state);
+    const search_tool = tools_mod.memory_search.tool(&state);
+
+    // 1. Empty store → "No memories found.".
+    const empty_text = try runTool(&list_tool, allocator, io, "{}");
+    defer allocator.free(empty_text);
+    try testing.expect(std.mem.indexOf(u8, empty_text, "No memories found") != null);
+
+    // 2. Save two memories with distinct scene names and types.
+    {
+        const t = try runTool(&save_tool, allocator, io,
+            \\{"content": "User prefers dark mode", "type": "persona", "scene_name": "ui prefs"}
+        );
+        defer allocator.free(t);
+    }
+    {
+        const t = try runTool(&save_tool, allocator, io,
+            \\{"content": "Decided to use SQLite for storage", "type": "episodic", "scene_name": "storage"}
+        );
+        defer allocator.free(t);
+    }
+
+    // 3. List → both memories, newest first, with the 4 metadata fields.
+    const list_text = try runTool(&list_tool, allocator, io, "{}");
+    defer allocator.free(list_text);
+    try testing.expect(std.mem.indexOf(u8, list_text, "2 memory(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, list_text, "scene=\"storage\"") != null);
+    try testing.expect(std.mem.indexOf(u8, list_text, "scene=\"ui prefs\"") != null);
+    // created/updated timestamps are present (non-empty ms-epoch strings).
+    try testing.expect(std.mem.indexOf(u8, list_text, "created=") != null);
+    try testing.expect(std.mem.indexOf(u8, list_text, "updated=") != null);
+    // metadata_json default is "{}".
+    try testing.expect(std.mem.indexOf(u8, list_text, "metadata={}") != null);
+    // No content leaks into the listing.
+    try testing.expect(std.mem.indexOf(u8, list_text, "dark mode") == null);
+    try testing.expect(std.mem.indexOf(u8, list_text, "SQLite") == null);
+
+    // 4. Filter by type=persona → only the persona memory.
+    const persona_text = try runTool(&list_tool, allocator, io,
+        \\{"type": "persona"}
+    );
+    defer allocator.free(persona_text);
+    try testing.expect(std.mem.indexOf(u8, persona_text, "1 memory(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, persona_text, "scene=\"ui prefs\"") != null);
+    try testing.expect(std.mem.indexOf(u8, persona_text, "storage") == null);
+
+    // 5. Soft-delete one → excluded from list.
+    // Find its id via search.
+    const search_text = try runTool(&search_tool, allocator, io,
+        \\{"query": "SQLite"}
+    );
+    defer allocator.free(search_text);
+    const id_start = std.mem.indexOf(u8, search_text, "[id: ").? + "[id: ".len;
+    const id_end = std.mem.indexOfPos(u8, search_text, id_start, "] ").?;
+    const record_id = search_text[id_start..id_end];
+    var buf: [256]u8 = undefined;
+    const del_args = try std.fmt.bufPrint(&buf, "{{\"record_id\": \"{s}\"}}", .{record_id});
+    {
+        const t = try runTool(&delete_tool, allocator, io, del_args);
+        defer allocator.free(t);
+    }
+
+    const after_del_text = try runTool(&list_tool, allocator, io, "{}");
+    defer allocator.free(after_del_text);
+    try testing.expect(std.mem.indexOf(u8, after_del_text, "1 memory(s)") != null);
+    try testing.expect(std.mem.indexOf(u8, after_del_text, "storage") == null);
+    try testing.expect(std.mem.indexOf(u8, after_del_text, "ui prefs") != null);
+}
+
+test "finalizeToolSet registers memory_search, memory_save, memory_delete, memory_list" {
     const allocator = testing.allocator;
     var threaded = franky.test_helpers.threadedIo();
     defer threaded.deinit();
@@ -295,14 +387,17 @@ test "finalizeToolSet registers memory_search, memory_save, memory_delete" {
     var saw_search = false;
     var saw_save = false;
     var saw_delete = false;
+    var saw_list = false;
     for (tools) |t| {
         if (std.mem.eql(u8, t.name, "memory_search")) saw_search = true;
         if (std.mem.eql(u8, t.name, "memory_save")) saw_save = true;
         if (std.mem.eql(u8, t.name, "memory_delete")) saw_delete = true;
+        if (std.mem.eql(u8, t.name, "memory_list")) saw_list = true;
     }
     try testing.expect(saw_search);
     try testing.expect(saw_save);
     try testing.expect(saw_delete);
-    // 3 memory tools + 4 built-in extras.
-    try testing.expectEqual(@as(usize, 7), tools.len);
+    try testing.expect(saw_list);
+    // 4 memory tools + 4 built-in extras.
+    try testing.expectEqual(@as(usize, 8), tools.len);
 }

@@ -18,6 +18,7 @@ pub const tools = struct {
     pub const memory_search = @import("tools/memory_search.zig");
     pub const memory_save = @import("tools/memory_save.zig");
     pub const memory_delete = @import("tools/memory_delete.zig");
+    pub const memory_list = @import("tools/memory_list.zig");
 };
 
 pub const modes = struct {
