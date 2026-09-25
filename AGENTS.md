@@ -15,7 +15,7 @@ Version: 0.29.0 (library root), built on Zig 0.17-dev (master), two vendored dep
 | Lines of code | ~50k+ across 100+ files |
 | Tests | ~1016 (unit + integration) |
 | Providers | 7 (Anthropic, OpenAI Chat, OpenAI Responses, OpenAI Gateway, Google Gemini, Google Vertex, + Faux for testing) |
-| Built-in tools | 14 (read/write/edit/bash/ls/find/grep/subagent/web_search/web_fetch/workspace/memory_save/memory_search/ccr_retrieve) |
+| Built-in tools | 15 (read/write/edit/bash/ls/find/grep/subagent/web_search/web_fetch/workspace/memory_save/memory_search/memory_delete/memory_list/ccr_retrieve) |
 | Run modes | 3 (print/rpc/proxy) |
 | Capability roles | 4 (read/plan/code/full) |
 | Guardrails | 3 (stuck detector, compilation guard, finish_task) |

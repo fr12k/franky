@@ -292,10 +292,11 @@ pub const Config = struct {
     compress_plain_text: bool = true,
 
     /// v3.2 — `--memory` / `--no-memory` — enable/disable the memory
-    /// tools (memory_search, memory_save) and the `## Memory Tools`
-    /// system-prompt section. Default on; settings.json `tools.memory.enabled`
-    /// overlays the default. When off, the memory tools are not
-    /// registered and the system prompt contains no memory guidance.
+    /// tools (memory_search, memory_save, memory_delete, memory_list) and
+    /// the `## Memory Tools` system-prompt section. Default on;
+    /// settings.json `tools.memory.enabled` overlays the default. When off,
+    /// the memory tools are not registered and the system prompt contains
+    /// no memory guidance.
     memory_enabled: bool = true,
 
     /// v3.2 — `--memory-nudge` — memory save nudge (default on). When

@@ -1139,7 +1139,8 @@ pub const ToolBindingCtx = struct {
     /// tool with a placeholder ctx that the mode driver patches after
     /// session init (same pattern as `resolve()` at line 1259).
     ccr_ctx: ?*compression_mod.CcrContext = null,
-    /// When non-null, appends `memory_search` + `memory_save`.
+    /// When non-null, appends `memory_search` + `memory_save` +
+    /// `memory_delete` + `memory_list`.
     memory_state: ?*memory_mod.MemoryState = null,
 };
 
@@ -1154,7 +1155,7 @@ pub fn finalizeToolSet(
     ctx: ToolBindingCtx,
 ) ![]at.AgentTool {
     const base_len = ctx.base_tools.len + ctx.ext_tools.len;
-    const extra: usize = if (ctx.memory_state != null) 7 else 4;
+    const extra: usize = if (ctx.memory_state != null) 8 else 4;
     const slice = try allocator.alloc(at.AgentTool, base_len + extra);
     @memcpy(slice[0..ctx.base_tools.len], ctx.base_tools);
     if (ctx.ext_tools.len > 0) {
@@ -1168,6 +1169,7 @@ pub fn finalizeToolSet(
         slice[base_len + 4] = tools_mod.memory_search.tool(ms);
         slice[base_len + 5] = tools_mod.memory_save.tool(ms);
         slice[base_len + 6] = tools_mod.memory_delete.tool(ms);
+        slice[base_len + 7] = tools_mod.memory_list.tool(ms);
     }
     return slice;
 }

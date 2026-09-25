@@ -375,10 +375,10 @@ fn selectTools(
 // own MemoryState ctx, so selectTools can pick them up by name. Recall
 // (memory_search) is safe for read-only presets; persist (memory_save)
 // only for write-capable presets. diff-review stays tool-less by design.
-const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_search", "web_fetch", "memory_search" };
+const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_search", "web_fetch", "memory_search", "memory_list" };
 const diff_review_tool_names = [_][]const u8{};
-const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls", "find", "grep", "memory_search", "memory_save" };
-const bash_runner_tool_names = [_][]const u8{ "bash", "ls", "find", "grep", "memory_search", "memory_save" };
+const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls", "find", "grep", "memory_search", "memory_save", "memory_list" };
+const bash_runner_tool_names = [_][]const u8{ "bash", "ls", "find", "grep", "memory_search", "memory_save", "memory_list" };
 
 fn buildResearchTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
     return selectTools(alloc, parent, &research_tool_names);

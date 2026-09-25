@@ -92,8 +92,9 @@ pub const Settings = struct {
     compress_plain_text: ?bool = null,
 
     /// v3.2 — `tools.memory.enabled` — settings-layer toggle for the
-    /// memory tools (memory_search, memory_save) and the `## Memory Tools`
-    /// system-prompt section. `null` = no setting (CLI default on applies).
+    /// memory tools (memory_search, memory_save, memory_delete, memory_list)
+    /// and the `## Memory Tools` system-prompt section. `null` = no setting
+    /// (CLI default on applies).
     memory_enabled: ?bool = null,
     /// v3.2 — `tools.memory.nudge` — settings-layer toggle for the
     /// memory save nudge guardrail. `null` = no setting (CLI default on).

@@ -16,7 +16,7 @@
             .hash = "zompress-0.0.1-hHj4JvKLAQD99DOqFg8rU0NfnwqGflzoPr0m_2A0ZmVG",
         },
         .agent_memory = .{
-            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory v0.5.1).
+            // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory).
             // v0.5.0 adds L1 memory deletion: deleteL1 (soft by default /
             // hard opt-in), restoreL1, purgeDeletedL1, a `deleted` column
             // with in-place ALTER TABLE migration of existing databases, a
@@ -25,8 +25,19 @@
             // vtable + MemoryContext helpers. v0.5.1 is the follow-up
             // refactor (shared execRecordStatement for delete/restore) —
             // behavior-preserving, same API.
-            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.5.1.tar.gz",
-            .hash = "agent_memory-0.5.0-yf36fk5mnQBWhXALo2RH-lQdZHQliXiASDdAg69RMwAs",
+            //
+            // v0.6.0 adds the listL1 metadata projection (PR #28):
+            // MemoryStore.listL1 / MemoryContext.list return only
+            // {scene_name, created_time, updated_time, metadata_json} for
+            // live records, with optional L1QueryFilter narrowing
+            // (session_id, type, time range, limit/offset).
+            //
+            // v0.7.0 adds limit=0 = all matching records to listL1 (PR #29):
+            // the SQL LIMIT clause is omitted when filter.limit = 0. Used by
+            // franky's memory_list tool for its no-hard-limit mode (large
+            // results are CCR-compressed by the agent loop).
+            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.7.0.tar.gz",
+            .hash = "agent_memory-0.5.0-yf36fgS-nQCaVqqL2V84X4bPV6fA82wpaWGR9jfxm7ga",
         },
         .franky_box = .{
             // v0.6.1 (from the original fr12k/franky-box repo) — on top of
