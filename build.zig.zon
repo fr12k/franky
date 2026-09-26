@@ -36,8 +36,19 @@
             // the SQL LIMIT clause is omitted when filter.limit = 0. Used by
             // franky's memory_list tool for its no-hard-limit mode (large
             // results are CCR-compressed by the agent loop).
-            .url = "https://github.com/fr12k/franky-memory/archive/refs/tags/v0.7.0.tar.gz",
-            .hash = "agent_memory-0.5.0-yf36fgS-nQCaVqqL2V84X4bPV6fA82wpaWGR9jfxm7ga",
+            //
+            // v0.8.0-search adds the search false-negative fix (PR #31):
+            // FTS5 index now covers both content AND scene_name columns
+            // (was content-only), buildFtsQuery uses OR semantics (was
+            // implicit AND), and empty/whitespace queries fall back to a
+            // full table scan (newest first). migrateFtsSchema rebuilds
+            // legacy FTS indexes with both columns atomically.
+            //
+            // This is a fork pre-release tag (franky-agent/franky-memory
+            // v0.8.0-search) pending an upstream fr12k/franky-memory tag
+            // release — flip back to a fr12k/ tag URL once that's cut.
+            .url = "https://github.com/franky-agent/franky-memory/releases/download/v0.8.0-search/franky-memory-v0.8.0-search.tar.gz",
+            .hash = "agent_memory-0.5.0-yf36ftkdngDCNCl_vwo4Km_N6oFKQdYq90-C0SOyDCxv",
         },
         .franky_box = .{
             // v0.6.1 (from the original fr12k/franky-box repo) — on top of
