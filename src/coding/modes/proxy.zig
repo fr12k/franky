@@ -15,6 +15,8 @@
 //!                     `200 {"ok":true}` once the run kicks off
 //!                     (events drain on `/events` subscribers).
 //!   - `GET /health`   liveness probe; replies `200 {"ok":true}`.
+//!   - `GET /version`  build version info; replies
+//!                     `200 {"version":"<v>","commit":"<sha>","date":"<iso>"}`.
 //!   - `POST /abort`   fire `session.cancel` to terminate the
 //!                     in-flight agent loop. The loop emits
 //!                     `agent_error{code=aborted}` and `turn_end`,
@@ -1865,6 +1867,10 @@ fn handleConnection(arg: ConnArg) void {
         sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true}");
         return;
     }
+    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/version")) {
+        respondVersion(&stream, arg.io, arg.allocator);
+        return;
+    }
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/transcript")) {
         respondTranscript(arg.session, &stream, arg.io, arg.allocator);
         return;
@@ -2738,6 +2744,25 @@ fn respondRole(
         session.provider.provider_name,
         session.provider.model_id,
         ext_tool_names.items,
+    ) catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    defer allocator.free(body);
+    sse_mod.respondJson(stream, io, 200, body);
+}
+
+/// `GET /version` — build version info for the web UI header pill.
+/// Returns JSON like `{"version":"dev","commit":"unknown","date":"unknown"}`.
+fn respondVersion(
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+) void {
+    const body = std.fmt.allocPrint(
+        allocator,
+        "{{\"version\":\"{s}\",\"commit\":\"{s}\",\"date\":\"{s}\"}}",
+        .{ franky.version, franky.commit, franky.build_date },
     ) catch {
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
@@ -4108,6 +4133,29 @@ test "proxy: GET /health returns 200" {
 
     try testing.expect(std.mem.indexOf(u8, resp.items, "200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "{\"ok\":true}") != null);
+}
+
+test "proxy: GET /version returns version + commit + date" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return; // sandbox can't bind
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "GET /version HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
+
+    try testing.expect(std.mem.indexOf(u8, resp.items, "200") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "\"version\":") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "\"commit\":") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "\"date\":") != null);
 }
 
 test "proxy: GET /role exposes role + permitted tools" {

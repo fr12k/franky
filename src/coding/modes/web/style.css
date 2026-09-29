@@ -343,6 +343,21 @@ header h1 {
     font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
 }
 
+/* Version pill — sits right after the <h1> so the build version is
+ * visible at a glance. Muted + monospaced, same chrome as the model
+ * pill. Tooltip carries commit + build date for diagnostics. */
+.version-pill {
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    margin-left: 2px;
+    user-select: none;
+    color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+    cursor: help;
+}
+
 /* ── v1.7.2 Activity pill ─────────────────────────────────────
  * Persistent feedback that's NOT inside the conversation pane,
  * so it's visible regardless of scroll position. Pulsing dot
@@ -2135,5 +2150,5 @@ button#send:hover:not(:disabled) {
 /* Very small phones: drop the least-essential header chips so the
  * actions that matter (abort / help / drawers) stay tappable. */
 @media (max-width: 520px) {
-    .status-line, .model-pill { display: none; }
+    .status-line, .model-pill, .version-pill { display: none; }
 }
