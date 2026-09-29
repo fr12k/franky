@@ -89,8 +89,8 @@ pub const default_host: []const u8 = "0.0.0.0";
 // The HTML ships with sentinel placeholders that we patch at
 // compile time so the build version is baked into the binary —
 // no runtime /version round-trip from the browser. `@embedFile`
-// yields a comptime-known `[]const u8`, so `std.mem.replace` runs
-// at comptime and the result is a static slice in the binary.
+// yields a comptime-known `[]const u8`; `patchVersion` runs at
+// comptime and the result is a static slice in the binary.
 const web_index_html = patchVersion(@embedFile("web/index.html"));
 const web_app_js = @embedFile("web/app.js");
 const web_style_css = @embedFile("web/style.css");
@@ -4259,6 +4259,8 @@ test "proxy: served app.js wires v1.7.0 session sidebar" {
     try testing.expect(std.mem.indexOf(u8, web_index_html, "__FRANKY_") == null);
     try testing.expect(std.mem.indexOf(u8, web_index_html, "version-pill") != null);
     try testing.expect(std.mem.indexOf(u8, web_index_html, franky.version) != null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, franky.commit) != null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, franky.build_date) != null);
 }
 
 test "proxy: served app.js carries v1.7.1 bug fixes" {
