@@ -15,8 +15,6 @@
 //!                     `200 {"ok":true}` once the run kicks off
 //!                     (events drain on `/events` subscribers).
 //!   - `GET /health`   liveness probe; replies `200 {"ok":true}`.
-//!   - `GET /version`  build version info; replies
-//!                     `200 {"version":"<v>","commit":"<sha>","date":"<iso>"}`.
 //!   - `POST /abort`   fire `session.cancel` to terminate the
 //!                     in-flight agent loop. The loop emits
 //!                     `agent_error{code=aborted}` and `turn_end`,
@@ -88,13 +86,54 @@ pub const default_host: []const u8 = "0.0.0.0";
 // the bytes into the binary at compile time so a single
 // `franky --mode proxy` invocation serves both the API and the UI.
 
-const web_index_html = @embedFile("web/index.html");
+// The HTML ships with sentinel placeholders that we patch at
+// compile time so the build version is baked into the binary —
+// no runtime /version round-trip from the browser. `@embedFile`
+// yields a comptime-known `[]const u8`, so `std.mem.replace` runs
+// at comptime and the result is a static slice in the binary.
+const web_index_html = patchVersion(@embedFile("web/index.html"));
 const web_app_js = @embedFile("web/app.js");
 const web_style_css = @embedFile("web/style.css");
 const web_prism_js = @embedFile("web/prism.js");
 const web_prism_css = @embedFile("web/prism-tomorrow.css");
 const web_htmx_js = @embedFile("web/htmx.min.js");
 const web_hx_sse_js = @embedFile("web/hx-sse.min.js");
+
+/// Compile-time patching of the embedded `index.html`: swaps the
+/// `__FRANKY_VERSION__` / `__FRANKY_COMMIT__` / `__FRANKY_DATE__`
+/// sentinels for the build-options values so the served HTML
+/// already carries the version — no client-side fetch needed.
+/// Runs at comptime (the inputs are comptime-known) and returns a
+/// static `[]const u8` baked into the binary.
+fn patchVersion(html: []const u8) []const u8 {
+    return replaceSentinel(
+        replaceSentinel(
+            replaceSentinel(html, "__FRANKY_VERSION__", franky.version),
+            "__FRANKY_COMMIT__", franky.commit,
+        ),
+        "__FRANKY_DATE__", franky.build_date,
+    );
+}
+
+/// Comptime-friendly sentinel replacement — swaps *every*
+/// occurrence of `needle` in `input` with `replacement`. All
+/// arguments must be comptime-known. Returns a comptime-known
+/// `[]const u8` whose address is stable in the binary.
+fn replaceSentinel(input: []const u8, needle: []const u8, replacement: []const u8) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        // Walk the input, splicing on every needle hit. `++` on
+        // comptime slices yields a comptime array, so the result
+        // is safe to return into a global const.
+        var out: []const u8 = &.{};
+        var rest: []const u8 = input;
+        while (std.mem.indexOf(u8, rest, needle)) |idx| {
+            out = out ++ rest[0..idx] ++ replacement;
+            rest = rest[idx + needle.len ..];
+        }
+        break :blk out ++ rest;
+    };
+}
 
 pub const RunError = error{
     BindFailed,
@@ -1867,10 +1906,6 @@ fn handleConnection(arg: ConnArg) void {
         sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true}");
         return;
     }
-    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/version")) {
-        respondVersion(&stream, arg.io, arg.allocator);
-        return;
-    }
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/transcript")) {
         respondTranscript(arg.session, &stream, arg.io, arg.allocator);
         return;
@@ -2744,25 +2779,6 @@ fn respondRole(
         session.provider.provider_name,
         session.provider.model_id,
         ext_tool_names.items,
-    ) catch {
-        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
-        return;
-    };
-    defer allocator.free(body);
-    sse_mod.respondJson(stream, io, 200, body);
-}
-
-/// `GET /version` — build version info for the web UI header pill.
-/// Returns JSON like `{"version":"dev","commit":"unknown","date":"unknown"}`.
-fn respondVersion(
-    stream: *std.Io.net.Stream,
-    io: std.Io,
-    allocator: std.mem.Allocator,
-) void {
-    const body = std.fmt.allocPrint(
-        allocator,
-        "{{\"version\":\"{s}\",\"commit\":\"{s}\",\"date\":\"{s}\"}}",
-        .{ franky.version, franky.commit, franky.build_date },
     ) catch {
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
@@ -4135,29 +4151,6 @@ test "proxy: GET /health returns 200" {
     try testing.expect(std.mem.indexOf(u8, resp.items, "{\"ok\":true}") != null);
 }
 
-test "proxy: GET /version returns version + commit + date" {
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-    const gpa = testing.allocator;
-
-    var setup = bindLoopback(io) orelse return; // sandbox can't bind
-    defer setup.server.deinit(io);
-
-    var ts: ProxyTestSession = undefined;
-    try ts.initFor(gpa, io, &.{"franky"});
-    defer ts.deinit();
-
-    var resp: std.ArrayList(u8) = .empty;
-    defer resp.deinit(gpa);
-    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "GET /version HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
-
-    try testing.expect(std.mem.indexOf(u8, resp.items, "200") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.items, "\"version\":") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.items, "\"commit\":") != null);
-    try testing.expect(std.mem.indexOf(u8, resp.items, "\"date\":") != null);
-}
-
 test "proxy: GET /role exposes role + permitted tools" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
@@ -4261,6 +4254,11 @@ test "proxy: served app.js wires v1.7.0 session sidebar" {
     try testing.expect(std.mem.indexOf(u8, web_index_html, "id=\"sidebar\"") != null);
     try testing.expect(std.mem.indexOf(u8, web_index_html, "id=\"session-list\"") != null);
     try testing.expect(std.mem.indexOf(u8, web_index_html, "id=\"new-session\"") != null);
+    // The comptime patchVersion pass bakes the build version into the
+    // HTML and must not leave any __FRANKY_*__ sentinels behind.
+    try testing.expect(std.mem.indexOf(u8, web_index_html, "__FRANKY_") == null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, "version-pill") != null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, franky.version) != null);
 }
 
 test "proxy: served app.js carries v1.7.1 bug fixes" {

@@ -3201,24 +3201,6 @@ function highlightCodeBlocks(container) {
     // localStorage-only so this is synchronous + instant.
     loadHistory();
 
-    // One-shot fetch at boot — build version for the header pill.
-    // Independent of /session so it can run in parallel with the
-    // dependent boot fetches.
-    async function loadVersion() {
-        const el = document.getElementById('version-pill');
-        if (!el) return;
-        try {
-            const r = await fetch('/version');
-            if (!r.ok) return;
-            const data = await r.json();
-            const v = data.version || 'dev';
-            const commit = data.commit || 'unknown';
-            const date = data.date || 'unknown';
-            el.textContent = 'v' + v;
-            el.title = 'franky v' + v + '\ncommit: ' + commit + '\nbuild: ' + date;
-        } catch (_) { /* leave placeholder */ }
-    }
-
     // One-shot fetch at boot — role is bound at session init
     // server-side and never changes for the proxy's lifetime.
     async function loadRole() {
@@ -3296,7 +3278,7 @@ function highlightCodeBlocks(container) {
                 if (data && data.persisted === false) sessionsPersisted = false;
             }
         } catch (_) { /* ignore */ }
-        await Promise.all([loadRole(), loadVersion(), loadSessions(), rehydrate()]);
+        await Promise.all([loadRole(), loadSessions(), rehydrate()]);
         connect();
     })();
 })();
