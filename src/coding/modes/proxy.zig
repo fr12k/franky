@@ -86,13 +86,54 @@ pub const default_host: []const u8 = "0.0.0.0";
 // the bytes into the binary at compile time so a single
 // `franky --mode proxy` invocation serves both the API and the UI.
 
-const web_index_html = @embedFile("web/index.html");
+// The HTML ships with sentinel placeholders that we patch at
+// compile time so the build version is baked into the binary —
+// no runtime /version round-trip from the browser. `@embedFile`
+// yields a comptime-known `[]const u8`; `patchVersion` runs at
+// comptime and the result is a static slice in the binary.
+const web_index_html = patchVersion(@embedFile("web/index.html"));
 const web_app_js = @embedFile("web/app.js");
 const web_style_css = @embedFile("web/style.css");
 const web_prism_js = @embedFile("web/prism.js");
 const web_prism_css = @embedFile("web/prism-tomorrow.css");
 const web_htmx_js = @embedFile("web/htmx.min.js");
 const web_hx_sse_js = @embedFile("web/hx-sse.min.js");
+
+/// Compile-time patching of the embedded `index.html`: swaps the
+/// `__FRANKY_VERSION__` / `__FRANKY_COMMIT__` / `__FRANKY_DATE__`
+/// sentinels for the build-options values so the served HTML
+/// already carries the version — no client-side fetch needed.
+/// Runs at comptime (the inputs are comptime-known) and returns a
+/// static `[]const u8` baked into the binary.
+fn patchVersion(html: []const u8) []const u8 {
+    return replaceSentinel(
+        replaceSentinel(
+            replaceSentinel(html, "__FRANKY_VERSION__", franky.version),
+            "__FRANKY_COMMIT__", franky.commit,
+        ),
+        "__FRANKY_DATE__", franky.build_date,
+    );
+}
+
+/// Comptime-friendly sentinel replacement — swaps *every*
+/// occurrence of `needle` in `input` with `replacement`. All
+/// arguments must be comptime-known. Returns a comptime-known
+/// `[]const u8` whose address is stable in the binary.
+fn replaceSentinel(input: []const u8, needle: []const u8, replacement: []const u8) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        // Walk the input, splicing on every needle hit. `++` on
+        // comptime slices yields a comptime array, so the result
+        // is safe to return into a global const.
+        var out: []const u8 = &.{};
+        var rest: []const u8 = input;
+        while (std.mem.indexOf(u8, rest, needle)) |idx| {
+            out = out ++ rest[0..idx] ++ replacement;
+            rest = rest[idx + needle.len ..];
+        }
+        break :blk out ++ rest;
+    };
+}
 
 pub const RunError = error{
     BindFailed,
@@ -4213,6 +4254,13 @@ test "proxy: served app.js wires v1.7.0 session sidebar" {
     try testing.expect(std.mem.indexOf(u8, web_index_html, "id=\"sidebar\"") != null);
     try testing.expect(std.mem.indexOf(u8, web_index_html, "id=\"session-list\"") != null);
     try testing.expect(std.mem.indexOf(u8, web_index_html, "id=\"new-session\"") != null);
+    // The comptime patchVersion pass bakes the build version into the
+    // HTML and must not leave any __FRANKY_*__ sentinels behind.
+    try testing.expect(std.mem.indexOf(u8, web_index_html, "__FRANKY_") == null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, "version-pill") != null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, franky.version) != null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, franky.commit) != null);
+    try testing.expect(std.mem.indexOf(u8, web_index_html, franky.build_date) != null);
 }
 
 test "proxy: served app.js carries v1.7.1 bug fixes" {
