@@ -95,7 +95,7 @@ pub fn run(
     }
 }
 
-const Session = struct {
+pub const Session = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     registry: ai.registry.Registry,
@@ -160,7 +160,7 @@ const Session = struct {
     /// memory is disabled. Owned by `role_arena`.
     memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
 
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
         self.bash_state.deinit();
@@ -175,7 +175,7 @@ const Session = struct {
     }
 };
 
-fn initSession(
+pub fn initSession(
     session: *Session,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -997,7 +997,7 @@ fn writeRoleResult(
     try writeResultFrame(allocator, io, stdout, id, body);
 }
 
-fn writeResultFrame(
+pub fn writeResultFrame(
     allocator: std.mem.Allocator,
     io: std.Io,
     stdout: std.Io.File,
@@ -1012,7 +1012,7 @@ fn writeResultFrame(
     try writeFrameToStdout(io, stdout, body);
 }
 
-fn writeErrorFrame(
+pub fn writeErrorFrame(
     allocator: std.mem.Allocator,
     io: std.Io,
     stdout: std.Io.File,
@@ -1028,7 +1028,7 @@ fn writeErrorFrame(
     try writeFrameToStdout(io, stdout, body);
 }
 
-fn writeFrameToStdout(io: std.Io, stdout: std.Io.File, body: []const u8) !void {
+pub fn writeFrameToStdout(io: std.Io, stdout: std.Io.File, body: []const u8) !void {
     // LSP framing: "Content-Length: N\r\n\r\n<body>".
     //
     // Use writeStreamingAll here — we explicitly want append-to-stream

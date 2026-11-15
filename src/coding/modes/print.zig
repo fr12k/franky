@@ -81,7 +81,7 @@ pub fn run(
     }
     var cfg = cli_mod.parse(allocator, argv) catch |e| switch (e) {
         error.MissingValue => return exitWithMessage(io, "missing value for flag; see --help\n", 2),
-        error.UnknownMode => return exitWithMessage(io, "unknown --mode value; use print, rpc, or proxy\n", 2),
+        error.UnknownMode => return exitWithMessage(io, "unknown --mode value; use print, rpc, proxy, or mcp\n", 2),
         error.UnknownThinkingLevel => return exitWithMessage(io, "unknown --thinking value; use off|minimal|low|medium|high|xhigh\n", 2),
         else => |err| return err,
     };
@@ -173,6 +173,10 @@ pub fn run(
     if (cfg.mode == .rpc) {
         const rpc_mode = @import("rpc.zig");
         return rpc_mode.run(allocator, io, environ, environ_map, &cfg);
+    }
+    if (cfg.mode == .mcp) {
+        const mcp_mode = @import("mcp.zig");
+        return mcp_mode.run(allocator, io, environ, environ_map, &cfg);
     }
     if (cfg.mode == .proxy) {
         const proxy_mode = @import("proxy.zig");

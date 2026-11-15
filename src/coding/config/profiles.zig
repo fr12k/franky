@@ -666,6 +666,7 @@ fn parseMode(s: []const u8) !cli.Mode {
     if (std.mem.eql(u8, s, "print")) return .print;
     if (std.mem.eql(u8, s, "rpc")) return .rpc;
     if (std.mem.eql(u8, s, "proxy")) return .proxy;
+    if (std.mem.eql(u8, s, "mcp")) return .mcp;
     return error.UnknownMode;
 }
 
