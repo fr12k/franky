@@ -36,6 +36,7 @@ const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compression_mod = franky.coding.compression;
 const memory_mod = franky.coding.memory;
 const memory_guard_mod = franky.agent.guardrails;
+const mcp_mod = franky.coding.mcp;
 
 /// Error set for config resolution.
 pub const ResolveError = error{
@@ -158,6 +159,12 @@ pub const ResolvedConfig = struct {
     /// after settings overlay). Mode drivers use this to set the
     /// guardrail pointer on their GuardrailState.
     memory_nudge_enabled: bool = false,
+
+    // ── MCP client (v0.30.0) ────────────────────────────────────
+    /// MCP client state holding tool contexts for externally-proxied
+    /// tools. `null` when `--mcp-configs` is not set or no servers
+    /// were configured. Owned by the resolver arena.
+    mcp_client: ?*mcp_mod.McpClient = null,
 
     // ── Arena ────────────────────────────────────────────────────
     /// Everything that outlives `resolve()` is allocated on this arena.
@@ -1444,6 +1451,42 @@ pub fn resolve(
         .memory_state = memory_state,
     });
 
+    // ── Step 13.5: MCP client tool discovery (v0.30.0) ────────
+    // When --mcp-configs is set, parse the config files, connect to
+    // each external MCP server, discover their tools, and append
+    // them to the tool set. Tools are namespaced as `server__tool`.
+    var mcp_client_ptr: ?*mcp_mod.McpClient = null;
+    const final_with_mcp: []const at.AgentTool = blk: {
+        if (cfg.mcp_configs) |configs_csv| {
+            const config_paths = splitCsv(a, configs_csv) catch &.{ };
+            if (config_paths.len > 0) {
+                var mcp_cancel: ai.stream.Cancel = .{};
+                const mcp_client = try a.create(mcp_mod.McpClient);
+                const mcp_tools = mcp_mod.client.discoverTools(
+                    a,
+                    io,
+                    // parseConfigs needs the environ_map for substitution
+                    blk2: {
+                        const servers = mcp_mod.config.parseConfigs(a, config_paths, environ_map, io) catch break :blk2 &.{};
+                        break :blk2 servers;
+                    },
+                    environ_map,
+                    &mcp_cancel,
+                    mcp_client,
+                ) catch &.{};
+                mcp_client_ptr = mcp_client;
+                if (mcp_tools.len > 0) {
+                    // Append to all_final_tools.
+                    const combined = try a.alloc(at.AgentTool, all_final_tools.len + mcp_tools.len);
+                    @memcpy(combined[0..all_final_tools.len], all_final_tools);
+                    @memcpy(combined[all_final_tools.len..], mcp_tools);
+                    break :blk combined;
+                }
+            }
+        }
+        break :blk all_final_tools;
+    };
+
     // ── Step 14: Build review config block ───────────────────────
     const review_block = try buildReviewConfigBlock(a, &settings);
 
@@ -1496,7 +1539,7 @@ pub fn resolve(
         .max_full_tool_results = settings.max_full_tool_results orelse 0,
         .registry = reg,
         .faux_provider = faux_ptr,
-        .tools = all_final_tools,
+        .tools = final_with_mcp,
         .permission_store = permission_store,
         .session_gates = session_gates,
         .preset_registry = preset_registry,
@@ -1534,6 +1577,7 @@ pub fn resolve(
         .memory_state = memory_state,
         .memory_guardrail = memory_guardrail,
         .memory_nudge_enabled = cfg.memory_nudge,
+        .mcp_client = mcp_client_ptr,
         .arena = arena,
     };
 }
@@ -1543,6 +1587,21 @@ pub fn resolve(
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+/// Split a comma-separated string into a slice of trimmed strings.
+/// Empty entries are skipped. Allocates on `allocator`.
+fn splitCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
+    var result: std.ArrayList([]const u8) = .empty;
+    errdefer result.deinit(allocator);
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) {
+            try result.append(allocator, try allocator.dupe(u8, trimmed));
+        }
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────

@@ -159,6 +159,9 @@ pub const Session = struct {
     /// v3.2 — memory nudge guardrail. `null` when nudge is off or
     /// memory is disabled. Owned by `role_arena`.
     memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+    /// v0.30.0 — MCP client state for externally-proxied tools.
+    /// null when --mcp-configs is not set. Owned by role_arena.
+    mcp_client: ?*franky.coding.mcp.McpClient = null,
 
     pub fn deinit(self: *Session) void {
         self.transcript.deinit();
@@ -466,12 +469,53 @@ pub fn initSession(
     });
     session.tools = final_tools;
 
+    // v0.30.0 — discover tools from external MCP servers when
+    // --mcp-configs is set. Tools are namespaced as
+    // `mcp__<server>__<tool>` and appended to the tool set.
+    if (cfg.mcp_configs) |configs_csv| {
+        const config_paths = splitCsv(ra, configs_csv) catch &.{};
+        if (config_paths.len > 0) {
+            const mcp_servers = franky.coding.mcp.config.parseConfigs(
+                ra, config_paths, session.environ_map, io,
+            ) catch &.{};
+            if (mcp_servers.len > 0) {
+                var mcp_cancel: ai.stream.Cancel = .{};
+                const mcp_client = try ra.create(franky.coding.mcp.McpClient);
+                const mcp_tools = franky.coding.mcp.client.discoverTools(
+                    ra, io, mcp_servers, session.environ_map, &mcp_cancel, mcp_client,
+                ) catch &.{};
+                session.mcp_client = mcp_client;
+                if (mcp_tools.len > 0) {
+                    const combined = try ra.alloc(at.AgentTool, final_tools.len + mcp_tools.len);
+                    @memcpy(combined[0..final_tools.len], final_tools);
+                    @memcpy(combined[final_tools.len..], mcp_tools);
+                    session.tools = combined;
+                }
+            }
+        }
+    }
+
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
 }
 
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try fp.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+/// Split a comma-separated string into a slice of trimmed strings.
+/// Empty entries are skipped. Allocates on `allocator`.
+fn splitCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
+    var result: std.ArrayList([]const u8) = .empty;
+    errdefer result.deinit(allocator);
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (trimmed.len > 0) {
+            try result.append(allocator, try allocator.dupe(u8, trimmed));
+        }
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 // ─── §6.6 — sub-agent progress forwarding ────────────────────────
