@@ -327,38 +327,43 @@ pub const Store = struct {
             if (self.deny_bash.contains(fp)) return .auto_deny;
         }
 
-        // Step 2: explicit force-ask for tool names (checked BEFORE
-        // wildcard allow so --ask-tools mcp__slack__* wins over
-        // --allow-tools mcp__*). Bash fingerprints are handled
-        // separately in step 3 to preserve the existing semantics
-        // where allow_bash wins over ask_all/ask_bash.
-        const force_ask_tool = self.ask_all
-            or self.ask_tools.contains(tool_name)
-            or setMatchesWildcard(&self.ask_tools, tool_name);
-        if (force_ask_tool and bash_fp == null) {
-            if (self.yes_to_all) return .auto_allow;
-            return .ask;
-        }
-
-        // Step 3: allow lists.
+        // Step 2: exact-match allow (wins over exact-match ask, preserving
+        // original semantics where --allow-tools read beats --ask-tools read).
         if (bash_fp) |fp| {
             if (self.allow_bash.contains(fp)) return .auto_allow;
         }
         if (self.allow_tools.contains(tool_name)) return .auto_allow;
-        if (setMatchesWildcard(&self.allow_tools, tool_name)) return .auto_allow;
 
-        // Step 3b: bash force-ask (after bash allow, preserving original
-        // semantics where allow_bash wins over ask_all/ask_bash).
-        if (force_ask_tool and bash_fp != null) {
-            if (bash_fp) |fp| {
-                if (self.ask_bash.contains(fp)) {
-                    if (self.yes_to_all) return .auto_allow;
-                    return .ask;
-                }
-            }
+        // Step 3: exact-match force-ask (for non-bash tools).
+        if (self.ask_tools.contains(tool_name)) {
+            if (self.yes_to_all) return .auto_allow;
+            return .ask;
         }
 
-        // Step 4: default policy.
+        // Step 4: wildcard allow.
+        if (setMatchesWildcard(&self.allow_tools, tool_name)) return .auto_allow;
+
+        // Step 5: wildcard force-ask (checked after wildcard allow so
+        // --ask-tools mcp__slack__* wins over --allow-tools mcp__*).
+        if (setMatchesWildcard(&self.ask_tools, tool_name)) {
+            if (self.yes_to_all) return .auto_allow;
+            return .ask;
+        }
+
+        // Step 6: bash fingerprint ask (after bash allow, preserving
+        // original semantics where allow_bash wins over ask_bash/ask_all).
+        if (bash_fp) |fp| {
+            if (self.ask_bash.contains(fp)) {
+                if (self.yes_to_all) return .auto_allow;
+                return .ask;
+            }
+        }
+        if (self.ask_all) {
+            if (self.yes_to_all) return .auto_allow;
+            return .ask;
+        }
+
+        // Step 7: default policy.
         const default = defaultPolicy(tool_name);
         if (default == .ask and self.yes_to_all) return .auto_allow;
         return default;

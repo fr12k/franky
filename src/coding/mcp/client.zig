@@ -46,9 +46,6 @@ pub const McpToolCtx = struct {
 /// Per-session MCP client state. Holds the arena-allocated tool
 /// contexts. Allocated by the caller on the session arena.
 pub const McpClient = struct {
-    /// All discovered tool contexts. Each one is pointed to by the
-    /// corresponding `AgentTool.ctx`.
-    tool_ctxs: []McpToolCtx = &.{},
     /// The arena that owns all MCP string data. Deinit is the
     /// caller's responsibility (usually the session arena).
     arena: std.mem.Allocator,
@@ -82,12 +79,10 @@ pub fn discoverTools(
     // Initialize to safe empty state — callers may read this even
     // if discoverTools returns an empty slice or all servers fail.
     client_out.* = .{
-        .tool_ctxs = &.{},
         .arena = arena,
     };
 
     var tools: std.ArrayList(at.AgentTool) = .empty;
-    var ctxs: std.ArrayList(McpToolCtx) = .empty;
 
     for (server_configs) |srv| {
         if (srv.transport != .http) continue; // Only http for now.
@@ -105,6 +100,20 @@ pub fn discoverTools(
             continue;
         };
         _ = init_result;
+
+        // Send the required notifications/initialized notification
+        // before any subsequent requests (per MCP spec).
+        _ = callRemote(
+            arena,
+            io,
+            srv,
+            environ_map,
+            cancel,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+        ) catch |err| {
+            log.log(.warn, "mcp-client", "discover", "initialized notification failed for {s}: {s}", .{ srv.name, @errorName(err) });
+            continue;
+        };
 
         // List tools.
         const list_result = callRemote(
@@ -170,7 +179,6 @@ pub fn discoverTools(
                 .environ_map = environ_map,
             };
 
-            try ctxs.append(arena, ctx.*);
             try tools.append(arena, at.AgentTool{
                 .name = ns_name,
                 .description = ctx.description,
@@ -181,7 +189,6 @@ pub fn discoverTools(
         }
     }
 
-    client_out.tool_ctxs = try ctxs.toOwnedSlice(arena);
     return tools.toOwnedSlice(arena);
 }
 
@@ -339,7 +346,7 @@ fn callRemote(
         },
         &bw,
         cancel,
-        .{ .max_retries = 1 },
+        .{ .max_retries = 0 },
         .{ .connect_ms = 10_000, .upload_ms = 15_000, .first_byte_ms = 30_000, .event_gap_ms = 30_000 },
         .{},
         &phase_info,
@@ -361,18 +368,55 @@ fn callRemote(
     return extractSsePayload(allocator, raw_body);
 }
 
-/// If `body` is an SSE response (contains `data:` lines), extract
-/// the first `data:` payload. Otherwise return a copy of the raw body.
+/// If `body` is an SSE response (starts with `data:`, `event:`, or `:`),
+/// extract and join all `data:` lines from the first event into a
+/// single payload. Otherwise return a copy of the raw body.
+/// This avoids mangling plain JSON responses that happen to contain
+/// the substring "data:".
 fn extractSsePayload(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
-    const data_prefix = "data:";
-    const data_idx = std.mem.indexOf(u8, body, data_prefix) orelse
+    // Only treat as SSE if the body starts with an SSE field prefix.
+    // A plain JSON response like {"data":"hello"} would not match.
+    const trimmed = std.mem.trimStart(u8, body, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "data:") and
+        !std.mem.startsWith(u8, trimmed, "event:") and
+        !std.mem.startsWith(u8, trimmed, ":"))
+    {
         return allocator.dupe(u8, body);
+    }
 
-    // Find the data line — skip "data:" and optional space.
-    var line_start = data_idx + data_prefix.len;
-    while (line_start < body.len and (body[line_start] == ' ' or body[line_start] == '\t')) : (line_start += 1) {}
-    // Find end of line.
-    const line_end = std.mem.indexOfScalarPos(u8, body, line_start, '\n') orelse body.len;
-    const payload = std.mem.trimEnd(u8, body[line_start..line_end], "\r");
-    return allocator.dupe(u8, payload);
+    // Parse SSE events: collect all `data:` lines until a blank line
+    // (event boundary), then join with \n per SSE spec.
+    var data_lines: std.ArrayList([]const u8) = .empty;
+    defer data_lines.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const lt = std.mem.trimEnd(u8, line, "\r");
+        if (lt.len == 0) {
+            // Blank line = event boundary. If we have data, join and return.
+            if (data_lines.items.len > 0) {
+                return joinDataLines(allocator, data_lines.items);
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, lt, "data:")) {
+            const payload = std.mem.trim(u8, lt[5..], " \t");
+            try data_lines.append(allocator, payload);
+        }
+        // Skip event:, comment (:), id: lines — we only care about data:
+    }
+    // No blank line at end — return what we have.
+    if (data_lines.items.len > 0) {
+        return joinDataLines(allocator, data_lines.items);
+    }
+    return allocator.dupe(u8, body);
+}
+
+fn joinDataLines(allocator: std.mem.Allocator, lines: []const []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (lines, 0..) |line, i| {
+        if (i > 0) try buf.append(allocator, '\n');
+        try buf.appendSlice(allocator, line);
+    }
+    return buf.toOwnedSlice(allocator);
 }

@@ -472,28 +472,8 @@ fn initSession(
     // v0.30.0 — discover tools from external MCP servers when
     // --mcp-configs is set. Tools are namespaced as
     // `mcp__<server>__<tool>` and appended to the tool set.
-    if (cfg.mcp_configs) |configs_csv| {
-        const config_paths = franky.coding.mcp.splitCsv(ra, configs_csv) catch &.{};
-        if (config_paths.len > 0) {
-            const mcp_servers = franky.coding.mcp.config.parseConfigs(
-                ra, config_paths, session.environ_map, io,
-            ) catch &.{};
-            if (mcp_servers.len > 0) {
-                var mcp_cancel: ai.stream.Cancel = .{};
-                const mcp_client = try ra.create(franky.coding.mcp.McpClient);
-                const mcp_tools = franky.coding.mcp.client.discoverTools(
-                    ra, io, mcp_servers, session.environ_map, &mcp_cancel, mcp_client,
-                ) catch &.{};
-                session.mcp_client = mcp_client;
-                if (mcp_tools.len > 0) {
-                    const combined = try ra.alloc(at.AgentTool, final_tools.len + mcp_tools.len);
-                    @memcpy(combined[0..final_tools.len], final_tools);
-                    @memcpy(combined[final_tools.len..], mcp_tools);
-                    session.tools = combined;
-                }
-            }
-        }
-    }
+    const final_with_mcp = try config_mod.discoverMcpTools(ra, io, cfg, session.environ_map, final_tools, &session.mcp_client);
+    session.tools = final_with_mcp;
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
 }

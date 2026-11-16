@@ -1456,36 +1456,7 @@ pub fn resolve(
     // each external MCP server, discover their tools, and append
     // them to the tool set. Tools are namespaced as `server__tool`.
     var mcp_client_ptr: ?*mcp_mod.McpClient = null;
-    const final_with_mcp: []const at.AgentTool = blk: {
-        if (cfg.mcp_configs) |configs_csv| {
-            const config_paths = mcp_mod.splitCsv(a, configs_csv) catch &.{ };
-            if (config_paths.len > 0) {
-                var mcp_cancel: ai.stream.Cancel = .{};
-                const mcp_client = try a.create(mcp_mod.McpClient);
-                const mcp_tools = mcp_mod.client.discoverTools(
-                    a,
-                    io,
-                    // parseConfigs needs the environ_map for substitution
-                    blk2: {
-                        const servers = mcp_mod.config.parseConfigs(a, config_paths, environ_map, io) catch break :blk2 &.{};
-                        break :blk2 servers;
-                    },
-                    environ_map,
-                    &mcp_cancel,
-                    mcp_client,
-                ) catch &.{};
-                mcp_client_ptr = mcp_client;
-                if (mcp_tools.len > 0) {
-                    // Append to all_final_tools.
-                    const combined = try a.alloc(at.AgentTool, all_final_tools.len + mcp_tools.len);
-                    @memcpy(combined[0..all_final_tools.len], all_final_tools);
-                    @memcpy(combined[all_final_tools.len..], mcp_tools);
-                    break :blk combined;
-                }
-            }
-        }
-        break :blk all_final_tools;
-    };
+    const final_with_mcp = try discoverMcpTools(a, io, cfg, environ_map, all_final_tools, &mcp_client_ptr);
 
     // ── Step 14: Build review config block ───────────────────────
     const review_block = try buildReviewConfigBlock(a, &settings);
@@ -1587,6 +1558,43 @@ pub fn resolve(
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+/// Shared MCP tool discovery — called by both `resolve()` (print/proxy modes)
+/// and `rpc.zig initSession()` (rpc mode). Parses config files, discovers
+/// tools from external servers, and appends them to `base_tools`.
+/// Returns the combined tool slice and sets `mcp_client_ptr` if any
+/// MCP tools were found. All allocation on `arena`.
+pub fn discoverMcpTools(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+    base_tools: []const at.AgentTool,
+    mcp_client_ptr: *?*mcp_mod.McpClient,
+) ![]const at.AgentTool {
+    mcp_client_ptr.* = null;
+    if (cfg.mcp_configs) |configs_csv| {
+        const config_paths = mcp_mod.splitCsv(arena, configs_csv) catch &.{};
+        if (config_paths.len > 0) {
+            const mcp_servers = mcp_mod.config.parseConfigs(arena, config_paths, environ_map, io) catch &.{};
+            if (mcp_servers.len > 0) {
+                var mcp_cancel: ai.stream.Cancel = .{};
+                const mcp_client = try arena.create(mcp_mod.McpClient);
+                const mcp_tools = mcp_mod.client.discoverTools(
+                    arena, io, mcp_servers, environ_map, &mcp_cancel, mcp_client,
+                ) catch &.{};
+                mcp_client_ptr.* = mcp_client;
+                if (mcp_tools.len > 0) {
+                    const combined = try arena.alloc(at.AgentTool, base_tools.len + mcp_tools.len);
+                    @memcpy(combined[0..base_tools.len], base_tools);
+                    @memcpy(combined[base_tools.len..], mcp_tools);
+                    return combined;
+                }
+            }
+        }
+    }
+    return base_tools;
 }
 
 // ─── Tests ─────────────────────────────────────────────────────

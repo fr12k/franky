@@ -109,6 +109,10 @@ fn parseOneFile(
 
         // Parse URL (required for http).
         const url = if (so.get("url")) |u| (if (u == .string) try arena.dupe(u8, u.string) else "") else "";
+        if (transport == .http and url.len == 0) {
+            ai_log(io, "mcp-config", "http server '{s}' has empty url, skipping", .{name});
+            continue;
+        }
 
         // Parse headers with env substitution.
         var headers: std.ArrayList(ServerConfig.Header) = .empty;
@@ -151,8 +155,11 @@ pub fn substituteEnv(
                 continue;
             };
             const var_name = s[i + 2 .. end];
-            if (environ_map.get(var_name)) |var_val| {
-                try result.appendSlice(arena, var_val);
+            if (environ_map.get(var_name)) |raw_val| {
+                // Strip CR/LF to prevent HTTP header injection.
+                for (raw_val) |c| {
+                    if (c != '\r' and c != '\n') try result.append(arena, c);
+                }
             }
             // Unknown var → empty string (skip).
             i = end + 1;
