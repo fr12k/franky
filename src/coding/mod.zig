@@ -25,7 +25,6 @@ pub const modes = struct {
     pub const print = @import("modes/print.zig");
     pub const rpc = @import("modes/rpc.zig");
     pub const proxy = @import("modes/proxy.zig");
-    pub const mcp = @import("modes/mcp.zig");
 };
 
 pub const session = @import("session/mod.zig");
@@ -106,7 +105,6 @@ test {
     _ = modes.print;
     _ = modes.rpc;
     _ = modes.proxy;
-    _ = modes.mcp;
     _ = session;
     _ = cli; // backward compat alias
     _ = settings; // backward compat alias

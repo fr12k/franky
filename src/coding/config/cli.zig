@@ -12,7 +12,7 @@
 //!   --session-dir DIR          Parent dir for sessions (default ~/.franky/sessions)
 //!   --resume ID                Resume a prior session (same as --session + load)
 //!   --no-session               Do not persist this run
-//!   --mode MODE                print (default) | rpc | proxy | mcp
+//!   --mode MODE                print (default) | rpc | proxy
 //!   --verbose                  Extra logging to stderr
 //!   -h / --help                Show usage and exit(0)
 //!   --version                  Print version and exit(0)
@@ -24,7 +24,7 @@
 const std = @import("std");
 const types = @import("../../ai/types.zig");
 
-pub const Mode = enum { print, rpc, proxy, worker, mcp };
+pub const Mode = enum { print, rpc, proxy, worker };
 
 pub const Config = struct {
     provider: ?[]const u8 = null,
@@ -733,7 +733,6 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         else if (std.mem.eql(u8, v, "rpc")) cfg.mode = .rpc
         else if (std.mem.eql(u8, v, "proxy")) cfg.mode = .proxy
         else if (std.mem.eql(u8, v, "worker")) cfg.mode = .worker
-        else if (std.mem.eql(u8, v, "mcp")) cfg.mode = .mcp
         else return error.UnknownMode;
     } else if (std.mem.eql(u8, name, "--image-stdin-mime")) {
         cfg.image_stdin_mime = try a.dupe(u8, try takeValue(argv, i, inline_value));
@@ -796,7 +795,7 @@ pub const usage_text: []const u8 =
     \\  --session-dir DIR            Parent dir (default: $FRANKY_HOME/sessions or ~/.franky/sessions)
     \\  --resume ID                  Resume a prior session (implies --session)
     \\  --no-session                 Do not persist this run
-    \\  --mode MODE                  print | rpc | proxy | mcp
+    \\  --mode MODE                  print | rpc | proxy
     \\  --proxy-port N               TCP port for --mode proxy (§4.7) [default: 8787]
     \\  --continue                   Resume the most-recent session in session-dir
     \\  --fork NAME                  Fork a new branch at the current head (§5.1)

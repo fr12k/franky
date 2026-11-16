@@ -95,7 +95,7 @@ pub fn run(
     }
 }
 
-pub const Session = struct {
+const Session = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     registry: ai.registry.Registry,
@@ -163,7 +163,7 @@ pub const Session = struct {
     /// null when --mcp-configs is not set. Owned by role_arena.
     mcp_client: ?*franky.coding.mcp.McpClient = null,
 
-    pub fn deinit(self: *Session) void {
+    fn deinit(self: *Session) void {
         self.transcript.deinit();
         self.allocator.free(self.system_prompt);
         self.bash_state.deinit();
@@ -178,7 +178,7 @@ pub const Session = struct {
     }
 };
 
-pub fn initSession(
+fn initSession(
     session: *Session,
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1026,7 +1026,7 @@ fn writeRoleResult(
     try writeResultFrame(allocator, io, stdout, id, body);
 }
 
-pub fn writeResultFrame(
+fn writeResultFrame(
     allocator: std.mem.Allocator,
     io: std.Io,
     stdout: std.Io.File,
@@ -1041,7 +1041,7 @@ pub fn writeResultFrame(
     try writeFrameToStdout(io, stdout, body);
 }
 
-pub fn writeErrorFrame(
+fn writeErrorFrame(
     allocator: std.mem.Allocator,
     io: std.Io,
     stdout: std.Io.File,
@@ -1057,7 +1057,7 @@ pub fn writeErrorFrame(
     try writeFrameToStdout(io, stdout, body);
 }
 
-pub fn writeFrameToStdout(io: std.Io, stdout: std.Io.File, body: []const u8) !void {
+fn writeFrameToStdout(io: std.Io, stdout: std.Io.File, body: []const u8) !void {
     // LSP framing: "Content-Length: N\r\n\r\n<body>".
     //
     // Use writeStreamingAll here — we explicitly want append-to-stream
