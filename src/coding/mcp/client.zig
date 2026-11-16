@@ -106,8 +106,11 @@ pub fn discoverTools(
         };
         _ = init_result;
 
-        // Send the required notifications/initialized notification
-        // before any subsequent requests (per MCP spec).
+        // Send the notifications/initialized notification (per MCP spec).
+        // This is a notification (no id, no response expected). Some servers
+        // return an HTTP error for notifications (e.g. Streamable HTTP servers
+        // that require Mcp-Session-Id). Don't skip the server if this fails —
+        // proceed to tools/list anyway since many servers work without it.
         _ = callRemote(
             arena,
             io,
@@ -116,8 +119,7 @@ pub fn discoverTools(
             cancel,
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
         ) catch |err| {
-            log.log(.warn, "mcp-client", "discover", "initialized notification failed for {s}: {s}", .{ srv.name, @errorName(err) });
-            continue;
+            log.log(.debug, "mcp-client", "discover", "initialized notification failed for {s}: {s} (proceeding anyway)", .{ srv.name, @errorName(err) });
         };
 
         // List tools.
