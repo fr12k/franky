@@ -914,6 +914,17 @@ pub fn initSession(
             .web_search_ctx = &session.web_search_ctx,
         });
     }
+
+    // v0.30.0 — discover tools from external MCP servers when
+    // --mcp-configs is set. This MUST run before finalizeToolSet
+    // (which captures session.tools into the subagent ctx's
+    // parent_tools) so that MCP tools are visible to subagents.
+    {
+        const ra_mcp = session.role_arena.allocator();
+        session.tools = try config_mod.discoverMcpTools(
+            ra_mcp, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+        );
+    }
     // No resume_loaded cleanup — SessionState.init() handled
     // the loaded header internally, transferring transcript ownership.
     errdefer session.registry.deinit();
@@ -1058,17 +1069,6 @@ pub fn initSession(
             .memory_state = session.memory_state,
         });
         session.tools = final_tools;
-    }
-
-    // v0.30.0 — discover tools from external MCP servers when
-    // --mcp-configs is set. Same integration as resolve()
-    // and rpc.zig initSession(). Tools are namespaced as
-    // `mcp__<server>__<tool>` and appended to the tool set.
-    {
-        const ra2 = session.role_arena.allocator();
-        session.tools = try config_mod.discoverMcpTools(
-            ra2, io, cfg, session.environ_map, session.tools, &session.mcp_client,
-        );
     }
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);

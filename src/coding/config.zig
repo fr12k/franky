@@ -1458,6 +1458,9 @@ pub fn resolve(
     var mcp_client_ptr: ?*mcp_mod.McpClient = null;
     const final_with_mcp = try discoverMcpTools(a, io, cfg, environ_map, all_final_tools, &mcp_client_ptr);
 
+    // Update subagent ctx's parent_tools to include MCP tools.
+    subagent_ctx.parent_tools = final_with_mcp;
+
     // ── Step 14: Build review config block ───────────────────────
     const review_block = try buildReviewConfigBlock(a, &settings);
 

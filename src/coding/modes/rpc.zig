@@ -435,6 +435,13 @@ fn initSession(
 
     const params_json = try tools_mod.subagent.buildParametersJson(ra, preset_reg);
 
+    // v0.30.0 — discover MCP tools before finalizeToolSet so that
+    // subagent ctx's parent_tools includes mcp__ tools.
+    const tools_before_finalize = try config_mod.discoverMcpTools(
+        ra, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+    );
+    session.tools = tools_before_finalize;
+
     const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
     const parent_session_dir: ?[]const u8 = if (session.bash_state.getSessionDir()) |sd|
         try ra.dupe(u8, sd)
@@ -468,12 +475,6 @@ fn initSession(
         .memory_state = session.memory_state,
     });
     session.tools = final_tools;
-
-    // v0.30.0 — discover tools from external MCP servers when
-    // --mcp-configs is set. Tools are namespaced as
-    // `mcp__<server>__<tool>` and appended to the tool set.
-    const final_with_mcp = try config_mod.discoverMcpTools(ra, io, cfg, session.environ_map, final_tools, &session.mcp_client);
-    session.tools = final_with_mcp;
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
 }
