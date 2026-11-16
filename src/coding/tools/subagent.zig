@@ -495,10 +495,11 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
         .default_profile = "",
         .default_role = .code,
         .default_system_prompt =
-        \\You are an MCP sub-agent. Your job is to call external MCP server tools.
-        \\You have read and write for file context, plus all available MCP tools
-        \\(prefixed with mcp__). MCP tools connect to external systems (Atlassian,
-        \\Slack, ArgoCD, etc.) — use them to query and act on those systems.
+        \\You are an MCP sub-agent. Your job is to call external MCP server tools to complete the task.
+        \\Look at your available tools list — any tool whose name starts with mcp__ is an external
+        \\MCP server tool (e.g. mcp__atlassian__search_issues, mcp__slack__post_message, mcp__argocd__list_applications).
+        \\ALWAYS use these mcp__ tools to query external systems instead of reporting that you cannot access them.
+        \\You also have read and write for file context.
         \\When finished, write your final answer as a clear, self-contained summary.
         ,
         .build_tools = buildMcpTools,
