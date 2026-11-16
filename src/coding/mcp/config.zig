@@ -119,7 +119,14 @@ fn parseOneFile(
         if (so.get("headers")) |hv| if (hv == .object) {
             var hit = hv.object.iterator();
             while (hit.next()) |hentry| {
-                const hname = try arena.dupe(u8, hentry.key_ptr.*);
+                // Sanitize header name: strip CR/LF to prevent header injection.
+                const hname_raw = hentry.key_ptr.*;
+                var hname_buf: std.ArrayList(u8) = .empty;
+                defer hname_buf.deinit(arena);
+                for (hname_raw) |c| {
+                    if (c != '\r' and c != '\n') try hname_buf.append(arena, c);
+                }
+                const hname = try arena.dupe(u8, hname_buf.items);
                 const hval_raw = if (hentry.value_ptr.* == .string) hentry.value_ptr.string else "";
                 const hval = try substituteEnv(arena, hval_raw, environ_map);
                 try headers.append(arena, .{ .name = hname, .value = hval });

@@ -248,7 +248,7 @@ fn executeMcpTool(
             var check_arena = std.heap.ArenaAllocator.init(allocator);
             defer check_arena.deinit();
             const check = std.json.parseFromSlice(std.json.Value, check_arena.allocator(), args_json, .{}) catch break :blk "{}";
-            if (check.value == .object or check.value == .array) break :blk args_json;
+            if (check.value == .object) break :blk args_json;
         }
         break :blk "{}";
     };
@@ -503,10 +503,17 @@ fn callRemoteWithHeaders(
     var body = try req.sendBodyUnflushed(&.{});
     try body.writer.writeAll(payload);
     try body.end();
-    try req.connection.?.flush();
+    if (req.connection) |conn| try conn.flush() else return error.HttpErrorStatus;
 
     var redirect_buf: [8 * 1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
+
+    // Check status before reading body (avoid wasting bandwidth
+    // on large error responses).
+    const status: u16 = @intFromEnum(response.head.status);
+    if (status == 401 or status == 403) return error.Unauthorized;
+    if (status == 429) return error.RateLimited;
+    if (status >= 400) return error.HttpErrorStatus;
 
     // Capture Mcp-Session-Id from response headers.
     var hdr_it = response.head.iterateHeaders();
@@ -524,11 +531,6 @@ fn callRemoteWithHeaders(
         else => return err,
     };
 
-    const status: u16 = @intFromEnum(response.head.status);
-    if (status == 401 or status == 403) return error.Unauthorized;
-    if (status == 429) return error.RateLimited;
-    if (status >= 400) return error.HttpErrorStatus;
-
-    _ = cancel; // not used in this path (no retry framework)
+    if (cancel.isFired()) return error.Timeout;
     return extractSsePayload(allocator, bw.written());
 }

@@ -74,9 +74,6 @@ pub fn defaultPolicy(tool_name: []const u8) Decision {
     if (std.mem.eql(u8, tool_name, "write")) return .ask;
     if (std.mem.eql(u8, tool_name, "edit")) return .ask;
     if (std.mem.eql(u8, tool_name, "bash")) return .ask;
-    // MCP-proxied tools (mcp__server__tool) default to ask — they
-    // can have side effects on external systems.
-    if (std.mem.startsWith(u8, tool_name, "mcp__")) return .ask;
     return .ask;
 }
 
@@ -340,15 +337,15 @@ pub const Store = struct {
             return .ask;
         }
 
-        // Step 4: wildcard allow.
-        if (setMatchesWildcard(&self.allow_tools, tool_name)) return .auto_allow;
-
-        // Step 5: wildcard force-ask (checked after wildcard allow so
+        // Step 4: wildcard force-ask (checked before wildcard allow so
         // --ask-tools mcp__slack__* wins over --allow-tools mcp__*).
         if (setMatchesWildcard(&self.ask_tools, tool_name)) {
             if (self.yes_to_all) return .auto_allow;
             return .ask;
         }
+
+        // Step 5: wildcard allow.
+        if (setMatchesWildcard(&self.allow_tools, tool_name)) return .auto_allow;
 
         // Step 6: bash fingerprint ask (after bash allow, preserving
         // original semantics where allow_bash wins over ask_bash/ask_all).

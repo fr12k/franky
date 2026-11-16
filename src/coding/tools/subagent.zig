@@ -357,11 +357,38 @@ fn selectTools(
     parent_tools: []const at.AgentTool,
     names: []const []const u8,
 ) ![]at.AgentTool {
-    // Count how many tools we'll select: the named tools plus
-    // any MCP-proxied tools (mcp__*) from the parent.
+    var out = try allocator.alloc(at.AgentTool, names.len);
+    var n: usize = 0;
+    for (names) |want| {
+        for (parent_tools) |t| {
+            if (std.mem.eql(u8, t.name, want)) {
+                out[n] = t;
+                n += 1;
+                break;
+            }
+        }
+    }
+    return allocator.realloc(out, n);
+}
+
+/// Like selectTools but also includes all mcp__ prefixed tools
+/// from the parent. Used only by the mcp preset.
+fn selectToolsWithMcp(
+    allocator: std.mem.Allocator,
+    parent_tools: []const at.AgentTool,
+    names: []const []const u8,
+) ![]at.AgentTool {
+    // Count mcp__ tools (avoid duplicates with named tools).
     var mcp_count: usize = 0;
     for (parent_tools) |t| {
-        if (std.mem.startsWith(u8, t.name, "mcp__")) mcp_count += 1;
+        if (std.mem.startsWith(u8, t.name, "mcp__")) {
+            // Skip if already in names list.
+            var found = false;
+            for (names) |want| {
+                if (std.mem.eql(u8, t.name, want)) { found = true; break; }
+            }
+            if (!found) mcp_count += 1;
+        }
     }
     var out = try allocator.alloc(at.AgentTool, names.len + mcp_count);
     var n: usize = 0;
@@ -374,11 +401,17 @@ fn selectTools(
             }
         }
     }
-    // Also include all MCP-proxied tools (mcp__server__tool).
+    // Also include all MCP-proxied tools not already in names.
     for (parent_tools) |t| {
         if (std.mem.startsWith(u8, t.name, "mcp__")) {
-            out[n] = t;
-            n += 1;
+            var found = false;
+            for (names) |want| {
+                if (std.mem.eql(u8, t.name, want)) { found = true; break; }
+            }
+            if (!found) {
+                out[n] = t;
+                n += 1;
+            }
         }
     }
     return allocator.realloc(out, n);
@@ -417,7 +450,7 @@ fn buildBashRunnerTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) 
 }
 
 fn buildMcpTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
-    return selectTools(alloc, parent, &mcp_tool_names);
+    return selectToolsWithMcp(alloc, parent, &mcp_tool_names);
 }
 
 pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
@@ -2034,7 +2067,7 @@ test "research preset build_tools: returns read+ls+find+grep, no bash/write/edit
     try testing.expect(!has(tools, "edit"));
 }
 
-test "selectTools: includes mcp__ tools from parent" {
+test "selectTools: does NOT include mcp__ tools (only selectToolsWithMcp does)" {
     const gpa = testing.allocator;
     const read_t: at.AgentTool = .{ .name = "read", .description = "", .parameters_json = "{}", .execute = undefined };
     const mcp_t: at.AgentTool = .{ .name = "mcp__atlassian__search", .description = "", .parameters_json = "{}", .execute = undefined };
@@ -2043,7 +2076,19 @@ test "selectTools: includes mcp__ tools from parent" {
     const sub = try selectTools(gpa, &parent, &[_][]const u8{ "read" });
     defer gpa.free(sub);
 
+    // selectTools should only include named tools, NOT mcp__ tools.
+    try testing.expectEqual(@as(usize, 1), sub.len);
+    try testing.expectEqualStrings("read", sub[0].name);
+}
 
+test "selectToolsWithMcp: includes mcp__ tools from parent" {
+    const gpa = testing.allocator;
+    const read_t: at.AgentTool = .{ .name = "read", .description = "", .parameters_json = "{}", .execute = undefined };
+    const mcp_t: at.AgentTool = .{ .name = "mcp__atlassian__search", .description = "", .parameters_json = "{}", .execute = undefined };
+    const parent = [_]at.AgentTool{ read_t, mcp_t };
+
+    const sub = try selectToolsWithMcp(gpa, &parent, &[_][]const u8{ "read" });
+    defer gpa.free(sub);
     // Should include read + the mcp__ tool.
     try testing.expectEqual(@as(usize, 2), sub.len);
     try testing.expectEqualStrings("read", sub[0].name);
