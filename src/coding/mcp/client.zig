@@ -86,11 +86,11 @@ pub fn discoverTools(
 
     for (server_configs) |srv| {
         if (srv.transport != .http) {
-            log.log(.warn, "mcp-client", "discover", "skipping non-http server {s}", .{srv.name});
+            log.log(.info, "mcp-client", "discover", "skipping non-http server {s}", .{srv.name});
             continue;
         }
 
-        log.log(.info, "mcp-client", "discover", "connecting to {s} at {s}", .{ srv.name, srv.url });
+        log.log(.info, "mcp-client", "discover", "connecting to {s}", .{srv.name});
 
         // Initialize the remote server.
         const init_result = callRemote(
@@ -138,7 +138,10 @@ pub fn discoverTools(
             log.log(.warn, "mcp-client", "discover", "invalid JSON from {s} tools/list", .{srv.name});
             continue;
         };
-        if (parsed != .object) continue;
+        if (parsed != .object) {
+            log.log(.warn, "mcp-client", "discover", "{s} tools/list: response not an object", .{srv.name});
+            continue;
+        }
         const result_obj = parsed.object.get("result") orelse {
             // Check for JSON-RPC error.
             if (parsed.object.get("error")) |err_val| if (err_val == .object) {
@@ -147,9 +150,15 @@ pub fn discoverTools(
             };
             continue;
         };
-        if (result_obj != .object) continue;
+        if (result_obj != .object) {
+            log.log(.warn, "mcp-client", "discover", "{s} tools/list: result not an object", .{srv.name});
+            continue;
+        }
         const tools_arr = result_obj.object.get("tools") orelse continue;
-        if (tools_arr != .array) continue;
+        if (tools_arr != .array) {
+            log.log(.warn, "mcp-client", "discover", "{s} tools/list: tools field not an array", .{srv.name});
+            continue;
+        }
 
         const tools_before = tools.items.len;
 
@@ -244,7 +253,7 @@ fn executeMcpTool(
         .headers = ctx.headers,
     }, ctx.environ_map, cancel, req_buf.items) catch |err| {
         log.log(.err, "mcp-client", "call", "tools/call to {s} failed: {s}", .{ ctx.server_name, @errorName(err) });
-        return common.toolError(allocator, "mcp_remote", try allocator.dupe(u8, @errorName(err)));
+        return common.toolError(allocator, "mcp_remote", @errorName(err));
     };
     defer allocator.free(response);
 

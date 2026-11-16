@@ -549,6 +549,7 @@ pub const Session = struct {
         self.ccr_store.deinit();
         // v3.2 — memory state + guardrail (allocated on role_arena).
         if (self.memory_state) |ms| ms.deinit();
+        if (self.mcp_client) |mc| mc.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
