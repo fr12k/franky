@@ -424,7 +424,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "research",
         .description = "Reads files, greps for patterns, summarises findings within the workspace.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .read,
         .default_system_prompt =
         \\You are a research sub-agent. Your job is to read, search, and summarise.
@@ -438,7 +438,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "code-audit",
         .description = "Audits a stated quality or security concern read-only across the workspace.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .read,
         .default_system_prompt =
         \\You are a code-audit sub-agent. Focus on the single concern stated in the prompt.
@@ -452,7 +452,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "diff-review",
         .description = "Reviews a diff pasted in the prompt — has NO file tools (works from prompt text only).",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .read,
         .default_system_prompt =
         \\You are a diff-review sub-agent. You have NO file-read tools.
@@ -467,7 +467,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "file-ops",
         .description = "Performs targeted file edits given clear instructions.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .plan,
         .default_system_prompt =
         \\You are a file-ops sub-agent. Apply the edits described in the prompt exactly.
@@ -480,7 +480,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "bash-runner",
         .description = "Runs a bounded shell task and reports stdout, stderr, and exit code.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .code,
         .default_system_prompt =
         \\You are a bash-runner sub-agent. Execute the shell task described in the prompt.
