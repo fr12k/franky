@@ -357,7 +357,13 @@ fn selectTools(
     parent_tools: []const at.AgentTool,
     names: []const []const u8,
 ) ![]at.AgentTool {
-    var out = try allocator.alloc(at.AgentTool, names.len);
+    // Count how many tools we'll select: the named tools plus
+    // any MCP-proxied tools (mcp__*) from the parent.
+    var mcp_count: usize = 0;
+    for (parent_tools) |t| {
+        if (std.mem.startsWith(u8, t.name, "mcp__")) mcp_count += 1;
+    }
+    var out = try allocator.alloc(at.AgentTool, names.len + mcp_count);
     var n: usize = 0;
     for (names) |want| {
         for (parent_tools) |t| {
@@ -366,6 +372,13 @@ fn selectTools(
                 n += 1;
                 break;
             }
+        }
+    }
+    // Also include all MCP-proxied tools (mcp__server__tool).
+    for (parent_tools) |t| {
+        if (std.mem.startsWith(u8, t.name, "mcp__")) {
+            out[n] = t;
+            n += 1;
         }
     }
     return allocator.realloc(out, n);
