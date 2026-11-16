@@ -479,6 +479,9 @@ pub const Session = struct {
     /// v3.2 — memory nudge guardrail. `null` when `--no-memory-nudge` or
     /// memory is disabled. Owned by `role_arena`.
     memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+    /// v0.30.0 — MCP client state for externally-proxied tools.
+    /// null when --mcp-configs is not set. Owned by role_arena.
+    mcp_client: ?*franky.coding.mcp.McpClient = null,
 
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
@@ -1054,6 +1057,17 @@ pub fn initSession(
             .memory_state = session.memory_state,
         });
         session.tools = final_tools;
+    }
+
+    // v0.30.0 — discover tools from external MCP servers when
+    // --mcp-configs is set. Same integration as resolve()
+    // and rpc.zig initSession(). Tools are namespaced as
+    // `mcp__<server>__<tool>` and appended to the tool set.
+    {
+        const ra2 = session.role_arena.allocator();
+        session.tools = try config_mod.discoverMcpTools(
+            ra2, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+        );
     }
 
     session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
