@@ -371,6 +371,52 @@ fn selectTools(
     return allocator.realloc(out, n);
 }
 
+/// Like selectTools but also includes all mcp__ prefixed tools
+/// from the parent. Used only by the mcp preset.
+fn selectToolsWithMcp(
+    allocator: std.mem.Allocator,
+    parent_tools: []const at.AgentTool,
+    names: []const []const u8,
+) ![]at.AgentTool {
+    // Count mcp__ tools (avoid duplicates with named tools).
+    var mcp_count: usize = 0;
+    for (parent_tools) |t| {
+        if (std.mem.startsWith(u8, t.name, "mcp__")) {
+            // Skip if already in names list.
+            var found = false;
+            for (names) |want| {
+                if (std.mem.eql(u8, t.name, want)) { found = true; break; }
+            }
+            if (!found) mcp_count += 1;
+        }
+    }
+    var out = try allocator.alloc(at.AgentTool, names.len + mcp_count);
+    var n: usize = 0;
+    for (names) |want| {
+        for (parent_tools) |t| {
+            if (std.mem.eql(u8, t.name, want)) {
+                out[n] = t;
+                n += 1;
+                break;
+            }
+        }
+    }
+    // Also include all MCP-proxied tools not already in names.
+    for (parent_tools) |t| {
+        if (std.mem.startsWith(u8, t.name, "mcp__")) {
+            var found = false;
+            for (names) |want| {
+                if (std.mem.eql(u8, t.name, want)) { found = true; break; }
+            }
+            if (!found) {
+                out[n] = t;
+                n += 1;
+            }
+        }
+    }
+    return allocator.realloc(out, n);
+}
+
 // v3.2 — memory tools are wired into the parent tool list with their
 // own MemoryState ctx, so selectTools can pick them up by name. Recall
 // (memory_search) is safe for read-only presets; persist (memory_save)
@@ -379,6 +425,9 @@ const research_tool_names = [_][]const u8{ "read", "ls", "find", "grep", "web_se
 const diff_review_tool_names = [_][]const u8{};
 const file_ops_tool_names = [_][]const u8{ "read", "write", "edit", "ls", "find", "grep", "memory_search", "memory_save", "memory_list" };
 const bash_runner_tool_names = [_][]const u8{ "bash", "ls", "find", "grep", "memory_search", "memory_save", "memory_list" };
+/// MCP preset: read + write + all mcp__ tools. Keeps MCP tool schemas
+/// (which can be large) out of the main agent's context.
+const mcp_tool_names = [_][]const u8{ "read", "write" };
 
 fn buildResearchTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
     return selectTools(alloc, parent, &research_tool_names);
@@ -400,11 +449,15 @@ fn buildBashRunnerTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) 
     return selectTools(alloc, parent, &bash_runner_tool_names);
 }
 
+fn buildMcpTools(alloc: std.mem.Allocator, parent: []const at.AgentTool) ![]at.AgentTool {
+    return selectToolsWithMcp(alloc, parent, &mcp_tool_names);
+}
+
 pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "research",
         .description = "Reads files, greps for patterns, summarises findings within the workspace.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .read,
         .default_system_prompt =
         \\You are a research sub-agent. Your job is to read, search, and summarise.
@@ -418,7 +471,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "code-audit",
         .description = "Audits a stated quality or security concern read-only across the workspace.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .read,
         .default_system_prompt =
         \\You are a code-audit sub-agent. Focus on the single concern stated in the prompt.
@@ -432,7 +485,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "diff-review",
         .description = "Reviews a diff pasted in the prompt — has NO file tools (works from prompt text only).",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .read,
         .default_system_prompt =
         \\You are a diff-review sub-agent. You have NO file-read tools.
@@ -447,7 +500,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "file-ops",
         .description = "Performs targeted file edits given clear instructions.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .plan,
         .default_system_prompt =
         \\You are a file-ops sub-agent. Apply the edits described in the prompt exactly.
@@ -460,7 +513,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "bash-runner",
         .description = "Runs a bounded shell task and reports stdout, stderr, and exit code.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .code,
         .default_system_prompt =
         \\You are a bash-runner sub-agent. Execute the shell task described in the prompt.
@@ -468,6 +521,21 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
         \\Use memory_search to recall relevant context; use memory_save only for durable, self-contained facts.
         ,
         .build_tools = buildBashRunnerTools,
+    });
+    try reg.register(.{
+        .name = "mcp",
+        .description = "Calls external MCP server tools (Atlassian, Slack, ArgoCD, etc.) with read/write for context.",
+        .default_profile = "",
+        .default_role = .code,
+        .default_system_prompt =
+        \\You are an MCP sub-agent. Your job is to call external MCP server tools to complete the task.
+        \\Look at your available tools list — any tool whose name starts with mcp__ is an external
+        \\MCP server tool (e.g. mcp__atlassian__search_issues, mcp__slack__post_message, mcp__argocd__list_applications).
+        \\ALWAYS use these mcp__ tools to query external systems instead of reporting that you cannot access them.
+        \\You also have read and write for file context.
+        \\When finished, write your final answer as a clear, self-contained summary.
+        ,
+        .build_tools = buildMcpTools,
     });
 }
 
@@ -1911,13 +1979,13 @@ test "PresetRegistry: register + get" {
     try testing.expect(reg.get("nonexistent") == null);
 }
 
-test "registerBuiltinPresets: populates all five built-ins" {
+test "registerBuiltinPresets: populates all six built-ins" {
     const gpa = testing.allocator;
     var reg = PresetRegistry.init(gpa);
     defer reg.deinit();
     try registerBuiltinPresets(&reg);
 
-    const names = [_][]const u8{ "research", "code-audit", "diff-review", "file-ops", "bash-runner" };
+    const names = [_][]const u8{ "research", "code-audit", "diff-review", "file-ops", "bash-runner", "mcp" };
     for (names) |n| {
         const p = reg.get(n);
         try testing.expect(p != null);
@@ -1929,6 +1997,7 @@ test "registerBuiltinPresets: populates all five built-ins" {
     try testing.expectEqual(role_mod.Role.read, reg.get("diff-review").?.default_role);
     try testing.expectEqual(role_mod.Role.plan, reg.get("file-ops").?.default_role);
     try testing.expectEqual(role_mod.Role.code, reg.get("bash-runner").?.default_role);
+    try testing.expectEqual(role_mod.Role.code, reg.get("mcp").?.default_role);
     try testing.expect(reg.get("research").?.safety.read_only);
     try testing.expect(reg.get("code-audit").?.safety.read_only);
     try testing.expect(reg.get("diff-review").?.safety.read_only);
@@ -1948,6 +2017,7 @@ test "buildParametersJson: enum contains all registered preset names" {
     try testing.expect(std.mem.indexOf(u8, params, "\"diff-review\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"file-ops\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"bash-runner\"") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "\"mcp\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"preset\"") != null);
     try testing.expect(std.mem.indexOf(u8, params, "\"prompt\"") != null);
 }
@@ -1995,6 +2065,34 @@ test "research preset build_tools: returns read+ls+find+grep, no bash/write/edit
     try testing.expect(!has(tools, "bash"));
     try testing.expect(!has(tools, "write"));
     try testing.expect(!has(tools, "edit"));
+}
+
+test "selectTools: does NOT include mcp__ tools (only selectToolsWithMcp does)" {
+    const gpa = testing.allocator;
+    const read_t: at.AgentTool = .{ .name = "read", .description = "", .parameters_json = "{}", .execute = undefined };
+    const mcp_t: at.AgentTool = .{ .name = "mcp__atlassian__search", .description = "", .parameters_json = "{}", .execute = undefined };
+    const parent = [_]at.AgentTool{ read_t, mcp_t };
+
+    const sub = try selectTools(gpa, &parent, &[_][]const u8{ "read" });
+    defer gpa.free(sub);
+
+    // selectTools should only include named tools, NOT mcp__ tools.
+    try testing.expectEqual(@as(usize, 1), sub.len);
+    try testing.expectEqualStrings("read", sub[0].name);
+}
+
+test "selectToolsWithMcp: includes mcp__ tools from parent" {
+    const gpa = testing.allocator;
+    const read_t: at.AgentTool = .{ .name = "read", .description = "", .parameters_json = "{}", .execute = undefined };
+    const mcp_t: at.AgentTool = .{ .name = "mcp__atlassian__search", .description = "", .parameters_json = "{}", .execute = undefined };
+    const parent = [_]at.AgentTool{ read_t, mcp_t };
+
+    const sub = try selectToolsWithMcp(gpa, &parent, &[_][]const u8{ "read" });
+    defer gpa.free(sub);
+    // Should include read + the mcp__ tool.
+    try testing.expectEqual(@as(usize, 2), sub.len);
+    try testing.expectEqualStrings("read", sub[0].name);
+    try testing.expectEqualStrings("mcp__atlassian__search", sub[1].name);
 }
 
 test "PresetRegistry: SDK preset overrides built-in with same name" {

@@ -159,6 +159,9 @@ const Session = struct {
     /// v3.2 — memory nudge guardrail. `null` when nudge is off or
     /// memory is disabled. Owned by `role_arena`.
     memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+    /// v0.30.0 — MCP client state for externally-proxied tools.
+    /// null when --mcp-configs is not set. Owned by role_arena.
+    mcp_client: ?*franky.coding.mcp.McpClient = null,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
@@ -168,6 +171,7 @@ const Session = struct {
         self.ccr_store.deinit();
         // v3.2 — memory state (allocated on role_arena).
         if (self.memory_state) |ms| ms.deinit();
+        if (self.mcp_client) |mc| mc.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -431,6 +435,13 @@ fn initSession(
     try tools_mod.subagent.registerBuiltinPresets(preset_reg);
 
     const params_json = try tools_mod.subagent.buildParametersJson(ra, preset_reg);
+
+    // v0.30.0 — discover MCP tools before finalizeToolSet so that
+    // subagent ctx's parent_tools includes mcp__ tools.
+    const tools_before_finalize = try config_mod.discoverMcpTools(
+        ra, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+    );
+    session.tools = tools_before_finalize;
 
     const subagent_ctx = try ra.create(tools_mod.subagent.Ctx);
     const parent_session_dir: ?[]const u8 = if (session.bash_state.getSessionDir()) |sd|

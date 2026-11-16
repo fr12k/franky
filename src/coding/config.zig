@@ -36,6 +36,7 @@ const ext_catalog = franky.coding.extensions_builtin.catalog;
 const compression_mod = franky.coding.compression;
 const memory_mod = franky.coding.memory;
 const memory_guard_mod = franky.agent.guardrails;
+const mcp_mod = franky.coding.mcp;
 
 /// Error set for config resolution.
 pub const ResolveError = error{
@@ -158,6 +159,12 @@ pub const ResolvedConfig = struct {
     /// after settings overlay). Mode drivers use this to set the
     /// guardrail pointer on their GuardrailState.
     memory_nudge_enabled: bool = false,
+
+    // ── MCP client (v0.30.0) ────────────────────────────────────
+    /// MCP client state holding tool contexts for externally-proxied
+    /// tools. `null` when `--mcp-configs` is not set or no servers
+    /// were configured. Owned by the resolver arena.
+    mcp_client: ?*mcp_mod.McpClient = null,
 
     // ── Arena ────────────────────────────────────────────────────
     /// Everything that outlives `resolve()` is allocated on this arena.
@@ -1444,6 +1451,16 @@ pub fn resolve(
         .memory_state = memory_state,
     });
 
+    // ── Step 13.5: MCP client tool discovery (v0.30.0) ────────
+    // When --mcp-configs is set, parse the config files, connect to
+    // each external MCP server, discover their tools, and append
+    // them to the tool set. Tools are namespaced as `server__tool`.
+    var mcp_client_ptr: ?*mcp_mod.McpClient = null;
+    const final_with_mcp = try discoverMcpTools(a, io, cfg, environ_map, all_final_tools, &mcp_client_ptr);
+
+    // Update subagent ctx's parent_tools to include MCP tools.
+    subagent_ctx.parent_tools = final_with_mcp;
+
     // ── Step 14: Build review config block ───────────────────────
     const review_block = try buildReviewConfigBlock(a, &settings);
 
@@ -1496,7 +1513,7 @@ pub fn resolve(
         .max_full_tool_results = settings.max_full_tool_results orelse 0,
         .registry = reg,
         .faux_provider = faux_ptr,
-        .tools = all_final_tools,
+        .tools = final_with_mcp,
         .permission_store = permission_store,
         .session_gates = session_gates,
         .preset_registry = preset_registry,
@@ -1534,6 +1551,7 @@ pub fn resolve(
         .memory_state = memory_state,
         .memory_guardrail = memory_guardrail,
         .memory_nudge_enabled = cfg.memory_nudge,
+        .mcp_client = mcp_client_ptr,
         .arena = arena,
     };
 }
@@ -1543,6 +1561,59 @@ pub fn resolve(
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+/// Shared MCP tool discovery — called by both `resolve()` (print/proxy modes)
+/// and `rpc.zig initSession()` (rpc mode). Parses config files, discovers
+/// tools from external servers, and appends them to `base_tools`.
+/// Returns the combined tool slice and sets `mcp_client_ptr` if any
+/// MCP tools were found. All allocation on `arena`.
+pub fn discoverMcpTools(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    cfg: *const cli_mod.Config,
+    environ_map: *const std.process.Environ.Map,
+    base_tools: []const at.AgentTool,
+    mcp_client_ptr: *?*mcp_mod.McpClient,
+) ![]const at.AgentTool {
+    mcp_client_ptr.* = null;
+
+    const configs_csv = cfg.mcp_configs orelse return base_tools;
+    const config_paths = mcp_mod.splitCsv(arena, configs_csv) catch |err| {
+        ai.log.log(.err, "mcp", "discover", "failed to split config paths: {s}", .{@errorName(err)});
+        return base_tools;
+    };
+    if (config_paths.len == 0) return base_tools;
+
+    const mcp_servers = mcp_mod.config.parseConfigs(arena, config_paths, environ_map, io) catch |err| {
+        ai.log.log(.err, "mcp", "discover", "failed to parse MCP configs: {s}", .{@errorName(err)});
+        return base_tools;
+    };
+    if (mcp_servers.len == 0) {
+        ai.log.log(.warn, "mcp", "discover", "no MCP servers found in config files", .{});
+        return base_tools;
+    }
+
+    var mcp_cancel: ai.stream.Cancel = .{};
+    const mcp_client = try arena.create(mcp_mod.McpClient);
+    const mcp_tools = mcp_mod.client.discoverTools(
+        arena, io, mcp_servers, environ_map, &mcp_cancel, mcp_client,
+    ) catch |err| {
+        ai.log.log(.err, "mcp", "discover", "discoverTools failed: {s}", .{@errorName(err)});
+        return base_tools;
+    };
+    mcp_client_ptr.* = mcp_client;
+
+    if (mcp_tools.len == 0) {
+        ai.log.log(.warn, "mcp", "discover", "no MCP tools discovered from {d} server(s)", .{mcp_servers.len});
+        return base_tools;
+    }
+
+    ai.log.log(.info, "mcp", "discover", "discovered {d} MCP tools from {d} server(s)", .{ mcp_tools.len, mcp_servers.len });
+    const combined = try arena.alloc(at.AgentTool, base_tools.len + mcp_tools.len);
+    @memcpy(combined[0..base_tools.len], base_tools);
+    @memcpy(combined[base_tools.len..], mcp_tools);
+    return combined;
 }
 
 // ─── Tests ─────────────────────────────────────────────────────

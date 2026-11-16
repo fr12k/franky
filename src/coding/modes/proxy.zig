@@ -479,6 +479,9 @@ pub const Session = struct {
     /// v3.2 — memory nudge guardrail. `null` when `--no-memory-nudge` or
     /// memory is disabled. Owned by `role_arena`.
     memory_guardrail: ?*memory_guard_mod.MemoryGuardrail = null,
+    /// v0.30.0 — MCP client state for externally-proxied tools.
+    /// null when --mcp-configs is not set. Owned by role_arena.
+    mcp_client: ?*franky.coding.mcp.McpClient = null,
 
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
@@ -546,6 +549,7 @@ pub const Session = struct {
         self.ccr_store.deinit();
         // v3.2 — memory state + guardrail (allocated on role_arena).
         if (self.memory_state) |ms| ms.deinit();
+        if (self.mcp_client) |mc| mc.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -909,6 +913,17 @@ pub fn initSession(
             .bash_state = &session.bash_state,
             .web_search_ctx = &session.web_search_ctx,
         });
+    }
+
+    // v0.30.0 — discover tools from external MCP servers when
+    // --mcp-configs is set. This MUST run before finalizeToolSet
+    // (which captures session.tools into the subagent ctx's
+    // parent_tools) so that MCP tools are visible to subagents.
+    {
+        const ra_mcp = session.role_arena.allocator();
+        session.tools = try config_mod.discoverMcpTools(
+            ra_mcp, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+        );
     }
     // No resume_loaded cleanup — SessionState.init() handled
     // the loaded header internally, transferring transcript ownership.

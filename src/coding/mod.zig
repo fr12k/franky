@@ -28,6 +28,7 @@ pub const modes = struct {
 };
 
 pub const session = @import("session/mod.zig");
+pub const mcp = @import("mcp/mod.zig");
 
 // ═══════════════════════════════════════════════════
 // Backward-compatible aliases for moved modules.
@@ -134,6 +135,7 @@ test {
     _ = regex;
     _ = gitignore;
     _ = rpc;
+    _ = mcp;
     _ = slash;
     _ = update;
     _ = skills;

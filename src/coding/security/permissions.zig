@@ -314,6 +314,7 @@ pub const Store = struct {
     ) Decision {
         // Step 1: deny lists (hard refusal).
         if (self.deny_tools.contains(tool_name)) return .auto_deny;
+        if (setMatchesWildcard(&self.deny_tools, tool_name)) return .auto_deny;
         const is_bash = std.mem.eql(u8, tool_name, "bash");
         const bash_fp: ?[]const u8 = if (is_bash)
             (if (extractBashCommand(args_json)) |cmd| fingerprintBash(cmd) else null)
@@ -323,22 +324,43 @@ pub const Store = struct {
             if (self.deny_bash.contains(fp)) return .auto_deny;
         }
 
-        // Step 2: allow lists.
+        // Step 2: exact-match allow (wins over exact-match ask, preserving
+        // original semantics where --allow-tools read beats --ask-tools read).
         if (bash_fp) |fp| {
             if (self.allow_bash.contains(fp)) return .auto_allow;
         }
         if (self.allow_tools.contains(tool_name)) return .auto_allow;
 
-        // Step 3: explicit force-ask (overrides default auto_allow).
-        const force_ask = self.ask_all
-            or self.ask_tools.contains(tool_name)
-            or (bash_fp != null and self.ask_bash.contains(bash_fp.?));
-        if (force_ask) {
+        // Step 3: exact-match force-ask (for non-bash tools).
+        if (self.ask_tools.contains(tool_name)) {
             if (self.yes_to_all) return .auto_allow;
             return .ask;
         }
 
-        // Step 4: default policy.
+        // Step 4: wildcard force-ask (checked before wildcard allow so
+        // --ask-tools mcp__slack__* wins over --allow-tools mcp__*).
+        if (setMatchesWildcard(&self.ask_tools, tool_name)) {
+            if (self.yes_to_all) return .auto_allow;
+            return .ask;
+        }
+
+        // Step 5: wildcard allow.
+        if (setMatchesWildcard(&self.allow_tools, tool_name)) return .auto_allow;
+
+        // Step 6: bash fingerprint ask (after bash allow, preserving
+        // original semantics where allow_bash wins over ask_bash/ask_all).
+        if (bash_fp) |fp| {
+            if (self.ask_bash.contains(fp)) {
+                if (self.yes_to_all) return .auto_allow;
+                return .ask;
+            }
+        }
+        if (self.ask_all) {
+            if (self.yes_to_all) return .auto_allow;
+            return .ask;
+        }
+
+        // Step 7: default policy.
         const default = defaultPolicy(tool_name);
         if (default == .ask and self.yes_to_all) return .auto_allow;
         return default;
@@ -363,6 +385,26 @@ fn freeStringSet(
     var it = set.keyIterator();
     while (it.next()) |k| allocator.free(k.*);
     set.deinit(allocator);
+}
+
+/// Check if any key in `set` matches `tool_name` using wildcard
+/// patterns. Supports trailing `*` (e.g. `mcp__atlassian__*`
+/// matches `mcp__atlassian__search_issues`). A bare `mcp__*`
+/// matches all MCP tools. Exact matches are handled by the caller's
+/// `.contains()` call; this function only checks wildcard entries.
+fn setMatchesWildcard(
+    set: *const std.StringHashMapUnmanaged(void),
+    tool_name: []const u8,
+) bool {
+    var it = set.keyIterator();
+    while (it.next()) |k| {
+        const pattern = k.*;
+        // Only check patterns that end with '*'.
+        if (pattern.len == 0 or pattern[pattern.len - 1] != '*') continue;
+        const prefix = pattern[0 .. pattern.len - 1];
+        if (std.mem.startsWith(u8, tool_name, prefix)) return true;
+    }
+    return false;
 }
 
 /// Verb-level fingerprint of a bash command — the first non-path
@@ -907,6 +949,43 @@ test "defaultPolicy: read-family auto, write/edit/bash ask" {
     try testing.expectEqual(Decision.ask, defaultPolicy("bash"));
     // Unknown tool defaults to ask (fail-closed).
     try testing.expectEqual(Decision.ask, defaultPolicy("not_a_real_tool"));
+    // MCP-proxied tools default to ask.
+    try testing.expectEqual(Decision.ask, defaultPolicy("mcp__atlassian__search"));
+}
+
+test "Store.check: MCP wildcard patterns" {
+    const gpa = testing.allocator;
+    const Case = struct {
+        list: []const u8,
+        kind: enum { allow, deny },
+        tool: []const u8,
+        expected: Decision,
+    };
+    const cases = [_]Case{
+        // Wildcard allow — all tools from one server.
+        .{ .list = "mcp__atlassian__*", .kind = .allow, .tool = "mcp__atlassian__search_issues", .expected = .auto_allow },
+        .{ .list = "mcp__atlassian__*", .kind = .allow, .tool = "mcp__atlassian__create_issue", .expected = .auto_allow },
+        .{ .list = "mcp__atlassian__*", .kind = .allow, .tool = "mcp__slack__post", .expected = .ask },
+        // Wildcard deny.
+        .{ .list = "mcp__slack__*", .kind = .deny, .tool = "mcp__slack__post_message", .expected = .auto_deny },
+        .{ .list = "mcp__slack__*", .kind = .deny, .tool = "mcp__atlassian__search", .expected = .ask },
+        // All-servers wildcard.
+        .{ .list = "mcp__*", .kind = .allow, .tool = "mcp__atlassian__search", .expected = .auto_allow },
+        .{ .list = "mcp__*", .kind = .allow, .tool = "mcp__slack__post", .expected = .auto_allow },
+        .{ .list = "mcp__*", .kind = .allow, .tool = "write", .expected = .ask },
+        // Exact tool match.
+        .{ .list = "mcp__atlassian__search_issues", .kind = .allow, .tool = "mcp__atlassian__search_issues", .expected = .auto_allow },
+        .{ .list = "mcp__atlassian__search_issues", .kind = .allow, .tool = "mcp__atlassian__create_issue", .expected = .ask },
+    };
+    for (cases) |c| {
+        var s = Store.init(gpa);
+        defer s.deinit();
+        switch (c.kind) {
+            .allow => try s.addAllowList(c.list),
+            .deny => try s.addDenyList(c.list),
+        }
+        try testing.expectEqual(c.expected, s.check(c.tool, "{}"));
+    }
 }
 
 test "Store.check: read auto-allows under defaults" {

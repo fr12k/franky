@@ -9,12 +9,14 @@ Google Gemini, Google Vertex, plus a scripted fake), a stateful agent
 loop with parallel tool execution, built-in `read` / `write` / `edit` /
 `bash` / `ls` / `find` / `grep` / `subagent` / `web_search` / `web_fetch` /
 `workspace` / `memory_save` / `memory_search` / `ccr_retrieve` tools (with regex, gitignore, atomic
-edits, and §R workspace path-safety), session persistence + branching
+edits, and §R workspace path-safety), MCP client integration via
+`--mcp-configs` (connect to external MCP servers, expose tools as
+`mcp__<server>__<tool>`), session persistence + branching
 on disk, **three run modes** (`print` / `rpc` / `proxy`),
 a built-in web UI served by proxy mode, capability roles, a per-tool
 permission overlay, bearer-token auth (`--auth-token` /
 `ANTHROPIC_AUTH_TOKEN` / `CLAUDE_CODE_OAUTH_TOKEN`) for subscription /
-gateway flows, and per-phase HTTP timeouts. **~1016 tests** pass at the
+gateway flows, and per-phase HTTP timeouts. **1100 tests** pass at the
 current cut.
 
 ## Quick start
@@ -232,6 +234,44 @@ franky --mode proxy --register http://localhost:9000
 # (reachable from the host via Docker port mapping when running in a
 # container), session id, model, role, workspace, and host PID.
 ```
+
+### MCP client (`--mcp-configs`)
+
+Franky can act as an MCP **client** that connects to external
+MCP servers (Atlassian, Slack, ArgoCD, etc.) and exposes their tools
+to the agent loop. Tools from external servers are namespaced as
+`mcp__<server>__<tool>` and appended to the session tool set.
+
+```sh
+# Connect to external MCP servers
+franky --provider anthropic --model claude-sonnet-4-20250514 \
+  --mcp-configs atlassian.json,slack.json
+
+# With permission controls (wildcards supported)
+franky --provider anthropic \
+  --mcp-configs atlassian.json,slack.json \
+  --allow-tools "read,ls,mcp__atlassian__*" \
+  --deny-tools "mcp__slack__*"
+```
+
+Config files use the standard `mcpServers` JSON format with
+`${VAR}` env var substitution in header values:
+
+```json
+{
+  "mcpServers": {
+    "atlassian": {
+      "type": "http",
+      "url": "https://mcp.atlassian.com/v2/mcp",
+      "headers": { "Authorization": "Bearer ${ATLASSIAN_TOKEN}" }
+    }
+  }
+}
+```
+
+MCP tools are also available to subagents via the `mcp` preset
+(`subagent preset=mcp prompt="..."`), which keeps large MCP
+tool schemas out of the main agent's context window.
 
 ### Capability roles (§5.10)
 
@@ -867,7 +907,7 @@ const ccr_retrieve_tool = franky.coding.tools.ccr_retrieve.tool();
 | `coding` modes | print, rpc (JSON-RPC), proxy (HTTP/SSE + web UI) | ✅ |
 | `coding` features | session persistence + branching + object-store + compaction, capability roles (§5.10), permission overlay foundation (§5.11), settings/auth/models JSON, bearer-token auth (`--auth-token` + `auth.json` round-trip), Tier-1 extensions | ✅ |
 
-**~1016 tests** pass at the current cut across one library binary and the
+**1100 tests** pass at the current cut across one library binary and the
 integration binaries (`agent_loop`, `agent_class`, `gitignore`,
 `parallel_tools`, `kitchen_sink`). The `franky login` minting flow
 shipped in v1.2.* and was removed in v1.30.0 — bearer tokens are now
@@ -1075,7 +1115,7 @@ A comprehensive automated audit of every module in the source tree was performed
 - **Permission system** with 4 role tiers, tool-level gates, bash verb fingerprinting.
 - **Spec-driven development** with automated cross-reference checking.
 - **7 LLM providers** with unified streaming interface.
-- **~1016 tests with leak detection** on every run.
+- **1100 tests with leak detection** on every run.
 - **Guardrails** for unattended operation (stuck detection, compilation check, finish_task).
 
 ### Recommended next steps

@@ -265,6 +265,13 @@ pub const Config = struct {
     /// runs. Off by default — every session is fresh-state.
     remember_permissions: bool = false,
 
+    /// `--mcp-configs <csv>` — comma-separated paths to MCP server
+    /// config files (JSON with `mcpServers` key). Tools from all
+    /// configured servers are discovered at startup and appended to
+    /// the agent's tool set with namespaced names (`server__tool`).
+    /// Env vars in header values are substituted (`${VAR}`).
+    mcp_configs: ?[]const u8 = null,
+
     /// `--autocontinue` — when the model stops (after tool calls or a
     /// text-only turn) without calling `finish_task`, inject a user
     /// message asking it to continue and call finish_task. Caps at 2
@@ -713,6 +720,13 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         cfg.deny_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--ask-tools")) {
         cfg.ask_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--mcp-configs")) {
+        const v = try takeValue(argv, i, inline_value);
+        if (cfg.mcp_configs) |existing| {
+            cfg.mcp_configs = try std.fmt.allocPrint(a, "{s},{s}", .{ existing, v });
+        } else {
+            cfg.mcp_configs = try a.dupe(u8, v);
+        }
     } else if (std.mem.eql(u8, name, "--mode")) {
         const v = try takeValue(argv, i, inline_value);
         if (std.mem.eql(u8, v, "print")) cfg.mode = .print
@@ -809,11 +823,18 @@ pub const usage_text: []const u8 =
     \\  --prompts                    Enable per-tool permission gate (Approach A)
     \\  --yes, -y                    Auto-allow every "ask" decision (CI mode)
     \\  --allow-tools LIST           CSV of tool names or bash:<fingerprint>
-    \\                               (e.g. read,write,bash:git)
-    \\  --deny-tools LIST            CSV; takes precedence over --allow-tools
+    \\                               (e.g. read,write,bash:git). Supports wildcards:
+    \\                               mcp__server__* or mcp__* for all MCP tools.
+    \\  --deny-tools LIST            CSV; takes precedence over --allow-tools.
+    \\                               Supports wildcards (e.g. mcp__slack__*).
     \\  --ask-tools LIST             CSV; demote default-auto_allow tools to "ask"
     \\                               (e.g. read,find or "all" for every tool)
     \\  --remember-permissions       Persist always-allow/deny to permissions.json
+    \\  --mcp-configs FILES          Comma-separated MCP server config files (JSON
+    \\                               with `mcpServers` key). Repeatable. Tools from
+    \\                               all servers are discovered at startup and added
+    \\                               to the tool set as `mcp__server__tool`. Env vars
+    \\                               in header values are substituted: ${VAR}.
     \\  --memory                     Enable persistent memory tools (default on)
     \\  --no-memory                  Disable persistent memory tools
     \\  --memory-nudge               Nudge agent to save memory before finish_task (default on)
