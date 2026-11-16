@@ -21,6 +21,9 @@
 //! All servers from all files are merged into a single list.
 
 const std = @import("std");
+const jh = @import("json_helpers.zig");
+const ai = @import("../../ai/mod.zig");
+const log = ai.log;
 
 /// A single configured MCP server.
 pub const ServerConfig = struct {
@@ -164,53 +167,32 @@ pub fn substituteEnv(
 fn ai_log(io: std.Io, scope: []const u8, comptime fmt: []const u8, args: anytype) void {
     _ = io;
     _ = scope;
-    _ = fmt;
-    _ = args;
+    log.log(.warn, "mcp-config", "parse", fmt, args);
 }
 
 // ─── tests ──────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "substituteEnv: replaces known var" {
+test "substituteEnv: known, unknown, identity, multiple vars" {
     const gpa = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
     var env_map = std.process.Environ.Map.init(gpa);
     defer env_map.deinit();
     try env_map.put("MY_TOKEN", "abc123");
-    const result = try substituteEnv(arena.allocator(), "Bearer ${MY_TOKEN}", &env_map);
-    try testing.expectEqualStrings("Bearer abc123", result);
-}
-
-test "substituteEnv: unknown var → empty" {
-    const gpa = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var env_map = std.process.Environ.Map.init(gpa);
-    defer env_map.deinit();
-    const result = try substituteEnv(arena.allocator(), "Bearer ${UNKNOWN_VAR}", &env_map);
-    try testing.expectEqualStrings("Bearer ", result);
-}
-
-test "substituteEnv: no vars → identity" {
-    const gpa = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var env_map = std.process.Environ.Map.init(gpa);
-    defer env_map.deinit();
-    const result = try substituteEnv(arena.allocator(), "plain text", &env_map);
-    try testing.expectEqualStrings("plain text", result);
-}
-
-test "substituteEnv: multiple vars" {
-    const gpa = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var env_map = std.process.Environ.Map.init(gpa);
-    defer env_map.deinit();
     try env_map.put("A", "1");
     try env_map.put("B", "2");
-    const result = try substituteEnv(arena.allocator(), "${A}-${B}-${A}", &env_map);
-    try testing.expectEqualStrings("1-2-1", result);
+
+    const Case = struct { input: []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .input = "Bearer ${MY_TOKEN}", .expected = "Bearer abc123" },
+        .{ .input = "Bearer ${UNKNOWN_VAR}", .expected = "Bearer " },
+        .{ .input = "plain text", .expected = "plain text" },
+        .{ .input = "${A}-${B}-${A}", .expected = "1-2-1" },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const result = try substituteEnv(arena.allocator(), c.input, &env_map);
+        try testing.expectEqualStrings(c.expected, result);
+    }
 }

@@ -10,23 +10,26 @@
 //!      `tools/call` JSON-RPC request to the originating server.
 //!
 //! The `McpToolCtx` stored in each tool's `.ctx` pointer carries the
-//! server URL, headers, and tool name so the execute function can
-//! route the call correctly.
+//! server URL, headers, env map pointer, and tool name so the
+//! execute function can route the call correctly.
 
 const std = @import("std");
 const config_mod = @import("config.zig");
+const jh = @import("json_helpers.zig");
 const at = @import("../../agent/types.zig");
 const ai = @import("../../ai/mod.zig");
 const http_mod = ai.http;
 const stream_mod = ai.stream;
 const common = @import("../tools/common.zig");
 
+const log = ai.log;
+
 /// Context for a single MCP-proxied tool. Allocated on the session
 /// arena; lives for the duration of the session.
 pub const McpToolCtx = struct {
     /// Server URL (e.g. "https://mcp.atlassian.com/v2/mcp").
     url: []const u8,
-    /// HTTP headers (owned by the session arena).
+    /// HTTP headers (owned by the session arena, already env-substituted).
     headers: []const config_mod.ServerConfig.Header,
     /// The tool name as known by the remote MCP server.
     tool_name: []const u8,
@@ -34,23 +37,23 @@ pub const McpToolCtx = struct {
     description: []const u8,
     /// The JSON Schema for the tool's input (for AgentTool.parameters_json).
     input_schema_json: []const u8,
-    /// The server name (for namespacing, e.g. "atlassian__search_issues").
+    /// The server name (for namespacing, e.g. "mcp__atlassian__search_issues").
     server_name: []const u8,
+    /// Env map pointer for proxy/TLS setup in tool calls.
+    environ_map: ?*const std.process.Environ.Map,
 };
 
 /// Per-session MCP client state. Holds the arena-allocated tool
-/// contexts and the cached server configs. Allocated by the caller
-/// on the session arena.
+/// contexts. Allocated by the caller on the session arena.
 pub const McpClient = struct {
     /// All discovered tool contexts. Each one is pointed to by the
     /// corresponding `AgentTool.ctx`.
-    tool_ctxs: []McpToolCtx,
+    tool_ctxs: []McpToolCtx = &.{},
     /// The arena that owns all MCP string data. Deinit is the
     /// caller's responsibility (usually the session arena).
     arena: std.mem.Allocator,
 
     pub fn deinit(self: *McpClient) void {
-        // Nothing to do — the arena is owned by the session.
         _ = self;
     }
 };
@@ -61,11 +64,13 @@ pub const McpClient = struct {
 ///   1. Send `initialize` (JSON-RPC over HTTP POST).
 ///   2. Send `tools/list` to get the tool catalog.
 ///   3. For each remote tool, create an `McpToolCtx` + `AgentTool`
-///      wrapper with a namespaced name: `<server>__<tool>`.
+///      wrapper with a namespaced name: `mcp__<server>__<tool>`.
 ///
 /// Returns the `AgentTool` slice (allocated on `arena`) and fills
 /// `client_out` with the tool contexts. On per-server failure, logs
 /// a warning and continues with the remaining servers.
+/// `client_out` is initialized to a safe empty state before the
+/// loop so callers never read uninitialized memory.
 pub fn discoverTools(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -74,12 +79,15 @@ pub fn discoverTools(
     cancel: *stream_mod.Cancel,
     client_out: *McpClient,
 ) ![]at.AgentTool {
+    // Initialize to safe empty state — callers may read this even
+    // if discoverTools returns an empty slice or all servers fail.
+    client_out.* = .{
+        .tool_ctxs = &.{},
+        .arena = arena,
+    };
+
     var tools: std.ArrayList(at.AgentTool) = .empty;
     var ctxs: std.ArrayList(McpToolCtx) = .empty;
-    errdefer {
-        tools.deinit(arena);
-        ctxs.deinit(arena);
-    }
 
     for (server_configs) |srv| {
         if (srv.transport != .http) continue; // Only http for now.
@@ -93,10 +101,10 @@ pub fn discoverTools(
             cancel,
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"franky\",\"version\":\"0.29.0\"}}}",
         ) catch |err| {
-            logWarn(io, "mcp-client", "initialize failed for {s}: {s}", .{ srv.name, @errorName(err) });
+            log.log(.warn, "mcp-client", "discover", "initialize failed for {s}: {s}", .{ srv.name, @errorName(err) });
             continue;
         };
-        defer arena.free(init_result);
+        _ = init_result;
 
         // List tools.
         const list_result = callRemote(
@@ -107,18 +115,24 @@ pub fn discoverTools(
             cancel,
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
         ) catch |err| {
-            logWarn(io, "mcp-client", "tools/list failed for {s}: {s}", .{ srv.name, @errorName(err) });
+            log.log(.warn, "mcp-client", "discover", "tools/list failed for {s}: {s}", .{ srv.name, @errorName(err) });
             continue;
         };
-        defer arena.free(list_result);
 
         // Parse the tools/list response.
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, list_result, .{}) catch {
-            logWarn(io, "mcp-client", "invalid JSON from {s} tools/list", .{srv.name});
+            log.log(.warn, "mcp-client", "discover", "invalid JSON from {s} tools/list", .{srv.name});
             continue;
         };
         if (parsed != .object) continue;
-        const result_obj = parsed.object.get("result") orelse continue;
+        const result_obj = parsed.object.get("result") orelse {
+            // Check for JSON-RPC error.
+            if (parsed.object.get("error")) |err_val| if (err_val == .object) {
+                const msg = if (err_val.object.get("message")) |m| (if (m == .string) m.string else "MCP server error") else "MCP server error";
+                log.log(.warn, "mcp-client", "discover", "{s} tools/list error: {s}", .{ srv.name, msg });
+            };
+            continue;
+        };
         if (result_obj != .object) continue;
         const tools_arr = result_obj.object.get("tools") orelse continue;
         if (tools_arr != .array) continue;
@@ -135,7 +149,7 @@ pub fn discoverTools(
             // Re-serialize inputSchema to a JSON string.
             var schema_buf: std.ArrayList(u8) = .empty;
             if (to.get("inputSchema")) |schema| {
-                renderJson(&schema_buf, arena, schema) catch {};
+                jh.renderJson(&schema_buf, arena, schema) catch {};
             }
             if (schema_buf.items.len == 0) {
                 schema_buf.appendSlice(arena, "{\"type\":\"object\",\"properties\":{}}") catch {};
@@ -153,6 +167,7 @@ pub fn discoverTools(
                 .description = try arena.dupe(u8, desc),
                 .input_schema_json = input_schema,
                 .server_name = srv.name,
+                .environ_map = environ_map,
             };
 
             try ctxs.append(arena, ctx.*);
@@ -166,10 +181,7 @@ pub fn discoverTools(
         }
     }
 
-    client_out.* = .{
-        .tool_ctxs = try ctxs.toOwnedSlice(arena),
-        .arena = arena,
-    };
+    client_out.tool_ctxs = try ctxs.toOwnedSlice(arena);
     return tools.toOwnedSlice(arena);
 }
 
@@ -189,28 +201,32 @@ fn executeMcpTool(
     _ = on_update;
     const ctx: *McpToolCtx = @ptrCast(@alignCast(tool.ctx.?));
 
-    // Build the tools/call request. `arguments` is the raw args_json
-    // from the agent — we embed it directly as the JSON value.
+    // Build the tools/call request. Validate args_json — if it's
+    // not a valid JSON object, fall back to {}.
+    const safe_args: []const u8 = blk: {
+        if (args_json.len > 0) {
+            var check_arena = std.heap.ArenaAllocator.init(allocator);
+            defer check_arena.deinit();
+            const check = std.json.parseFromSlice(std.json.Value, check_arena.allocator(), args_json, .{}) catch break :blk "{}";
+            if (check.value == .object or check.value == .array) break :blk args_json;
+        }
+        break :blk "{}";
+    };
+
     var req_buf: std.ArrayList(u8) = .empty;
     defer req_buf.deinit(allocator);
     try req_buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":");
-    try appendJsonStr(&req_buf, allocator, ctx.tool_name);
+    try jh.appendJsonStr(&req_buf, allocator, ctx.tool_name);
     try req_buf.appendSlice(allocator, ",\"arguments\":");
-    // args_json is already a JSON object string; embed raw.
-    if (args_json.len > 0) {
-        try req_buf.appendSlice(allocator, args_json);
-    } else {
-        try req_buf.appendSlice(allocator, "{}");
-    }
+    try req_buf.appendSlice(allocator, safe_args);
     try req_buf.appendSlice(allocator, "}}");
 
-    const env_map: ?*const std.process.Environ.Map = null; // Not needed for call — headers already resolved.
     const response = try callRemote(allocator, io, .{
         .name = ctx.server_name,
         .transport = .http,
         .url = ctx.url,
         .headers = ctx.headers,
-    }, env_map, cancel, req_buf.items);
+    }, ctx.environ_map, cancel, req_buf.items);
     defer allocator.free(response);
 
     // Parse the response.
@@ -225,7 +241,7 @@ fn executeMcpTool(
     // Check for JSON-RPC error.
     if (parsed.object.get("error")) |err_val| if (err_val == .object) {
         const msg = if (err_val.object.get("message")) |m| (if (m == .string) m.string else "MCP server error") else "MCP server error";
-        return common.toolError(allocator, "mcp_remote", try allocator.dupe(u8, msg));
+        return common.toolError(allocator, "mcp_remote", msg);
     };
 
     // Extract result.content → ToolResult.content.
@@ -274,7 +290,9 @@ fn executeMcpTool(
 }
 
 /// Send a single JSON-RPC POST to an MCP server and return the
-/// response body. Allocates the result on `allocator`.
+/// response body. Handles both `application/json` and
+/// `text/event-stream` (SSE) responses — for SSE, extracts the
+/// first `data:` payload. Allocates the result on `allocator`.
 fn callRemote(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -322,7 +340,7 @@ fn callRemote(
         &bw,
         cancel,
         .{ .max_retries = 1 },
-        .{ .connect_ms = 10_000, .upload_ms = 15_000, .first_byte_ms = 30_000, .event_gap_ms = 0 },
+        .{ .connect_ms = 10_000, .upload_ms = 15_000, .first_byte_ms = 30_000, .event_gap_ms = 30_000 },
         .{},
         &phase_info,
     ) catch |e| {
@@ -335,76 +353,26 @@ fn callRemote(
     if (status == 429) return error.RateLimited;
     if (status >= 400) return error.HttpErrorStatus;
 
-    return allocator.dupe(u8, bw.written());
+    const raw_body = bw.written();
+
+    // Check if the response is SSE (text/event-stream). If so,
+    // extract the first `data:` payload — that's the JSON-RPC
+    // response. Otherwise return the raw body as-is.
+    return extractSsePayload(allocator, raw_body);
 }
 
-// ─── helpers ────────────────────────────────────────────────────
+/// If `body` is an SSE response (contains `data:` lines), extract
+/// the first `data:` payload. Otherwise return a copy of the raw body.
+fn extractSsePayload(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    const data_prefix = "data:";
+    const data_idx = std.mem.indexOf(u8, body, data_prefix) orelse
+        return allocator.dupe(u8, body);
 
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn renderJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: std.json.Value) !void {
-    switch (v) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |i| {
-            var tmp: [20]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .string => |s| try appendJsonStr(buf, allocator, s),
-        .number_string => |s| {
-            try buf.append(allocator, '"');
-            try buf.appendSlice(allocator, s);
-            try buf.append(allocator, '"');
-        },
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, i| {
-                if (i > 0) try buf.append(allocator, ',');
-                try renderJson(buf, allocator, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var it = obj.iterator();
-            var first = true;
-            while (it.next()) |entry| {
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                try appendJsonStr(buf, allocator, entry.key_ptr.*);
-                try buf.append(allocator, ':');
-                try renderJson(buf, allocator, entry.value_ptr.*);
-            }
-            try buf.append(allocator, '}');
-        },
-    }
-}
-
-fn logWarn(io: std.Io, scope: []const u8, comptime fmt: []const u8, args: anytype) void {
-    _ = io;
-    _ = scope;
-    _ = fmt;
-    _ = args;
+    // Find the data line — skip "data:" and optional space.
+    var line_start = data_idx + data_prefix.len;
+    while (line_start < body.len and (body[line_start] == ' ' or body[line_start] == '\t')) : (line_start += 1) {}
+    // Find end of line.
+    const line_end = std.mem.indexOfScalarPos(u8, body, line_start, '\n') orelse body.len;
+    const payload = std.mem.trimEnd(u8, body[line_start..line_end], "\r");
+    return allocator.dupe(u8, payload);
 }

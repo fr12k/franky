@@ -34,6 +34,7 @@ const at = agent.types;
 const rpc = franky.coding.rpc;
 const cli_mod = franky.coding.cli;
 const rpc_mode = @import("rpc.zig");
+const jh = franky.coding.mcp.json;
 
 /// MCP protocol versions we can negotiate.
 pub const protocol_v1: []const u8 = "2024-11-05";
@@ -101,7 +102,7 @@ pub fn run(
             continue;
         }
         const n = std.posix.read(stdin.handle, &scratch) catch |err| switch (err) {
-            error.WouldBlock => 0,
+            error.WouldBlock => continue,
             else => break,
         };
         if (n == 0) break; // EOF
@@ -261,9 +262,9 @@ fn handleToolsList(
         first = false;
         try buf.append(allocator, '{');
         try buf.appendSlice(allocator, "\"name\":");
-        try appendJsonStr(&buf, allocator, t.name);
+        try jh.appendJsonStr(&buf, allocator, t.name);
         try buf.appendSlice(allocator, ",\"description\":");
-        try appendJsonStr(&buf, allocator, t.description);
+        try jh.appendJsonStr(&buf, allocator, t.description);
         // `parameters_json` is already a JSON Schema string; embed it raw.
         try buf.appendSlice(allocator, ",\"inputSchema\":");
         try buf.appendSlice(allocator, t.parameters_json);
@@ -331,17 +332,18 @@ fn handleToolsCall(
 
     // Serialize `arguments` back to a JSON string for the franky tool's
     // `execute` (which expects args_json). MCP sends arguments as a JSON
-    // object; we re-serialize it.
+    // object; we re-serialize it. Allocate from the local arena to
+    // avoid leaking on every tool call.
     var args_json: []const u8 = "{}";
     if (o.get("arguments")) |args_val| {
         if (args_val == .object or args_val == .array) {
             var tmp: std.ArrayList(u8) = .empty;
-            defer tmp.deinit(allocator);
-            try renderJson(&tmp, allocator, args_val);
-            args_json = try allocator.dupe(u8, tmp.items);
+            defer tmp.deinit(aa);
+            try jh.renderJson(&tmp, aa, args_val);
+            args_json = try aa.dupe(u8, tmp.items);
         } else if (args_val == .string) {
             // Some clients send a pre-serialized string.
-            args_json = try allocator.dupe(u8, args_val.string);
+            args_json = try aa.dupe(u8, args_val.string);
         }
     }
 
@@ -365,7 +367,7 @@ fn handleToolsCall(
         defer allocator.free(err_msg);
         const err_payload = try std.fmt.allocPrint(allocator,
             "{{\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"isError\":true}}",
-            .{try jsonStr(aa, err_msg)});
+            .{try jh.jsonStr(aa, err_msg)});
         try rpc_mode.writeResultFrame(allocator, io, stdout, req.id, err_payload);
         return;
     };
@@ -382,16 +384,16 @@ fn handleToolsCall(
             if (!first) try buf.append(allocator, ',');
             first = false;
             try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
-            try appendJsonStr(&buf, allocator, tc.text);
+            try jh.appendJsonStr(&buf, allocator, tc.text);
             try buf.append(allocator, '}');
         },
         .image => |ic| {
             if (!first) try buf.append(allocator, ',');
             first = false;
             try buf.appendSlice(allocator, "{\"type\":\"image\",\"data\":");
-            try appendJsonStr(&buf, allocator, ic.data);
+            try jh.appendJsonStr(&buf, allocator, ic.data);
             try buf.appendSlice(allocator, ",\"mimeType\":");
-            try appendJsonStr(&buf, allocator, ic.mime_type);
+            try jh.appendJsonStr(&buf, allocator, ic.mime_type);
             try buf.append(allocator, '}');
         },
         // thinking and tool_call blocks are not translatable to MCP
@@ -428,9 +430,7 @@ fn writeMcpError(
                 try buf.appendSlice(allocator, s);
             },
             .string => |s| {
-                try buf.append(allocator, '"');
-                try buf.appendSlice(allocator, s);
-                try buf.append(allocator, '"');
+                try jh.appendJsonStr(&buf, allocator, s);
             },
         }
     } else {
@@ -443,104 +443,7 @@ fn writeMcpError(
         try buf.appendSlice(allocator, s);
     }
     try buf.appendSlice(allocator, ",\"message\":");
-    try appendJsonStr(&buf, allocator, message);
+    try jh.appendJsonStr(&buf, allocator, message);
     try buf.appendSlice(allocator, "}}");
     try rpc_mode.writeFrameToStdout(io, stdout, buf.items);
-}
-
-/// JSON-encode a string (allocates on `allocator`).
-fn jsonStr(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try appendJsonStr(&buf, allocator, s);
-    return try buf.toOwnedSlice(allocator);
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-/// Re-serialize a `std.json.Value` to a string (mirrors rpc.zig's
-/// private `renderJson`).
-fn renderJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: std.json.Value) !void {
-    switch (v) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |i| {
-            var tmp: [20]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .string => |s| try appendJsonStr(buf, allocator, s),
-        .number_string => |s| {
-            try buf.append(allocator, '"');
-            try buf.appendSlice(allocator, s);
-            try buf.append(allocator, '"');
-        },
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, i| {
-                if (i > 0) try buf.append(allocator, ',');
-                try renderJson(buf, allocator, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var it = obj.iterator();
-            var first = true;
-            while (it.next()) |entry| {
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                try appendJsonStr(buf, allocator, entry.key_ptr.*);
-                try buf.append(allocator, ':');
-                try renderJson(buf, allocator, entry.value_ptr.*);
-            }
-            try buf.append(allocator, '}');
-        },
-    }
-}
-
-// ─── tests ──────────────────────────────────────────────────────
-
-const testing = std.testing;
-
-test "appendJsonStr: escapes control chars" {
-    const gpa = testing.allocator;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(gpa);
-    try appendJsonStr(&buf, gpa, "a\nb\"c");
-    try testing.expectEqualStrings("\"a\\nb\\\"c\"", buf.items);
-}
-
-test "renderJson: object round-trip" {
-    const gpa = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"x\":1,\"y\":\"z\"}", .{});
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(gpa);
-    try renderJson(&buf, gpa, parsed.value);
-    // Order may differ; just check key presence.
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"x\":1") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"y\":\"z\"") != null);
 }

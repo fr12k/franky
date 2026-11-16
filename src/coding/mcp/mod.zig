@@ -12,10 +12,14 @@
 
 pub const config = @import("config.zig");
 pub const client = @import("client.zig");
+/// Shared JSON helpers — used by both client.zig and modes/mcp.zig
+/// to avoid duplicating appendJsonStr / renderJson / splitCsv.
+pub const json = @import("json_helpers.zig");
 
 pub const ServerConfig = config.ServerConfig;
 pub const McpClient = client.McpClient;
 pub const McpToolCtx = client.McpToolCtx;
+pub const splitCsv = json.splitCsv;
 
 /// Convenience: parse config files + discover tools in one call.
 /// Returns the tool slice and fills `client_out`.

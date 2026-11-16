@@ -473,7 +473,7 @@ pub fn initSession(
     // --mcp-configs is set. Tools are namespaced as
     // `mcp__<server>__<tool>` and appended to the tool set.
     if (cfg.mcp_configs) |configs_csv| {
-        const config_paths = splitCsv(ra, configs_csv) catch &.{};
+        const config_paths = franky.coding.mcp.splitCsv(ra, configs_csv) catch &.{};
         if (config_paths.len > 0) {
             const mcp_servers = franky.coding.mcp.config.parseConfigs(
                 ra, config_paths, session.environ_map, io,
@@ -501,21 +501,6 @@ pub fn initSession(
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try fp.runSync(ctx.io, ctx.context, ctx.out);
-}
-
-/// Split a comma-separated string into a slice of trimmed strings.
-/// Empty entries are skipped. Allocates on `allocator`.
-fn splitCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
-    var result: std.ArrayList([]const u8) = .empty;
-    errdefer result.deinit(allocator);
-    var it = std.mem.splitScalar(u8, csv, ',');
-    while (it.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t");
-        if (trimmed.len > 0) {
-            try result.append(allocator, try allocator.dupe(u8, trimmed));
-        }
-    }
-    return result.toOwnedSlice(allocator);
 }
 
 // ─── §6.6 — sub-agent progress forwarding ────────────────────────

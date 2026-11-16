@@ -327,21 +327,35 @@ pub const Store = struct {
             if (self.deny_bash.contains(fp)) return .auto_deny;
         }
 
-        // Step 2: allow lists.
+        // Step 2: explicit force-ask for tool names (checked BEFORE
+        // wildcard allow so --ask-tools mcp__slack__* wins over
+        // --allow-tools mcp__*). Bash fingerprints are handled
+        // separately in step 3 to preserve the existing semantics
+        // where allow_bash wins over ask_all/ask_bash.
+        const force_ask_tool = self.ask_all
+            or self.ask_tools.contains(tool_name)
+            or setMatchesWildcard(&self.ask_tools, tool_name);
+        if (force_ask_tool and bash_fp == null) {
+            if (self.yes_to_all) return .auto_allow;
+            return .ask;
+        }
+
+        // Step 3: allow lists.
         if (bash_fp) |fp| {
             if (self.allow_bash.contains(fp)) return .auto_allow;
         }
         if (self.allow_tools.contains(tool_name)) return .auto_allow;
         if (setMatchesWildcard(&self.allow_tools, tool_name)) return .auto_allow;
 
-        // Step 3: explicit force-ask (overrides default auto_allow).
-        const force_ask = self.ask_all
-            or self.ask_tools.contains(tool_name)
-            or setMatchesWildcard(&self.ask_tools, tool_name)
-            or (bash_fp != null and self.ask_bash.contains(bash_fp.?));
-        if (force_ask) {
-            if (self.yes_to_all) return .auto_allow;
-            return .ask;
+        // Step 3b: bash force-ask (after bash allow, preserving original
+        // semantics where allow_bash wins over ask_all/ask_bash).
+        if (force_ask_tool and bash_fp != null) {
+            if (bash_fp) |fp| {
+                if (self.ask_bash.contains(fp)) {
+                    if (self.yes_to_all) return .auto_allow;
+                    return .ask;
+                }
+            }
         }
 
         // Step 4: default policy.
@@ -937,42 +951,39 @@ test "defaultPolicy: read-family auto, write/edit/bash ask" {
     try testing.expectEqual(Decision.ask, defaultPolicy("mcp__atlassian__search"));
 }
 
-test "Store.check: MCP wildcard allow" {
-    var s = Store.init(testing.allocator);
-    defer s.deinit();
-    try s.addAllowList("mcp__atlassian__*");
-    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__search_issues", "{}"));
-    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__create_issue", "{}"));
-    // Other server tools not matched.
-    try testing.expectEqual(Decision.ask, s.check("mcp__slack__post", "{}"));
-}
-
-test "Store.check: MCP wildcard deny" {
-    var s = Store.init(testing.allocator);
-    defer s.deinit();
-    try s.addDenyList("mcp__slack__*");
-    try testing.expectEqual(Decision.auto_deny, s.check("mcp__slack__post_message", "{}"));
-    try testing.expectEqual(Decision.ask, s.check("mcp__atlassian__search", "{}"));
-}
-
-test "Store.check: MCP all-servers wildcard" {
-    var s = Store.init(testing.allocator);
-    defer s.deinit();
-    try s.addAllowList("mcp__*");
-    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__search", "{}"));
-    try testing.expectEqual(Decision.auto_allow, s.check("mcp__slack__post", "{}"));
-    try testing.expectEqual(Decision.auto_allow, s.check("mcp__doit__anything", "{}"));
-    // Built-in tools unaffected.
-    try testing.expectEqual(Decision.ask, s.check("write", "{}"));
-}
-
-test "Store.check: MCP exact tool allow" {
-    var s = Store.init(testing.allocator);
-    defer s.deinit();
-    try s.addAllowList("mcp__atlassian__search_issues");
-    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__search_issues", "{}"));
-    // Other tool from same server not matched.
-    try testing.expectEqual(Decision.ask, s.check("mcp__atlassian__create_issue", "{}"));
+test "Store.check: MCP wildcard patterns" {
+    const gpa = testing.allocator;
+    const Case = struct {
+        list: []const u8,
+        kind: enum { allow, deny },
+        tool: []const u8,
+        expected: Decision,
+    };
+    const cases = [_]Case{
+        // Wildcard allow — all tools from one server.
+        .{ .list = "mcp__atlassian__*", .kind = .allow, .tool = "mcp__atlassian__search_issues", .expected = .auto_allow },
+        .{ .list = "mcp__atlassian__*", .kind = .allow, .tool = "mcp__atlassian__create_issue", .expected = .auto_allow },
+        .{ .list = "mcp__atlassian__*", .kind = .allow, .tool = "mcp__slack__post", .expected = .ask },
+        // Wildcard deny.
+        .{ .list = "mcp__slack__*", .kind = .deny, .tool = "mcp__slack__post_message", .expected = .auto_deny },
+        .{ .list = "mcp__slack__*", .kind = .deny, .tool = "mcp__atlassian__search", .expected = .ask },
+        // All-servers wildcard.
+        .{ .list = "mcp__*", .kind = .allow, .tool = "mcp__atlassian__search", .expected = .auto_allow },
+        .{ .list = "mcp__*", .kind = .allow, .tool = "mcp__slack__post", .expected = .auto_allow },
+        .{ .list = "mcp__*", .kind = .allow, .tool = "write", .expected = .ask },
+        // Exact tool match.
+        .{ .list = "mcp__atlassian__search_issues", .kind = .allow, .tool = "mcp__atlassian__search_issues", .expected = .auto_allow },
+        .{ .list = "mcp__atlassian__search_issues", .kind = .allow, .tool = "mcp__atlassian__create_issue", .expected = .ask },
+    };
+    for (cases) |c| {
+        var s = Store.init(gpa);
+        defer s.deinit();
+        switch (c.kind) {
+            .allow => try s.addAllowList(c.list),
+            .deny => try s.addDenyList(c.list),
+        }
+        try testing.expectEqual(c.expected, s.check(c.tool, "{}"));
+    }
 }
 
 test "Store.check: read auto-allows under defaults" {

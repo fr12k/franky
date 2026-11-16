@@ -1458,7 +1458,7 @@ pub fn resolve(
     var mcp_client_ptr: ?*mcp_mod.McpClient = null;
     const final_with_mcp: []const at.AgentTool = blk: {
         if (cfg.mcp_configs) |configs_csv| {
-            const config_paths = splitCsv(a, configs_csv) catch &.{ };
+            const config_paths = mcp_mod.splitCsv(a, configs_csv) catch &.{ };
             if (config_paths.len > 0) {
                 var mcp_cancel: ai.stream.Cancel = .{};
                 const mcp_client = try a.create(mcp_mod.McpClient);
@@ -1587,21 +1587,6 @@ pub fn resolve(
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
-}
-
-/// Split a comma-separated string into a slice of trimmed strings.
-/// Empty entries are skipped. Allocates on `allocator`.
-fn splitCsv(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
-    var result: std.ArrayList([]const u8) = .empty;
-    errdefer result.deinit(allocator);
-    var it = std.mem.splitScalar(u8, csv, ',');
-    while (it.next()) |part| {
-        const trimmed = std.mem.trim(u8, part, " \t");
-        if (trimmed.len > 0) {
-            try result.append(allocator, try allocator.dupe(u8, trimmed));
-        }
-    }
-    return result.toOwnedSlice(allocator);
 }
 
 // ─── Tests ─────────────────────────────────────────────────────
