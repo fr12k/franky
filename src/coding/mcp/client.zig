@@ -85,7 +85,12 @@ pub fn discoverTools(
     var tools: std.ArrayList(at.AgentTool) = .empty;
 
     for (server_configs) |srv| {
-        if (srv.transport != .http) continue; // Only http for now.
+        if (srv.transport != .http) {
+            log.log(.warn, "mcp-client", "discover", "skipping non-http server {s}", .{srv.name});
+            continue;
+        }
+
+        log.log(.info, "mcp-client", "discover", "connecting to {s} at {s}", .{ srv.name, srv.url });
 
         // Initialize the remote server.
         const init_result = callRemote(
@@ -146,6 +151,8 @@ pub fn discoverTools(
         const tools_arr = result_obj.object.get("tools") orelse continue;
         if (tools_arr != .array) continue;
 
+        const tools_before = tools.items.len;
+
         for (tools_arr.array.items) |tool_val| {
             if (tool_val != .object) continue;
             const to = tool_val.object;
@@ -187,6 +194,8 @@ pub fn discoverTools(
                 .execute = executeMcpTool,
             });
         }
+
+        log.log(.info, "mcp-client", "discover", "discovered {d} tool(s) from {s}", .{ tools.items.len - tools_before, srv.name });
     }
 
     return tools.toOwnedSlice(arena);
@@ -228,12 +237,15 @@ fn executeMcpTool(
     try req_buf.appendSlice(allocator, safe_args);
     try req_buf.appendSlice(allocator, "}}");
 
-    const response = try callRemote(allocator, io, .{
+    const response = callRemote(allocator, io, .{
         .name = ctx.server_name,
         .transport = .http,
         .url = ctx.url,
         .headers = ctx.headers,
-    }, ctx.environ_map, cancel, req_buf.items);
+    }, ctx.environ_map, cancel, req_buf.items) catch |err| {
+        log.log(.err, "mcp-client", "call", "tools/call to {s} failed: {s}", .{ ctx.server_name, @errorName(err) });
+        return common.toolError(allocator, "mcp_remote", try allocator.dupe(u8, @errorName(err)));
+    };
     defer allocator.free(response);
 
     // Parse the response.

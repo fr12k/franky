@@ -1575,22 +1575,37 @@ pub fn discoverMcpTools(
 ) ![]const at.AgentTool {
     mcp_client_ptr.* = null;
     if (cfg.mcp_configs) |configs_csv| {
-        const config_paths = mcp_mod.splitCsv(arena, configs_csv) catch &.{};
+        const config_paths = mcp_mod.splitCsv(arena, configs_csv) catch |err| {
+            ai.log.log(.err, "mcp", "discover", "failed to split config paths: {s}", .{@errorName(err)});
+            return base_tools;
+        };
         if (config_paths.len > 0) {
-            const mcp_servers = mcp_mod.config.parseConfigs(arena, config_paths, environ_map, io) catch &.{};
+            const mcp_servers = mcp_mod.config.parseConfigs(arena, config_paths, environ_map, io) catch |err| {
+                ai.log.log(.err, "mcp", "discover", "failed to parse MCP configs: {s}", .{@errorName(err)});
+                return base_tools;
+            };
             if (mcp_servers.len > 0) {
                 var mcp_cancel: ai.stream.Cancel = .{};
                 const mcp_client = try arena.create(mcp_mod.McpClient);
                 const mcp_tools = mcp_mod.client.discoverTools(
                     arena, io, mcp_servers, environ_map, &mcp_cancel, mcp_client,
-                ) catch &.{};
+                ) catch |err| {
+                    ai.log.log(.err, "mcp", "discover", "discoverTools failed: {s}", .{@errorName(err)});
+                    mcp_client_ptr.* = mcp_client;
+                    return base_tools;
+                };
                 mcp_client_ptr.* = mcp_client;
                 if (mcp_tools.len > 0) {
+                    ai.log.log(.info, "mcp", "discover", "discovered {d} MCP tools from {d} server(s)", .{ mcp_tools.len, mcp_servers.len });
                     const combined = try arena.alloc(at.AgentTool, base_tools.len + mcp_tools.len);
                     @memcpy(combined[0..base_tools.len], base_tools);
                     @memcpy(combined[base_tools.len..], mcp_tools);
                     return combined;
+                } else {
+                    ai.log.log(.warn, "mcp", "discover", "no MCP tools discovered from {d} server(s)", .{mcp_servers.len});
                 }
+            } else {
+                ai.log.log(.warn, "mcp", "discover", "no MCP servers found in config files", .{});
             }
         }
     }
