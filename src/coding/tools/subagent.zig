@@ -492,7 +492,7 @@ pub fn registerBuiltinPresets(reg: *PresetRegistry) !void {
     try reg.register(.{
         .name = "mcp",
         .description = "Calls external MCP server tools (Atlassian, Slack, ArgoCD, etc.) with read/write for context.",
-        .default_profile = "ollama-cloud/deepseek-v4-pro:cloud",
+        .default_profile = "",
         .default_role = .code,
         .default_system_prompt =
         \\You are an MCP sub-agent. Your job is to call external MCP server tools.
