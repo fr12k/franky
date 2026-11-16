@@ -41,6 +41,10 @@ pub const McpToolCtx = struct {
     server_name: []const u8,
     /// Env map pointer for proxy/TLS setup in tool calls.
     environ_map: ?*const std.process.Environ.Map,
+    /// MCP session ID captured from the `initialize` response
+    /// `Mcp-Session-Id` header. Sent on all subsequent requests.
+    /// null when the server doesn't require session management.
+    session_id: ?[]const u8 = null,
 };
 
 /// Per-session MCP client state. Holds the arena-allocated tool
@@ -92,7 +96,9 @@ pub fn discoverTools(
 
         log.log(.info, "mcp-client", "discover", "connecting to {s}", .{srv.name});
 
-        // Initialize the remote server.
+        // Initialize the remote server. Capture the Mcp-Session-Id
+        // from the response header for subsequent requests.
+        var session_id: ?[]const u8 = null;
         const init_result = callRemote(
             arena,
             io,
@@ -100,6 +106,8 @@ pub fn discoverTools(
             environ_map,
             cancel,
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"franky\",\"version\":\"0.29.0\"}}}",
+            null,
+            &session_id,
         ) catch |err| {
             log.log(.warn, "mcp-client", "discover", "initialize failed for {s}: {s}", .{ srv.name, @errorName(err) });
             continue;
@@ -118,6 +126,8 @@ pub fn discoverTools(
             environ_map,
             cancel,
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}",
+            session_id,
+            null,
         ) catch |err| {
             log.log(.debug, "mcp-client", "discover", "initialized notification failed for {s}: {s} (proceeding anyway)", .{ srv.name, @errorName(err) });
         };
@@ -130,6 +140,8 @@ pub fn discoverTools(
             environ_map,
             cancel,
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}",
+            session_id,
+            null,
         ) catch |err| {
             log.log(.warn, "mcp-client", "discover", "tools/list failed for {s}: {s}", .{ srv.name, @errorName(err) });
             continue;
@@ -195,6 +207,7 @@ pub fn discoverTools(
                 .input_schema_json = input_schema,
                 .server_name = srv.name,
                 .environ_map = environ_map,
+                .session_id = session_id,
             };
 
             try tools.append(arena, at.AgentTool{
@@ -253,7 +266,7 @@ fn executeMcpTool(
         .transport = .http,
         .url = ctx.url,
         .headers = ctx.headers,
-    }, ctx.environ_map, cancel, req_buf.items) catch |err| {
+    }, ctx.environ_map, cancel, req_buf.items, ctx.session_id, null) catch |err| {
         log.log(.err, "mcp-client", "call", "tools/call to {s} failed: {s}", .{ ctx.server_name, @errorName(err) });
         return common.toolError(allocator, "mcp_remote", @errorName(err));
     };
@@ -323,6 +336,9 @@ fn executeMcpTool(
 /// response body. Handles both `application/json` and
 /// `text/event-stream` (SSE) responses — for SSE, extracts the
 /// first `data:` payload. Allocates the result on `allocator`.
+/// When `session_id_out` is non-null, captures the `Mcp-Session-Id`
+/// response header into it (allocated on `allocator`).
+/// When `session_id` is non-null, sends it as `Mcp-Session-Id` header.
 fn callRemote(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -330,6 +346,8 @@ fn callRemote(
     environ_map: ?*const std.process.Environ.Map,
     cancel: *stream_mod.Cancel,
     payload: []const u8,
+    session_id: ?[]const u8,
+    session_id_out: ?*?[]const u8,
 ) ![]u8 {
     var client = http_mod.Client{ .allocator = allocator, .io = io };
     var proxy_arena: ?std.heap.ArenaAllocator = null;
@@ -343,7 +361,9 @@ fn callRemote(
 
     // Build headers: server-configured headers + content-type + accept.
     const cfg_headers = srv.headers;
-    var headers_buf = try allocator.alloc(std.http.Header, cfg_headers.len + 2);
+    // +2 for content-type/accept, +1 for Mcp-Session-Id if present.
+    const session_hdr_count: usize = if (session_id != null) 1 else 0;
+    var headers_buf = try allocator.alloc(std.http.Header, cfg_headers.len + 2 + session_hdr_count);
     defer allocator.free(headers_buf);
     var hi: usize = 0;
     for (cfg_headers) |h| {
@@ -354,9 +374,20 @@ fn callRemote(
     hi += 1;
     headers_buf[hi] = .{ .name = "accept", .value = "application/json, text/event-stream" };
     hi += 1;
+    if (session_id) |sid| {
+        headers_buf[hi] = .{ .name = "Mcp-Session-Id", .value = sid };
+        hi += 1;
+    }
 
     var bw = std.Io.Writer.Allocating.init(allocator);
     defer bw.deinit();
+
+    // When we need to capture the Mcp-Session-Id response header,
+    // use the lower-level request API instead of fetch (which only
+    // returns FetchResult{status} without headers).
+    if (session_id_out) |sid_out| {
+        return callRemoteWithHeaders(allocator, io, &client, srv, headers_buf[0..hi], payload, &bw, cancel, sid_out);
+    }
 
     var phase_info: http_mod.PhaseInfo = .{};
     const result = http_mod.fetchWithRetryAndTimeoutsAndHooksAndPhases(
@@ -442,4 +473,62 @@ fn joinDataLines(allocator: std.mem.Allocator, lines: []const []const u8) ![]u8 
         try buf.appendSlice(allocator, line);
     }
     return buf.toOwnedSlice(allocator);
+}
+
+/// Lower-level HTTP request that captures response headers.
+/// Used for the `initialize` call to get the `Mcp-Session-Id`.
+/// This bypasses `fetch` (which discards response headers)
+/// and uses `request` + `receiveHead` + `iterateHeaders`.
+fn callRemoteWithHeaders(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    client: *http_mod.Client,
+    srv: config_mod.ServerConfig,
+    headers: []const std.http.Header,
+    payload: []const u8,
+    bw: *std.Io.Writer.Allocating,
+    cancel: *stream_mod.Cancel,
+    session_id_out: *?[]const u8,
+) ![]u8 {
+    _ = io;
+    const Uri = std.Uri;
+    const uri = try Uri.parse(srv.url);
+
+    var req = try http_mod.Client.request(client, .POST, uri, .{
+        .extra_headers = headers,
+    });
+    defer req.deinit();
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var body = try req.sendBodyUnflushed(&.{});
+    try body.writer.writeAll(payload);
+    try body.end();
+    try req.connection.?.flush();
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    // Capture Mcp-Session-Id from response headers.
+    var hdr_it = response.head.iterateHeaders();
+    while (hdr_it.next()) |hdr| {
+        if (std.ascii.eqlIgnoreCase(hdr.name, "Mcp-Session-Id")) {
+            session_id_out.* = try allocator.dupe(u8, hdr.value);
+            break;
+        }
+    }
+
+    // Read response body.
+    const reader = response.reader(&.{});
+    _ = reader.streamRemaining(&bw.writer) catch |err| switch (err) {
+        error.ReadFailed => return error.HttpErrorStatus,
+        else => return err,
+    };
+
+    const status: u16 = @intFromEnum(response.head.status);
+    if (status == 401 or status == 403) return error.Unauthorized;
+    if (status == 429) return error.RateLimited;
+    if (status >= 400) return error.HttpErrorStatus;
+
+    _ = cancel; // not used in this path (no retry framework)
+    return extractSsePayload(allocator, bw.written());
 }
