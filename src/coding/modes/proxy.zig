@@ -3357,16 +3357,17 @@ fn countTranscriptMessages(
         const bytes = try allocator.alloc(u8, len_usize);
         defer allocator.free(bytes);
         const n = try f.readPositionalAll(io, bytes, 0);
-        // Count non-empty lines, subtracting the meta header (type:"meta")
-        // if present. This is cheaper than parsing each line as JSON.
+        // Count non-empty lines, subtracting the meta header
+        // (type:"meta") if it is the first non-empty line. This is
+        // cheaper than parsing each line as JSON.
         var count: u32 = 0;
-        var saw_meta = false;
+        var first_non_empty = true;
         var it = std.mem.splitScalar(u8, bytes[0..n], '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
-            if (!saw_meta and std.mem.indexOf(u8, line, "\"type\":\"meta\"") != null) {
-                saw_meta = true;
-                continue;
+            if (first_non_empty) {
+                first_non_empty = false;
+                if (std.mem.indexOf(u8, line, "\"type\":\"meta\"") != null) continue;
             }
             count += 1;
         }

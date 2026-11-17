@@ -28,6 +28,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ai = struct {
     pub const types = @import("../../ai/types.zig");
+    pub const log = @import("../../ai/log.zig");
 };
 const agent_mod = @import("../../agent/mod.zig");
 const object_store = @import("object_store.zig");
@@ -235,7 +236,10 @@ pub fn writeTranscript(
     // the new file is missing.
     const legacy_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
     defer allocator.free(legacy_path);
-    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => ai.log.log(.warn, "session", "legacy_json_delete_failed", "error={s}", .{@errorName(e)}),
+    };
 }
 
 /// Load `transcript.jsonl` into an owned `Transcript`. Caller deinits it.
@@ -312,7 +316,10 @@ pub fn writeBranchTranscript(
     defer allocator.free(legacy_name);
     const legacy_path = try std.fs.path.join(allocator, &.{ snap_dir, legacy_name });
     defer allocator.free(legacy_path);
-    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => ai.log.log(.warn, "session", "legacy_branch_delete_failed", "error={s}", .{@errorName(e)}),
+    };
 }
 
 /// v1.7.0 — load a branch-scoped snapshot. Returns
@@ -376,7 +383,15 @@ fn parseTranscriptJsonl(
         // Skip a trailing empty line (file ends with '\n').
         if (line.len == 0) continue;
 
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        // Crash-resilience: if a line fails to parse as JSON, skip it
+        // rather than aborting the entire transcript read. A truncated
+        // final line (process killed mid-append) is the most common
+        // cause; the prior complete lines are still valuable. We lose
+        // at most the in-flight message.
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+            ai.log.log(.warn, "session", "jsonl_skip_line", "len={d}", .{line.len});
+            continue;
+        };
         defer parsed.deinit();
         if (parsed.value != .object) continue;
         const obj = parsed.value.object;
@@ -389,7 +404,10 @@ fn parseTranscriptJsonl(
             first_line = false;
             const type_str = strOpt(obj, "type") orelse "";
             if (std.mem.eql(u8, type_str, "meta")) {
-                const version = if (obj.get("version")) |v| v.integer else 0;
+                const version: u32 = blk: {
+                    if (obj.get("version")) |v| if (v == .integer and v.integer >= 0) break :blk @intCast(v.integer);
+                    break :blk 0;
+                };
                 if (version > current_transcript_version) return error.UnsupportedTranscriptVersion;
                 continue;
             }
@@ -415,7 +433,10 @@ fn parseTranscriptLegacyJson(
     defer parsed.deinit();
 
     const root = parsed.value.object;
-    const version = if (root.get("version")) |v| v.integer else 0;
+    const version: u32 = blk: {
+        if (root.get("version")) |v| if (v == .integer and v.integer >= 0) break :blk @intCast(v.integer);
+        break :blk 0;
+    };
     if (version > legacy_transcript_version) return error.UnsupportedTranscriptVersion;
 
     var transcript = agent_mod.loop.Transcript.init(allocator);
