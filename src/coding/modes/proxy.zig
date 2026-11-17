@@ -994,7 +994,7 @@ pub fn initSession(
     //
     // v1.28.0 — wire `parent_session_dir` so the sub-agent's
     // transcript persists to
-    // `<session>/subagents/<call_id>/transcript.json`. The path
+    // `<session>/subagents/<call_id>/transcript.jsonl`. The path
     // is duped into role_arena so it lives as long as the session.
     {
         const ra = session.role_arena.allocator();
@@ -3287,7 +3287,7 @@ fn renderSessionListJson(
         const header = session_mod.readSessionHeader(allocator, io, session_dir) catch continue;
         defer session_mod.freeSessionHeader(allocator, header);
 
-        // Cheap message-count: parse transcript.json and count
+        // Cheap message-count: parse transcript.jsonl and count
         // top-level messages without resolving content blocks.
         const msg_count = countTranscriptMessages(allocator, io, session_dir) catch 0;
 
