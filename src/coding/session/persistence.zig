@@ -231,15 +231,8 @@ pub fn writeTranscript(
     try atomicWrite(io, path, buf.items);
 
     // Best-effort cleanup of a pre-v1.30 `transcript.json` so we don't
-    // leave a stale duplicate on disk. A failure here is harmless —
-    // the reader prefers `.jsonl` and only falls back to `.json` when
-    // the new file is missing.
-    const legacy_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
-    defer allocator.free(legacy_path);
-    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch |e| switch (e) {
-        error.FileNotFound => {},
-        else => ai.log.log(.warn, "session", "legacy_json_delete_failed", "error={s}", .{@errorName(e)}),
-    };
+    // leave a stale duplicate on disk.
+    deleteLegacyFile(io, session_dir, "transcript.json");
 }
 
 /// Load `transcript.jsonl` into an owned `Transcript`. Caller deinits it.
@@ -258,24 +251,7 @@ pub fn readTranscript(
 ) !agent_mod.loop.Transcript {
     const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
     defer allocator.free(store_dir);
-
-    // Prefer the v1.30 JSON Lines file.
-    const jsonl_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.jsonl" });
-    defer allocator.free(jsonl_path);
-    if (readWholeFile(allocator, io, jsonl_path)) |bytes| {
-        defer allocator.free(bytes);
-        return try parseTranscriptJsonl(allocator, io, store_dir, bytes);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    // Fall back to the legacy single-JSON `transcript.json`.
-    const legacy_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
-    defer allocator.free(legacy_path);
-    const bytes = try readWholeFile(allocator, io, legacy_path);
-    defer allocator.free(bytes);
-    return try parseTranscriptLegacyJson(allocator, io, store_dir, bytes);
+    return try readTranscriptWithFallback(allocator, io, session_dir, "transcript", store_dir);
 }
 
 /// v1.7.0 — write a branch-scoped snapshot at
@@ -314,12 +290,7 @@ pub fn writeBranchTranscript(
     // Best-effort cleanup of a pre-v1.30 `<branch>.json` snapshot.
     const legacy_name = try std.fmt.allocPrint(allocator, "{s}.json", .{branch});
     defer allocator.free(legacy_name);
-    const legacy_path = try std.fs.path.join(allocator, &.{ snap_dir, legacy_name });
-    defer allocator.free(legacy_path);
-    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch |e| switch (e) {
-        error.FileNotFound => {},
-        else => ai.log.log(.warn, "session", "legacy_branch_delete_failed", "error={s}", .{@errorName(e)}),
-    };
+    deleteLegacyFile(io, snap_dir, legacy_name);
 }
 
 /// v1.7.0 — load a branch-scoped snapshot. Returns
@@ -338,10 +309,36 @@ pub fn readBranchTranscript(
     const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
     defer allocator.free(store_dir);
 
-    // Prefer the v1.30 JSON Lines file.
-    const jsonl_name = try std.fmt.allocPrint(allocator, "transcripts/{s}.jsonl", .{branch});
+    const snap_dir = try std.fs.path.join(allocator, &.{ session_dir, "transcripts" });
+    defer allocator.free(snap_dir);
+    return try readTranscriptWithFallback(allocator, io, snap_dir, branch, store_dir);
+}
+
+// ─── v1.30.0 transcript parsers ───────────────────────────────────
+
+/// Safely extract a `version` integer from a JSON object map.
+/// Returns 0 when the field is absent or not a non-negative integer.
+/// Guards against a union-tag panic on non-integer values.
+fn parseVersionField(o: std.json.ObjectMap) u32 {
+    if (o.get("version")) |v| if (v == .integer and v.integer >= 0) return @intCast(v.integer);
+    return 0;
+}
+
+/// Read a transcript from `dir`, preferring `<stem>.jsonl` and
+/// falling back to the pre-v1.30 `<stem>.json` when the `.jsonl`
+/// is absent. `store_dir` is the shared `objects/` path for `ref`
+/// resolution. Returns `error.FileNotFound` only when neither file
+/// exists.
+fn readTranscriptWithFallback(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+    stem: []const u8,
+    store_dir: []const u8,
+) !agent_mod.loop.Transcript {
+    const jsonl_name = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{stem});
     defer allocator.free(jsonl_name);
-    const jsonl_path = try std.fs.path.join(allocator, &.{ session_dir, jsonl_name });
+    const jsonl_path = try std.fs.path.join(allocator, &.{ dir, jsonl_name });
     defer allocator.free(jsonl_path);
     if (readWholeFile(allocator, io, jsonl_path)) |bytes| {
         defer allocator.free(bytes);
@@ -351,17 +348,26 @@ pub fn readBranchTranscript(
         else => return err,
     }
 
-    // Fall back to the legacy single-JSON `<branch>.json`.
-    const legacy_name = try std.fmt.allocPrint(allocator, "transcripts/{s}.json", .{branch});
+    const legacy_name = try std.fmt.allocPrint(allocator, "{s}.json", .{stem});
     defer allocator.free(legacy_name);
-    const legacy_path = try std.fs.path.join(allocator, &.{ session_dir, legacy_name });
+    const legacy_path = try std.fs.path.join(allocator, &.{ dir, legacy_name });
     defer allocator.free(legacy_path);
     const bytes = try readWholeFile(allocator, io, legacy_path);
     defer allocator.free(bytes);
     return try parseTranscriptLegacyJson(allocator, io, store_dir, bytes);
 }
 
-// ─── v1.30.0 transcript parsers ───────────────────────────────────
+/// Best-effort delete of a legacy file at `dir/<name>`. Suppresses
+/// `FileNotFound` (the common case — no pre-v1.30 file exists); logs
+/// any other error as a warning.
+fn deleteLegacyFile(io: std.Io, dir: []const u8, name: []const u8) void {
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return;
+    std.Io.Dir.cwd().deleteFile(io, path) catch |e| switch (e) {
+        error.FileNotFound => {},
+        else => ai.log.log(.warn, "session", "legacy_delete_failed", "path={s} error={s}", .{ path, @errorName(e) }),
+    };
+}
 
 /// Parse a JSON Lines transcript (v4) — the first line is a header
 /// `{"type":"meta","version":4,"branch":…}`; each subsequent line is
@@ -404,11 +410,7 @@ fn parseTranscriptJsonl(
             first_line = false;
             const type_str = strOpt(obj, "type") orelse "";
             if (std.mem.eql(u8, type_str, "meta")) {
-                const version: u32 = blk: {
-                    if (obj.get("version")) |v| if (v == .integer and v.integer >= 0) break :blk @intCast(v.integer);
-                    break :blk 0;
-                };
-                if (version > current_transcript_version) return error.UnsupportedTranscriptVersion;
+                if (parseVersionField(obj) > current_transcript_version) return error.UnsupportedTranscriptVersion;
                 continue;
             }
             // Not a meta line — fall through and treat as a message.
@@ -433,11 +435,7 @@ fn parseTranscriptLegacyJson(
     defer parsed.deinit();
 
     const root = parsed.value.object;
-    const version: u32 = blk: {
-        if (root.get("version")) |v| if (v == .integer and v.integer >= 0) break :blk @intCast(v.integer);
-        break :blk 0;
-    };
-    if (version > legacy_transcript_version) return error.UnsupportedTranscriptVersion;
+    if (parseVersionField(root) > legacy_transcript_version) return error.UnsupportedTranscriptVersion;
 
     var transcript = agent_mod.loop.Transcript.init(allocator);
     errdefer transcript.deinit();

@@ -448,6 +448,13 @@ test "writeBranchTranscript + readBranchTranscript: round-trip preserves message
 
     try writeBranchTranscript(gpa, io, base, &transcript, "experiment");
 
+    // v1.30 — verify the snapshot is written as .jsonl with a meta header.
+    const snap_path = try std.fmt.allocPrint(gpa, "{s}/transcripts/experiment.jsonl", .{base});
+    defer gpa.free(snap_path);
+    const snap_bytes = try readWholeFile(gpa, io, snap_path);
+    defer gpa.free(snap_bytes);
+    try testing.expect(std.mem.indexOf(u8, snap_bytes, "\"type\":\"meta\"") != null);
+
     var loaded = try readBranchTranscript(gpa, io, base, "experiment");
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
@@ -669,7 +676,26 @@ test "assertRefsInKeep: large content block hash is verified in keep list" {
     assertRefsInKeep(gpa, &transcript, &.{hex});
 }
 
+
 // ─── v1.30.0 JSONL format tests ───────────────────────────────────
+
+/// Write a minimal `session.json` under `<base>/<id>/` so `load()`
+/// can read the header. Returns the session_dir path (caller frees).
+fn writeMinimalSessionHeader(allocator: std.mem.Allocator, io: std.Io, base: []const u8, id: []const u8) ![]u8 {
+    const session_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, id });
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+
+    const session_json = try std.fmt.allocPrint(allocator,
+        "{{\"version\":3,\"id\":\"{s}\",\"createdAtMs\":1,\"updatedAtMs\":1," ++
+            "\"title\":\"t\",\"provider\":\"faux\",\"model\":\"faux-1\",\"api\":\"faux\"," ++
+            "\"thinkingLevel\":\"off\",\"activeBranch\":\"main\",\"systemPromptHash\":\"\"}}", .{id});
+    defer allocator.free(session_json);
+
+    const session_path = try std.fmt.allocPrint(allocator, "{s}/session.json", .{session_dir});
+    defer allocator.free(session_path);
+    try atomicWrite(io, session_path, session_json);
+    return session_dir;
+}
 
 test "v1.30: legacy .json transcript is read when .jsonl is absent" {
     var threaded = test_h.threadedIo();
@@ -682,18 +708,8 @@ test "v1.30: legacy .json transcript is read when .jsonl is absent" {
     defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
     try std.Io.Dir.cwd().createDirPath(io, base);
 
-    const session_dir = try std.fmt.allocPrint(gpa, "{s}/01JXLEG", .{base});
+    const session_dir = try writeMinimalSessionHeader(gpa, io, base, "01JXLEG");
     defer gpa.free(session_dir);
-    try std.Io.Dir.cwd().createDirPath(io, session_dir);
-
-    // Write a minimal session.json so load() can read the header.
-    const session_json =
-        "{\"version\":3,\"id\":\"01JXLEG\",\"createdAtMs\":1,\"updatedAtMs\":1," ++
-        "\"title\":\"legacy\",\"provider\":\"faux\",\"model\":\"faux-1\",\"api\":\"faux\"," ++
-        "\"thinkingLevel\":\"off\",\"activeBranch\":\"main\",\"systemPromptHash\":\"\"}";
-    const session_path = try std.fmt.allocPrint(gpa, "{s}/session.json", .{session_dir});
-    defer gpa.free(session_path);
-    try atomicWrite(io, session_path, session_json);
 
     // Write a legacy single-JSON transcript.json (version 3 shape).
     const legacy_json =
@@ -722,20 +738,9 @@ test "v1.30: empty JSONL (meta-only) yields zero messages" {
     defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
     try std.Io.Dir.cwd().createDirPath(io, base);
 
-    const session_dir = try std.fmt.allocPrint(gpa, "{s}/01JXEMPTY", .{base});
+    const session_dir = try writeMinimalSessionHeader(gpa, io, base, "01JXEMPTY");
     defer gpa.free(session_dir);
-    try std.Io.Dir.cwd().createDirPath(io, session_dir);
 
-    // Write a minimal session.json so load() can read the header.
-    const session_json =
-        "{\"version\":3,\"id\":\"01JXEMPTY\",\"createdAtMs\":1,\"updatedAtMs\":1," ++
-        "\"title\":\"empty\",\"provider\":\"faux\",\"model\":\"faux-1\",\"api\":\"faux\"," ++
-        "\"thinkingLevel\":\"off\",\"activeBranch\":\"main\",\"systemPromptHash\":\"\"}";
-    const session_path = try std.fmt.allocPrint(gpa, "{s}/session.json", .{session_dir});
-    defer gpa.free(session_path);
-    try atomicWrite(io, session_path, session_json);
-
-    // Write a JSONL file with only the meta header line.
     const jsonl_path = try std.fmt.allocPrint(gpa, "{s}/transcript.jsonl", .{session_dir});
     defer gpa.free(jsonl_path);
     try atomicWrite(io, jsonl_path, "{\"type\":\"meta\",\"version\":4,\"branch\":\"main\"}\n");
@@ -756,18 +761,8 @@ test "v1.30: truncated final line is skipped, prior messages load" {
     defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
     try std.Io.Dir.cwd().createDirPath(io, base);
 
-    const session_dir = try std.fmt.allocPrint(gpa, "{s}/01JXTRUNC", .{base});
+    const session_dir = try writeMinimalSessionHeader(gpa, io, base, "01JXTRUNC");
     defer gpa.free(session_dir);
-    try std.Io.Dir.cwd().createDirPath(io, session_dir);
-
-    // Write a minimal session.json so load() can read the header.
-    const session_json =
-        "{\"version\":3,\"id\":\"01JXTRUNC\",\"createdAtMs\":1,\"updatedAtMs\":1," ++
-        "\"title\":\"trunc\",\"provider\":\"faux\",\"model\":\"faux-1\",\"api\":\"faux\"," ++
-        "\"thinkingLevel\":\"off\",\"activeBranch\":\"main\",\"systemPromptHash\":\"\"}";
-    const session_path = try std.fmt.allocPrint(gpa, "{s}/session.json", .{session_dir});
-    defer gpa.free(session_path);
-    try atomicWrite(io, session_path, session_json);
 
     // Meta header + one valid message + one truncated line.
     const jsonl_content =
@@ -783,39 +778,6 @@ test "v1.30: truncated final line is skipped, prior messages load" {
     // The valid user message loads; the truncated assistant line is skipped.
     try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
     try testing.expectEqualStrings("ok", loaded.transcript.messages.items[0].content[0].text.text);
-}
-
-test "v1.30: writeBranchTranscript writes .jsonl, readBranchTranscript reads it" {
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-    const gpa = testing.allocator;
-
-    const base = "/tmp/franky_br_jsonl_ext";
-    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
-    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, base);
-
-    var transcript = agent_mod.loop.Transcript.init(gpa);
-    defer transcript.deinit();
-    const c = try gpa.alloc(ai.types.ContentBlock, 1);
-    c[0] = .{ .text = .{ .text = try gpa.dupe(u8, "jsonl branch") } };
-    try transcript.append(.{ .role = .user, .content = c, .timestamp = 1 });
-
-    try writeBranchTranscript(gpa, io, base, &transcript, "feat-x");
-
-    // Verify the file has .jsonl extension.
-    const snap_path = try std.fmt.allocPrint(gpa, "{s}/transcripts/feat-x.jsonl", .{base});
-    defer gpa.free(snap_path);
-    const snap_bytes = try readWholeFile(gpa, io, snap_path);
-    defer gpa.free(snap_bytes);
-    try testing.expect(std.mem.indexOf(u8, snap_bytes, "\"type\":\"meta\"") != null);
-    try testing.expect(std.mem.indexOf(u8, snap_bytes, "jsonl branch") != null);
-
-    var loaded = try readBranchTranscript(gpa, io, base, "feat-x");
-    defer loaded.deinit();
-    try testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
-    try testing.expectEqualStrings("jsonl branch", loaded.messages.items[0].content[0].text.text);
 }
 
 test "v1.30: legacy .json branch snapshot is read when .jsonl is absent" {
