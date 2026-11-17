@@ -144,7 +144,7 @@ pub const SessionBashState = struct {
     /// v1.27.2 — record the session's on-disk directory so bash
     /// spills can land under it. Caller passes the materialized
     /// `<parent_dir>/<session_id>` path (the directory that holds
-    /// `session.json` + `transcript.json`); `bash/` is added by
+    /// `session.json` + `transcript.jsonl`); `bash/` is added by
     /// the spill writer on demand.
     pub fn setSessionDir(self: *SessionBashState, dir: []const u8) !void {
         self.session_dir_buf.clearRetainingCapacity();
@@ -1763,12 +1763,12 @@ test "session env: injectSessionEnv sets FRANKY_* from state" {
 
     var state = SessionBashState.init(gpa);
     defer state.deinit();
-    try state.setSessionMetadata("s1", "/tmp/s1/transcript.json", "anthropic", "claude-sonnet-4-5", .high);
+    try state.setSessionMetadata("s1", "/tmp/s1/transcript.jsonl", "anthropic", "claude-sonnet-4-5", .high);
 
     injectSessionEnv(&env, &state);
 
     try testing.expectEqualStrings("s1", env.get("FRANKY_SESSION_ID").?);
-    try testing.expectEqualStrings("/tmp/s1/transcript.json", env.get("FRANKY_SESSION_FILE").?);
+    try testing.expectEqualStrings("/tmp/s1/transcript.jsonl", env.get("FRANKY_SESSION_FILE").?);
     try testing.expectEqualStrings("anthropic", env.get("FRANKY_PROVIDER").?);
     try testing.expectEqualStrings("claude-sonnet-4-5", env.get("FRANKY_MODEL").?);
     try testing.expectEqualStrings("high", env.get("FRANKY_REASONING_LEVEL").?);
@@ -1798,7 +1798,7 @@ test "session env: expose_session_environment=false scrubs inherited values" {
     var state = SessionBashState.init(gpa);
     defer state.deinit();
     state.expose_session_environment = false;
-    try state.setSessionMetadata("s3", "/tmp/s3/transcript.json", "google-gemini", "gemini-pro", .medium);
+    try state.setSessionMetadata("s3", "/tmp/s3/transcript.jsonl", "google-gemini", "gemini-pro", .medium);
 
     injectSessionEnv(&env, &state);
 
@@ -1838,7 +1838,7 @@ test "session env: bash execute injects FRANKY_* into child env" {
     var state = SessionBashState.init(gpa);
     defer state.deinit();
     state.parent_env = &parent_env;
-    try state.setSessionMetadata("e2e-1", "/tmp/e2e/transcript.json", "anthropic", "claude-sonnet-4-5", .high);
+    try state.setSessionMetadata("e2e-1", "/tmp/e2e/transcript.jsonl", "anthropic", "claude-sonnet-4-5", .high);
 
     var cancel: ai.stream.Cancel = .{};
     const t = toolWithState(&state);
@@ -1850,7 +1850,7 @@ test "session env: bash execute injects FRANKY_* into child env" {
 
     const txt = res.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, txt, "e2e-1") != null);
-    try testing.expect(std.mem.indexOf(u8, txt, "/tmp/e2e/transcript.json") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "/tmp/e2e/transcript.jsonl") != null);
     try testing.expect(std.mem.indexOf(u8, txt, "anthropic") != null);
     try testing.expect(std.mem.indexOf(u8, txt, "claude-sonnet-4-5") != null);
     try testing.expect(std.mem.indexOf(u8, txt, "high") != null);

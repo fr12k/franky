@@ -1327,7 +1327,7 @@ fn runSubagent(
     // OR when `persistSubagentSession` failed (the failure was
     // already warn-logged).
     const transcript_path: ?[]u8 = if (ctx.parent_session_dir) |parent|
-        std.fs.path.join(allocator, &.{ parent, "subagents", call_id, "transcript.json" }) catch null
+        std.fs.path.join(allocator, &.{ parent, "subagents", call_id, "transcript.jsonl" }) catch null
     else
         null;
     defer if (transcript_path) |p| allocator.free(p);
@@ -1775,7 +1775,7 @@ fn persistSubagentSession(
     const title = try std.fmt.allocPrint(allocator, "subagent[{s}]: {s}", .{ args.profile, trimmed_prompt });
     defer allocator.free(title);
 
-    // session.save handles the <subagents>/<call_id>/transcript.json layout.
+    // session.save handles the <subagents>/<call_id>/transcript.jsonl layout.
     try session_mod.save(allocator, io, subagents_dir, .{
         .id = args.call_id,
         .created_at_ms = args.start_ms,
@@ -2153,14 +2153,14 @@ test "successResult emits transcript_path field when set (v1.28.0)" {
         7,
         1234,
         "01J0",
-        "/home/user/.franky/sessions/abc/subagents/01J0/transcript.json",
+        "/home/user/.franky/sessions/abc/subagents/01J0/transcript.jsonl",
         "call_xyz",
     );
     defer r.deinit(gpa);
     try testing.expect(!r.is_error);
     const text = r.content[0].text.text;
     try testing.expect(std.mem.indexOf(u8, text, "\"transcript_path\":") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "/subagents/01J0/transcript.json") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "/subagents/01J0/transcript.jsonl") != null);
 }
 
 test "errorResult emits valid JSON with kind + hint + tool_code" {

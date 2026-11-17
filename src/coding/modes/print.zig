@@ -301,7 +301,7 @@ fn runPrint(
     // v0.30.0 — expose session metadata to the bash tool's child env.
     resolved.bash_state.parent_env = environ_map;
     const tfile: ?[]const u8 = if (session_dir_path) |sd|
-        std.fs.path.join(allocator, &.{ sd, "transcript.json" }) catch null
+        std.fs.path.join(allocator, &.{ sd, "transcript.jsonl" }) catch null
     else
         null;
     defer if (tfile) |p| allocator.free(p);

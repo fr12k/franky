@@ -54,7 +54,7 @@ pub const Session = struct {
     }
 };
 
-/// Write both `session.json` and `transcript.json` atomically under
+/// Write both `session.json` and `transcript.jsonl` atomically under
 /// `<parent_dir>/<session_id>/`. The directory is created if missing.
 pub fn save(
     allocator: std.mem.Allocator,
@@ -318,7 +318,7 @@ test "transcript: small block stays inline; objects/ dir stays empty" {
     };
     try save(gpa, io, base, header, &transcript);
 
-    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXSMALL/transcript.json", .{base});
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXSMALL/transcript.jsonl", .{base});
     defer gpa.free(t_path);
     const t_bytes = try readWholeFile(gpa, io, t_path);
     defer gpa.free(t_bytes);
@@ -369,7 +369,7 @@ test "transcript: 32 KiB block externalized and round-trips through $ref" {
     };
     try save(gpa, io, base, header, &transcript);
 
-    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXLARGE/transcript.json", .{base});
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXLARGE/transcript.jsonl", .{base});
     defer gpa.free(t_path);
     const t_bytes = try readWholeFile(gpa, io, t_path);
     defer gpa.free(t_bytes);
@@ -447,6 +447,13 @@ test "writeBranchTranscript + readBranchTranscript: round-trip preserves message
     try transcript.append(.{ .role = .user, .content = c, .timestamp = 1 });
 
     try writeBranchTranscript(gpa, io, base, &transcript, "experiment");
+
+    // v1.30 — verify the snapshot is written as .jsonl with a meta header.
+    const snap_path = try std.fmt.allocPrint(gpa, "{s}/transcripts/experiment.jsonl", .{base});
+    defer gpa.free(snap_path);
+    const snap_bytes = try readWholeFile(gpa, io, snap_path);
+    defer gpa.free(snap_bytes);
+    try testing.expect(std.mem.indexOf(u8, snap_bytes, "\"type\":\"meta\"") != null);
 
     var loaded = try readBranchTranscript(gpa, io, base, "experiment");
     defer loaded.deinit();
@@ -667,4 +674,138 @@ test "assertRefsInKeep: large content block hash is verified in keep list" {
     defer gpa.free(hex);
 
     assertRefsInKeep(gpa, &transcript, &.{hex});
+}
+
+
+// ─── v1.30.0 JSONL format tests ───────────────────────────────────
+
+/// Write a minimal `session.json` under `<base>/<id>/` so `load()`
+/// can read the header. Returns the session_dir path (caller frees).
+fn writeMinimalSessionHeader(allocator: std.mem.Allocator, io: std.Io, base: []const u8, id: []const u8) ![]u8 {
+    const session_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, id });
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+
+    const session_json = try std.fmt.allocPrint(allocator,
+        "{{\"version\":3,\"id\":\"{s}\",\"createdAtMs\":1,\"updatedAtMs\":1," ++
+            "\"title\":\"t\",\"provider\":\"faux\",\"model\":\"faux-1\",\"api\":\"faux\"," ++
+            "\"thinkingLevel\":\"off\",\"activeBranch\":\"main\",\"systemPromptHash\":\"\"}}", .{id});
+    defer allocator.free(session_json);
+
+    const session_path = try std.fmt.allocPrint(allocator, "{s}/session.json", .{session_dir});
+    defer allocator.free(session_path);
+    try atomicWrite(io, session_path, session_json);
+    return session_dir;
+}
+
+test "v1.30: legacy .json transcript is read when .jsonl is absent" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_legacy_read";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const session_dir = try writeMinimalSessionHeader(gpa, io, base, "01JXLEG");
+    defer gpa.free(session_dir);
+
+    // Write a legacy single-JSON transcript.json (version 3 shape).
+    const legacy_json =
+        "{\"version\":3,\"branch\":\"main\",\"messages\":[" ++
+        "{\"role\":\"user\",\"timestamp\":1000,\"content\":[{\"type\":\"text\",\"text\":\"legacy hello\"}]}" ++
+        "]}";
+    const legacy_path = try std.fmt.allocPrint(gpa, "{s}/transcript.json", .{session_dir});
+    defer gpa.free(legacy_path);
+    try atomicWrite(io, legacy_path, legacy_json);
+
+    // readTranscript should find the .jsonl absent and fall back to .json.
+    var loaded = try load(gpa, io, base, "01JXLEG");
+    defer loaded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
+    try testing.expectEqualStrings("legacy hello", loaded.transcript.messages.items[0].content[0].text.text);
+}
+
+test "v1.30: empty JSONL (meta-only) yields zero messages" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_empty_jsonl";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const session_dir = try writeMinimalSessionHeader(gpa, io, base, "01JXEMPTY");
+    defer gpa.free(session_dir);
+
+    const jsonl_path = try std.fmt.allocPrint(gpa, "{s}/transcript.jsonl", .{session_dir});
+    defer gpa.free(jsonl_path);
+    try atomicWrite(io, jsonl_path, "{\"type\":\"meta\",\"version\":4,\"branch\":\"main\"}\n");
+
+    var loaded = try load(gpa, io, base, "01JXEMPTY");
+    defer loaded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), loaded.transcript.messages.items.len);
+}
+
+test "v1.30: truncated final line is skipped, prior messages load" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_truncated";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const session_dir = try writeMinimalSessionHeader(gpa, io, base, "01JXTRUNC");
+    defer gpa.free(session_dir);
+
+    // Meta header + one valid message + one truncated line.
+    const jsonl_content =
+        "{\"type\":\"meta\",\"version\":4,\"branch\":\"main\"}\n" ++
+        "{\"role\":\"user\",\"timestamp\":1000,\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}\n" ++
+        "{\"role\":\"assistant\",\"timestamp\":2000,\"content\":[{\"type\":\"text\",\"text\":\"trun";
+    const jsonl_path = try std.fmt.allocPrint(gpa, "{s}/transcript.jsonl", .{session_dir});
+    defer gpa.free(jsonl_path);
+    try atomicWrite(io, jsonl_path, jsonl_content);
+
+    var loaded = try load(gpa, io, base, "01JXTRUNC");
+    defer loaded.deinit(gpa);
+    // The valid user message loads; the truncated assistant line is skipped.
+    try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
+    try testing.expectEqualStrings("ok", loaded.transcript.messages.items[0].content[0].text.text);
+}
+
+test "v1.30: legacy .json branch snapshot is read when .jsonl is absent" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_br_legacy";
+    _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const snap_dir = try std.fmt.allocPrint(gpa, "{s}/transcripts", .{base});
+    defer gpa.free(snap_dir);
+    try std.Io.Dir.cwd().createDirPath(io, snap_dir);
+
+    // Write a legacy single-JSON branch snapshot.
+    const legacy_json =
+        "{\"version\":3,\"branch\":\"old\",\"messages\":[" ++
+        "{\"role\":\"user\",\"timestamp\":500,\"content\":[{\"type\":\"text\",\"text\":\"old branch\"}]}" ++
+        "]}";
+    const legacy_path = try std.fmt.allocPrint(gpa, "{s}/transcripts/old.json", .{base});
+    defer gpa.free(legacy_path);
+    try atomicWrite(io, legacy_path, legacy_json);
+
+    var loaded = try readBranchTranscript(gpa, io, base, "old");
+    defer loaded.deinit();
+    try testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
+    try testing.expectEqualStrings("old branch", loaded.messages.items[0].content[0].text.text);
 }

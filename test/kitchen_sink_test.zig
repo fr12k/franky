@@ -262,8 +262,8 @@ test "kitchen-sink: oversize block spills to objects/ and round-trips" {
     };
     try session_mod.save(gpa, io, base, header, &transcript);
 
-    // transcript.json contains a ref, objects/ has the blob.
-    const t_path = try std.fmt.allocPrint(gpa, "{s}/01KITCHEN/transcript.json", .{base});
+    // transcript.jsonl contains a ref, objects/ has the blob.
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01KITCHEN/transcript.jsonl", .{base});
     defer gpa.free(t_path);
     var t_file = try std.Io.Dir.cwd().openFile(io, t_path, .{});
     const t_len = try t_file.length(io);
@@ -320,7 +320,7 @@ test "kitchen-sink: session + tree persist side by side" {
     try branching_mod.saveTree(gpa, io, session_dir, &tree);
 
     // All three canonical files exist.
-    for ([_][]const u8{ "session.json", "transcript.json", "tree.json" }) |name| {
+    for ([_][]const u8{ "session.json", "transcript.jsonl", "tree.json" }) |name| {
         const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ session_dir, name });
         defer gpa.free(path);
         var f = try std.Io.Dir.cwd().openFile(io, path, .{});

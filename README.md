@@ -505,7 +505,7 @@ Recipes for Docker, devcontainer, Lima, and the Slack-bot
 
 Unless you pass `--no-session`, each run writes to
 `$FRANKY_HOME/sessions/<ulid>/session.json`,
-`.../transcript.json`, `.../tree.json` (branch graph), and an
+`.../transcript.jsonl`, `.../tree.json` (branch graph), and an
 `object_store/` directory for content-addressed blobs ≥32 KiB. Pass
 `--continue` (most recent) or `--resume <ulid>` on the next run to
 continue the conversation. `--fork <name>` and `--checkout <name>`
@@ -577,7 +577,7 @@ src/
   coding/              # The coding-agent layer
     mod.zig            # Module root
     cli.zig            # CLI argument parsing
-    session.zig        # session.json + transcript.json round-trip (ULID, atomic writes)
+    session.zig        # session.json + transcript.jsonl round-trip (ULID, atomic writes)
     settings.zig       # $FRANKY_HOME/settings.json runtime limits
     auth.zig           # $FRANKY_HOME/auth.json bearer token records
     models.zig         # §H.3 model catalog + lookup

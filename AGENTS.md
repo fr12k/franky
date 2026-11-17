@@ -179,7 +179,7 @@ Session Persistence
 ~/.franky/
   sessions/<ulid>/
     session.json       # header: id, timestamps, model, provider
-    transcript.json    # full conversation history
+    transcript.jsonl    # full conversation history
     tree.json          # branch graph
     object_store/      # content-addressed blobs ≥32 KiB
   permissions.json     # persisted allow/deny decisions
@@ -273,8 +273,8 @@ The following findings were surfaced by an automated deep-code audit of every mo
 2. **Object store `sweep` can cause silent data loss**
    - **Location:** `src/coding/object_store.zig` lines 102–115
    - **Symptom:** Content-addressed blobs referenced by the transcript are deleted, producing `error.ObjectNotFound` on subsequent reads.
-   - **Root cause:** `sweep()` relies on an externally-supplied `keep` list of SHA-256 hashes. If the caller passes an incomplete `keep` list (missing a hash that a `Ref` in `transcript.json` references), the blob is deleted.
-   - **Mitigation:** The `transcript.json` ref-extraction logic must guarantee completeness. Add an assertion that verifies every `Ref` in the transcript resolves to a kept hash before calling `sweep`.
+   - **Root cause:** `sweep()` relies on an externally-supplied `keep` list of SHA-256 hashes. If the caller passes an incomplete `keep` list (missing a hash that a `Ref` in `transcript.jsonl` references), the blob is deleted.
+   - **Mitigation:** The `transcript.jsonl` ref-extraction logic must guarantee completeness. Add an assertion that verifies every `Ref` in the transcript resolves to a kept hash before calling `sweep`.
 
 3. **Grep regex `\b` and word-boundary assertions reject valid model output**
    - **Location:** `src/coding/tools/grep.zig` — regex engine does not support `\b` (ECMAScript subset)
