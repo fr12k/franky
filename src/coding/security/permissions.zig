@@ -457,7 +457,7 @@ pub const Store = struct {
         // `hardDeny` or classifier `block_hard`.
         if (self.auto_enabled) {
             // 7a: hardDeny — check bash-glob patterns + bare tool names.
-            if (self.autoHardDenyMatches(tool_name, args_json)) {
+            if (autoSetMatches(&self.auto_hard_deny, tool_name, args_json)) {
                 return .{
                     .decision = .auto_deny,
                     .rule_name = "[Hard Deny]",
@@ -465,12 +465,12 @@ pub const Store = struct {
                 };
             }
             // 7b: allow exceptions — skip the classifier.
-            if (self.autoAllowMatches(tool_name, args_json)) {
+            if (autoSetMatches(&self.auto_allow, tool_name, args_json)) {
                 return .{ .decision = .auto_allow };
             }
             // 7c: softDeny — check, but allow exceptions already
             // handled above, so a softDeny match blocks.
-            if (self.autoSoftDenyMatches(tool_name, args_json)) {
+            if (autoSetMatches(&self.auto_soft_deny, tool_name, args_json)) {
                 return .{
                     .decision = .auto_deny,
                     .rule_name = "[Soft Deny]",
@@ -508,53 +508,20 @@ pub const Store = struct {
         return .{ .decision = default };
     }
 
-    /// v3.x — true when `tool_name` (or the bash command) matches a
-    /// `hardDeny` entry. Entries are bare tool names, wildcard patterns
-    /// (e.g. `mcp__atlassian__*`), or `Bash(<glob>)` patterns.
-    fn autoHardDenyMatches(self: *const Store, tool_name: []const u8, args_json: []const u8) bool {
-        if (self.auto_hard_deny.contains(tool_name)) return true;
-        if (setMatchesWildcard(&self.auto_hard_deny, tool_name)) return true;
+    /// v3.x — shared matching logic for auto-mode sets.
+    /// Checks exact match, wildcard patterns (e.g. `mcp__atlassian__*`),
+    /// and `Bash(<glob>)` patterns against the bash command.
+    /// Public so config.zig's MCP pre-filter can call it.
+    pub fn autoSetMatches(
+        set: *const std.StringHashMapUnmanaged(void),
+        tool_name: []const u8,
+        args_json: []const u8,
+    ) bool {
+        if (set.contains(tool_name)) return true;
+        if (setMatchesWildcard(set, tool_name)) return true;
         if (std.mem.eql(u8, tool_name, "bash")) {
             const cmd = extractBashCommand(args_json) orelse return false;
-            var it = self.auto_hard_deny.keyIterator();
-            while (it.next()) |k| {
-                if (std.mem.startsWith(u8, k.*, "Bash(")) {
-                    const pat = k.*[5 .. k.*.len - 1]; // strip Bash( ... )
-                    if (auto_mode.bashGlobMatches(pat, cmd)) return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /// v3.x — true when `tool_name` (or the bash command) matches an
-    /// `allow` entry (auto-mode exception). Supports bare tool names,
-    /// wildcard patterns (e.g. `mcp__atlassian__*`), and `Bash(<glob>)`.
-    fn autoAllowMatches(self: *const Store, tool_name: []const u8, args_json: []const u8) bool {
-        if (self.auto_allow.contains(tool_name)) return true;
-        if (setMatchesWildcard(&self.auto_allow, tool_name)) return true;
-        if (std.mem.eql(u8, tool_name, "bash")) {
-            const cmd = extractBashCommand(args_json) orelse return false;
-            var it = self.auto_allow.keyIterator();
-            while (it.next()) |k| {
-                if (std.mem.startsWith(u8, k.*, "Bash(")) {
-                    const pat = k.*[5 .. k.*.len - 1];
-                    if (auto_mode.bashGlobMatches(pat, cmd)) return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /// v3.x — true when `tool_name` (or the bash command) matches a
-    /// `softDeny` entry. Supports bare tool names, wildcard patterns,
-    /// and `Bash(<glob>)`.
-    fn autoSoftDenyMatches(self: *const Store, tool_name: []const u8, args_json: []const u8) bool {
-        if (self.auto_soft_deny.contains(tool_name)) return true;
-        if (setMatchesWildcard(&self.auto_soft_deny, tool_name)) return true;
-        if (std.mem.eql(u8, tool_name, "bash")) {
-            const cmd = extractBashCommand(args_json) orelse return false;
-            var it = self.auto_soft_deny.keyIterator();
+            var it = set.keyIterator();
             while (it.next()) |k| {
                 if (std.mem.startsWith(u8, k.*, "Bash(")) {
                     const pat = k.*[5 .. k.*.len - 1];
@@ -835,21 +802,13 @@ pub const SessionGates = struct {
         switch (dd.decision) {
             .auto_allow => return .{ .block = false },
             .auto_deny => {
-                // v3.x — surface the classifier's rule name + reason
-                // when available, so the user knows what to `allow`.
-                // `rule_name` and `reason` are static string literals
-                // from auto_mode.zig, so we can return them directly.
-                // The agent loop dupes reason_text before use.
-                if (dd.reason) |reason| {
-                    return .{ .block = true, .reason_text = reason };
-                }
-                if (dd.rule_name) |rule| {
-                    return .{ .block = true, .reason_text = rule };
-                }
-                return .{
-                    .block = true,
-                    .reason_text = "permission gate: tool denied by --deny-tools or default policy",
-                };
+                // v3.x — surface the classifier's rule/reason when
+                // available. Both are static string literals from
+                // auto_mode.zig. Prefer `reason` (more actionable);
+                // fall back to `rule_name`, then the generic message.
+                const msg = dd.reason orelse dd.rule_name orelse
+                    "permission gate: tool denied by --deny-tools or default policy";
+                return .{ .block = true, .reason_text = msg };
             },
             .ask => {
                 if (self.prompter) |p| return waitForPrompt(p, store, tool.name, call_id, args_json);

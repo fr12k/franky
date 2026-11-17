@@ -134,12 +134,9 @@ pub const Settings = struct {
     auto_source_control: [][]const u8 = &.{},
     /// `autoMode.environment.trustedDomains` — trusted internal domains.
     auto_trusted_domains: [][]const u8 = &.{},
-    /// `autoMode.environment.trustedBuckets` — trusted cloud buckets.
-    auto_trusted_buckets: [][]const u8 = &.{},
-    /// `autoMode.environment.internalPackageRegistries`.
-    auto_internal_package_registries: [][]const u8 = &.{},
-    /// `autoMode.environment.cicdDeployTargets`.
-    auto_cicd_deploy_targets: [][]const u8 = &.{},
+    // Removed unused settings: auto_trusted_buckets,
+    // auto_internal_package_registries, auto_cicd_deploy_targets —
+    // no classifier rule reads them. They'll be added back when needed.
     /// `autoMode.environment.networkPosture.cloudMetadataReachable`.
     auto_cloud_metadata_reachable: ?bool = null,
     /// `autoMode.allow` — exception entries (override soft blocks).
@@ -197,9 +194,6 @@ pub const Settings = struct {
         deinitStringArray(self.allocator, self.auto_trusted_repos);
         deinitStringArray(self.allocator, self.auto_source_control);
         deinitStringArray(self.allocator, self.auto_trusted_domains);
-        deinitStringArray(self.allocator, self.auto_trusted_buckets);
-        deinitStringArray(self.allocator, self.auto_internal_package_registries);
-        deinitStringArray(self.allocator, self.auto_cicd_deploy_targets);
         deinitStringArray(self.allocator, self.auto_allow);
         deinitStringArray(self.allocator, self.auto_soft_deny);
         deinitStringArray(self.allocator, self.auto_hard_deny);
@@ -449,15 +443,8 @@ fn applyAutoModeSection(settings: *Settings, obj: std.json.ObjectMap) !void {
             if (env.object.get("trustedDomains")) |arr| if (arr == .array) {
                 try appendStringArray(alloc, &settings.auto_trusted_domains, arr.array);
             };
-            if (env.object.get("trustedBuckets")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.auto_trusted_buckets, arr.array);
-            };
-            if (env.object.get("internalPackageRegistries")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.auto_internal_package_registries, arr.array);
-            };
-            if (env.object.get("cicdDeployTargets")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.auto_cicd_deploy_targets, arr.array);
-            };
+            // Removed: trustedBuckets, internalPackageRegistries, cicdDeployTargets
+            // — no classifier rule reads them.
             // networkPosture sub-object.
             if (env.object.get("networkPosture")) |np| if (np == .object) {
                 if (np.object.get("cloudMetadataReachable")) |b| if (b == .bool) {

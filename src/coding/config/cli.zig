@@ -272,9 +272,6 @@ pub const Config = struct {
     /// `permissions.deny` / `permissions.ask` (evaluated first) and
     /// `autoMode.allow` (exceptions that skip the classifier).
     auto: bool = false,
-    /// `--auto-env <json>` — inline `autoMode.environment` override
-    /// for this run (automation / SDK).
-    auto_env_json: ?[]const u8 = null,
     /// `--auto-allow <csv>` — append to `autoMode.allow` for this run
     /// (lift-only, additive over settings).
     auto_allow_csv: ?[]const u8 = null,
@@ -741,8 +738,6 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         cfg.deny_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--ask-tools")) {
         cfg.ask_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
-    } else if (std.mem.eql(u8, name, "--auto-env")) {
-        cfg.auto_env_json = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--auto-allow")) {
         cfg.auto_allow_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--auto-deny")) {
@@ -860,7 +855,6 @@ pub const usage_text: []const u8 =
     \\  --auto                       Enable auto-mode classifier (v3.x): auto-approve
     \\                               routine calls, block destructive/exfiltration ones.
     \\                               Honors permissions.deny/ask; autoMode.allow is exceptions.
-    \\  --auto-env JSON              Inline autoMode.environment override for this run
     \\  --auto-allow LIST            CSV appended to autoMode.allow (additive over settings)
     \\  --auto-deny LIST             CSV appended to autoMode.hardDeny (additive over settings)
     \\  --mcp-configs FILES          Comma-separated MCP server config files (JSON

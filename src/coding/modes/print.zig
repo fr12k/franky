@@ -23,8 +23,6 @@ const at = agent.types;
 const tools_mod = franky.coding.tools;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
-const auto_mode_mod = franky.coding.security.auto_mode;
-const config_resolver = franky.coding.config.resolver;
 const session_mod = franky.coding.session;
 const cli_mod = franky.coding.cli;
 const profiles_mod = franky.coding.profiles;
@@ -1110,24 +1108,6 @@ pub fn applyPermissionsSettingsOverlay(
     }
 }
 
-/// v3.x — auto-mode settings overlay. Delegates to the config
-/// resolver's implementation. Proxy mode calls this via
-/// `print_mode.applyAutoModeSettingsOverlay`.
-pub fn applyAutoModeSettingsOverlay(
-    store: *permissions_mod.Store,
-    settings: *const settings_mod.Settings,
-    cfg: *const cli_mod.Config,
-    arena_allocator: std.mem.Allocator,
-    workspace_root: []const u8,
-) !?*const auto_mode_mod.AutoEnv {
-    return try config_resolver.applyAutoModeSettingsOverlay(
-        store,
-        settings,
-        cfg,
-        arena_allocator,
-        workspace_root,
-    );
-}
 
 /// v1.19.0 — settings-layer default for `--prompts`. CLI flag
 /// always wins. Returns `true` when prompts should be enabled

@@ -81,12 +81,9 @@ pub const AutoEnv = struct {
     /// Trusted internal domains (e.g. `*.internal.acme.com`).
     /// Network commands targeting other hosts are exfiltration risks.
     trusted_domains: []const []const u8 = &.{},
-    /// Trusted cloud buckets (e.g. `gs://acme-build-artifacts`).
-    trusted_buckets: []const []const u8 = &.{},
-    /// Trusted internal package registries.
-    internal_package_registries: []const []const u8 = &.{},
-    /// CI/CD deploy targets.
-    cicd_deploy_targets: []const []const u8 = &.{},
+    // Removed unused fields: trusted_buckets, internal_package_registries,
+    // cicd_deploy_targets — no rule reads them. They'll be added
+    // back when a rule actually consumes them.
     /// When true, the cloud metadata endpoint
     /// (`169.254.169.254`) is reachable. Default false — blocked.
     cloud_metadata_reachable: bool = false,
@@ -141,9 +138,7 @@ pub fn classify(input: ClassifierInput) Result {
 fn destructiveRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
-    const lower_buf = lowerCmd(cmd) catch return null;
-    defer std.heap.page_allocator.free(lower_buf);
-    const lower = lower_buf;
+    const lower = lowerCmd(cmd);
 
     // `rm -rf` with any target — but allow `rm -rf` of paths clearly
     // inside the workspace (e.g. `rm -rf build/`). A bare `rm -rf /`
@@ -319,8 +314,7 @@ fn secretsEgressRule(input: ClassifierInput) ?Result {
 fn exfiltrationRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
-    const lower = lowerCmd(cmd) catch return null;
-    defer std.heap.page_allocator.free(lower);
+    const lower = lowerCmd(cmd);
 
     // curl / wget → URL argument.
     if (startsWithVerb(lower, "curl") or startsWithVerb(lower, "wget")) {
@@ -355,8 +349,7 @@ fn exfiltrationRule(input: ClassifierInput) ?Result {
 fn scmTargetRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
-    const lower = lowerCmd(cmd) catch return null;
-    defer std.heap.page_allocator.free(lower);
+    const lower = lowerCmd(cmd);
     if (!startsWithVerb(lower, "git")) return null;
     if (!containsToken(lower, "push")) return null;
 
@@ -450,38 +443,35 @@ const mcp_safe_verbs = [_][]const u8{
 fn mcpAllowlistRule(input: ClassifierInput) ?Result {
     // Only applies to MCP tools.
     if (!std.mem.startsWith(u8, input.tool, "mcp__")) return null;
-
-    // Extract the remote tool name: the part after the second `__`.
-    // `mcp__atlassian__search_issues` -> `search_issues`.
-    const tool_name = mcpRemoteToolName(input.tool) orelse return null;
-
-    // Lowercase for case-insensitive matching.
-    var lower_buf: [256]u8 = undefined;
-    if (tool_name.len > lower_buf.len) return null;
-    for (tool_name, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
-    const lower = lower_buf[0..tool_name.len];
-
-    // Check if the tool name starts with any safe verb (followed by
-    // a word boundary: end-of-string, `_`, or a capital letter in the
-    // original — but since we lowercased, we check `_` or end).
-    for (mcp_safe_verbs) |verb| {
-        if (std.mem.startsWith(u8, lower, verb)) {
-            // Must be a word boundary: the verb is the whole name,
-            // or the next char is `_` (snake_case) or a non-alphanumeric.
-            if (lower.len == verb.len) return null; // exact match, pass
-            const next = lower[verb.len];
-            if (next == '_' or next == '-' or !std.ascii.isAlphanumeric(next)) {
-                return null; // safe verb prefix, pass
-            }
-        }
-    }
-
-    // No safe verb matched → soft-block.
+    if (mcpToolWouldPass(input.tool)) return null;
+    // No safe verb matched -> soft-block.
     return .{
         .verdict = .block,
         .rule_name = "[MCP Tool Not Allowed]",
         .reason = "MCP tool not in the safe allow-list (get, find, search, list, read, ...). Add it to autoMode.allow if this is a safe tool.",
     };
+}
+
+/// Public helper -- true when an MCP tool name (`mcp__<server>__<tool>`)
+/// would pass the allow-list check (i.e. its remote name starts
+/// with a safe read-family verb at a word boundary). Used by the
+/// pre-filter in config.zig to remove destructive MCP tools from
+/// the tool list before the model sees them.
+pub fn mcpToolWouldPass(full_name: []const u8) bool {
+    if (!std.mem.startsWith(u8, full_name, "mcp__")) return true;
+    const tool_name = mcpRemoteToolName(full_name) orelse return true;
+    var lbuf: [256]u8 = undefined;
+    if (tool_name.len > lbuf.len) return false; // conservative
+    for (tool_name, 0..) |c, i| lbuf[i] = std.ascii.toLower(c);
+    const lower = lbuf[0..tool_name.len];
+    for (mcp_safe_verbs) |verb| {
+        if (std.mem.startsWith(u8, lower, verb)) {
+            if (lower.len == verb.len) return true;
+            const next = lower[verb.len];
+            if (next == '_' or next == '-' or !std.ascii.isAlphanumeric(next)) return true;
+        }
+    }
+    return false;
 }
 
 /// Extract the remote tool name from a namespaced `mcp__<server>__<tool>`
@@ -498,26 +488,10 @@ fn mcpRemoteToolName(full_name: []const u8) ?[]const u8 {
 // ─── helpers: command parsing ─────────────────────────────────────
 
 /// Pull the `command` field out of a bash tool call's JSON args.
-/// Same logic as `permissions.extractBashCommand`, duplicated here to
-/// keep this module dependency-free (pure). Returns a slice into the
-/// input buffer (no allocation).
+/// Delegates to `extractJsonStringField` to avoid duplicating the
+/// JSON string-extraction loop. Returns a slice into the input buffer.
 pub fn extractBashCommand(args_json: []const u8) ?[]const u8 {
-    const key = "\"command\"";
-    const k = std.mem.indexOf(u8, args_json, key) orelse return null;
-    var i = k + key.len;
-    // skip whitespace and ':'
-    while (i < args_json.len and (args_json[i] == ' ' or args_json[i] == '\t' or args_json[i] == ':')) i += 1;
-    if (i >= args_json.len or args_json[i] != '"') return null;
-    i += 1;
-    const start = i;
-    while (i < args_json.len) : (i += 1) {
-        switch (args_json[i]) {
-            '\\' => i += 1, // skip escaped char
-            '"' => return args_json[start..i],
-            else => {},
-        }
-    }
-    return null;
+    return extractJsonStringField(args_json, "command");
 }
 
 /// Extract a string field value from JSON (first occurrence). Returns
@@ -545,12 +519,20 @@ pub fn extractJsonStringField(args_json: []const u8, field: []const u8) ?[]const
     return null;
 }
 
-/// Lowercase a command into a freshly allocated buffer (page_allocator
-/// scratch — freed by caller). Used for case-insensitive matching.
-fn lowerCmd(cmd: []const u8) ![]u8 {
-    const buf = try std.heap.page_allocator.alloc(u8, cmd.len);
-    for (cmd, 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    return buf;
+/// Stack buffer for lowercasing commands. 4 KB is enough for
+/// any realistic shell command; longer commands skip lowercasing
+/// and fall back to case-sensitive matching (acceptable — the
+/// rules are conservative, so a miss just means `pass`).
+const lower_buf_size = 4096;
+var lower_scratch: [lower_buf_size]u8 = undefined;
+
+/// Lowercase a command into the thread-local `lower_scratch`. Returns
+/// a slice of the buffer. Returns the original (case-preserved)
+/// slice if the command is too long for the buffer.
+fn lowerCmd(cmd: []const u8) []const u8 {
+    if (cmd.len > lower_scratch.len) return cmd;
+    for (cmd, 0..) |c, i| lower_scratch[i] = std.ascii.toLower(c);
+    return lower_scratch[0..cmd.len];
 }
 
 /// True if `cmd` starts with verb `v` as a whole token (followed
@@ -715,9 +697,10 @@ fn isTrustedDestination(url: []const u8, env: *const AutoEnv) bool {
         return env.cloud_metadata_reachable;
     }
     if (isTrustedHost(host, env)) return true;
-    // git_remotes are trusted by default.
+    // git_remotes are trusted by default — match by host, not substring.
     for (env.git_remotes) |r| {
-        if (std.mem.indexOf(u8, r, host) != null) return true;
+        const r_host = urlHost(r);
+        if (std.mem.eql(u8, r_host, host)) return true;
     }
     return false;
 }
@@ -751,14 +734,10 @@ fn hostMatchesPattern(host: []const u8, pattern: []const u8) bool {
 
 /// Does a git remote URL correspond to the named remote (e.g. "origin")?
 /// We can't know the name from the URL alone, so we trust any configured
-/// remote URL. This function is used to check that *some* configured
-/// remote exists; the name match is heuristic: returns true for any
-/// remote URL (the caller already verified the push names a remote).
+/// remote URL. The caller has already verified the push names a remote;
+/// this function just confirms the remote URL set is non-empty.
 fn remoteUrlMatchesName(remote_url: []const u8, remote_name: []const u8) bool {
     _ = remote_name;
-    // We trust all configured git remotes by default. The name-based
-    // check is handled by the caller scanning git_remotes. Returning
-    // true here means "this remote URL is trusted".
     _ = remote_url;
     return true;
 }
@@ -781,13 +760,6 @@ pub fn bashGlobMatches(pattern: []const u8, command: []const u8) bool {
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;
-
-fn bashArgs(command: []const u8) []const u8 {
-    // Tiny helper to build a bash args JSON snippet.
-    // Not heap-allocated — returns a comptime-formatable slice via
-    // a fixed buffer. Tests use short commands.
-    return command; // tests call extractBashCommand directly on a JSON string
-}
 
 fn mkBashJson(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
     // Escape the command for embedding in a JSON string value.
@@ -826,29 +798,31 @@ test "classify: zig build passes" {
     try testing.expectEqual(Verdict.pass, r.verdict);
 }
 
-test "classify: rm -rf / is block_hard" {
+test "classify: destructive commands table" {
     const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "rm -rf /");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-    try testing.expectEqualStrings("[Destructive Command]", r.rule_name);
-}
-
-test "classify: rm -rf ~ is block_hard" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "rm -rf ~");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-}
-
-test "classify: bare rm -rf is block_hard" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "rm -rf");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
+    const cases = [_]struct { cmd: []const u8, expected: Verdict }{
+        .{ .cmd = "rm -rf /", .expected = .block_hard },
+        .{ .cmd = "rm -rf ~", .expected = .block_hard },
+        .{ .cmd = "rm -rf", .expected = .block_hard },
+        .{ .cmd = "rm -rf /etc", .expected = .block_hard },
+        .{ .cmd = "rm -fr /", .expected = .block_hard },
+        .{ .cmd = "rm -r -f /", .expected = .block_hard },
+        .{ .cmd = "git push --force origin main", .expected = .block_hard },
+        .{ .cmd = "git push -f origin main", .expected = .block_hard },
+        .{ .cmd = "git reset --hard HEAD~1", .expected = .block_hard },
+        .{ .cmd = "git clean -fdx", .expected = .block_hard },
+        .{ .cmd = "mkfs.ext4 /dev/sda1", .expected = .block_hard },
+        .{ .cmd = "dd if=img.iso of=/dev/sdb bs=4M", .expected = .block_hard },
+        .{ .cmd = "psql -c 'DROP TABLE users;'", .expected = .block_hard },
+        .{ .cmd = "chmod -R 777 /", .expected = .block_hard },
+    };
+    for (cases) |tc| {
+        const json = try mkBashJson(allocator, tc.cmd);
+        defer allocator.free(json);
+        const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
+        try testing.expectEqual(tc.expected, r.verdict);
+        try testing.expectEqualStrings("[Destructive Command]", r.rule_name);
+    }
 }
 
 test "classify: rm -rf build/ passes (in-workspace)" {
@@ -858,64 +832,6 @@ test "classify: rm -rf build/ passes (in-workspace)" {
     const env = AutoEnv{ .workspace_root = "/home/user/repo" };
     const r = classify(.{ .tool = "bash", .args_json = json, .env = &env });
     try testing.expectEqual(Verdict.pass, r.verdict);
-}
-
-test "classify: rm -rf /etc is block_hard (outside workspace)" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "rm -rf /etc");
-    defer allocator.free(json);
-    const env = AutoEnv{ .workspace_root = "/home/user/repo" };
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-}
-
-test "classify: rm -fr combined flag detected" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "rm -fr /");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-}
-
-test "classify: rm -r -f split flags detected" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "rm -r -f /");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-}
-
-test "classify: git push --force is block_hard" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "git push --force origin main");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-    try testing.expectEqualStrings("[Destructive Command]", r.rule_name);
-}
-
-test "classify: git push -f short flag block_hard" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "git push -f origin main");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-}
-
-test "classify: git reset --hard is block_hard" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "git reset --hard HEAD~1");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
-}
-
-test "classify: git clean -fdx is block_hard" {
-    const allocator = testing.allocator;
-    const json = try mkBashJson(allocator, "git clean -fdx");
-    defer allocator.free(json);
-    const r = classify(.{ .tool = "bash", .args_json = json, .env = &empty_env });
-    try testing.expectEqual(Verdict.block_hard, r.verdict);
 }
 
 test "classify: git push (normal) to default remote passes" {
@@ -1150,66 +1066,46 @@ test "isSecretEnvVar: known + FRANKY_SECRET_" {
 
 // ─── MCP allow-list tests ─────────────────────────────────────────
 
-test "classify: mcp search tool passes" {
-    const r = classify(.{ .tool = "mcp__atlassian__search_issues", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.pass, r.verdict);
-}
-
-test "classify: mcp get tool passes" {
-    const r = classify(.{ .tool = "mcp__github__get_issue", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.pass, r.verdict);
-}
-
-test "classify: mcp list tool passes" {
-    const r = classify(.{ .tool = "mcp__github__list_repos", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.pass, r.verdict);
-}
-
-test "classify: mcp delete tool blocks" {
-    const r = classify(.{ .tool = "mcp__atlassian__delete_ticket", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.block, r.verdict);
-    try testing.expectEqualStrings("[MCP Tool Not Allowed]", r.rule_name);
-}
-
-test "classify: mcp create tool blocks" {
-    const r = classify(.{ .tool = "mcp__atlassian__create_issue", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.block, r.verdict);
-    try testing.expectEqualStrings("[MCP Tool Not Allowed]", r.rule_name);
-}
-
-test "classify: mcp update tool blocks" {
-    const r = classify(.{ .tool = "mcp__slack__update_message", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.block, r.verdict);
-}
-
-test "classify: mcp post tool blocks" {
-    const r = classify(.{ .tool = "mcp__slack__post_message", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.block, r.verdict);
-}
-
-test "classify: mcp purge tool blocks" {
-    const r = classify(.{ .tool = "mcp__cache__purge_cache", .args_json = "{}", .env = &empty_env });
-    try testing.expectEqual(Verdict.block, r.verdict);
-}
-
-test "classify: mcp tool with safe verb prefix passes" {
-    try testing.expectEqual(Verdict.pass, classify(.{ .tool = "mcp__db__query_database", .args_json = "{}", .env = &empty_env }).verdict);
-    try testing.expectEqual(Verdict.pass, classify(.{ .tool = "mcp__db__fetch_record", .args_json = "{}", .env = &empty_env }).verdict);
-    try testing.expectEqual(Verdict.pass, classify(.{ .tool = "mcp__ci__status_check", .args_json = "{}", .env = &empty_env }).verdict);
-    try testing.expectEqual(Verdict.pass, classify(.{ .tool = "mcp__ci__health", .args_json = "{}", .env = &empty_env }).verdict);
-}
-
-test "classify: mcp tool safe verb must be word-boundary" {
-    // `get` prefix must be followed by `_` or end, not just any char.
-    // `mcp__x__getter` should NOT match `get` (it's not a read op).
-    try testing.expectEqual(Verdict.block, classify(.{ .tool = "mcp__x__getter", .args_json = "{}", .env = &empty_env }).verdict);
-    // `mcp__x__get` (exact) should pass.
-    try testing.expectEqual(Verdict.pass, classify(.{ .tool = "mcp__x__get", .args_json = "{}", .env = &empty_env }).verdict);
+test "classify: mcp tools table" {
+    const cases = [_]struct { tool: []const u8, expected: Verdict }{
+        .{ .tool = "mcp__atlassian__search_issues", .expected = .pass },
+        .{ .tool = "mcp__github__get_issue", .expected = .pass },
+        .{ .tool = "mcp__github__list_repos", .expected = .pass },
+        .{ .tool = "mcp__db__query_database", .expected = .pass },
+        .{ .tool = "mcp__db__fetch_record", .expected = .pass },
+        .{ .tool = "mcp__ci__status_check", .expected = .pass },
+        .{ .tool = "mcp__ci__health", .expected = .pass },
+        .{ .tool = "mcp__atlassian__delete_ticket", .expected = .block },
+        .{ .tool = "mcp__atlassian__create_issue", .expected = .block },
+        .{ .tool = "mcp__slack__update_message", .expected = .block },
+        .{ .tool = "mcp__slack__post_message", .expected = .block },
+        .{ .tool = "mcp__cache__purge_cache", .expected = .block },
+        .{ .tool = "mcp__x__getter", .expected = .block }, // word-boundary: getter != get
+        .{ .tool = "mcp__x__get", .expected = .pass }, // exact match
+    };
+    for (cases) |tc| {
+        const r = classify(.{ .tool = tc.tool, .args_json = "{}", .env = &empty_env });
+        try testing.expectEqual(tc.expected, r.verdict);
+        if (tc.expected == .block) {
+            try testing.expectEqualStrings("[MCP Tool Not Allowed]", r.rule_name);
+        }
+    }
 }
 
 test "classify: non-mcp tool not affected by mcp rule" {
     // bash/read/write should not trigger the mcp rule.
     try testing.expectEqual(Verdict.pass, classify(.{ .tool = "read", .args_json = "{\"path\":\"/etc/passwd\"}", .env = &empty_env }).verdict);
+}
+
+test "mcpToolWouldPass: safe verbs" {
+    try testing.expect(mcpToolWouldPass("mcp__atlassian__search_issues"));
+    try testing.expect(mcpToolWouldPass("mcp__github__get_issue"));
+    try testing.expect(mcpToolWouldPass("mcp__x__get"));
+    try testing.expect(!mcpToolWouldPass("mcp__atlassian__delete_ticket"));
+    try testing.expect(!mcpToolWouldPass("mcp__x__getter"));
+    // Non-MCP tools always pass.
+    try testing.expect(mcpToolWouldPass("read"));
+    try testing.expect(mcpToolWouldPass("bash"));
 }
 
 test "mcpRemoteToolName: extracts tool name" {

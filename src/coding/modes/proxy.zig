@@ -814,13 +814,13 @@ pub fn initSession(
         // (settings arrays are stack-scoped here). The AutoEnv is
         // allocated on `allocator` (session-owned, outlives this block).
         const proxy_ws_root = environ.getPosix("PWD") orelse "";
-        _ = try print_mode.applyAutoModeSettingsOverlay(
+        _ = try config_mod.applyAutoModeSettingsOverlay(
             &permission_store,
             &settings,
             cfg,
             allocator,
             proxy_ws_root,
-        ) orelse {};
+        );
         // Re-check: auto mode may enable the gate even without --prompts.
         if (permission_store.auto_enabled) prompts_enabled = true;
     }
@@ -937,6 +937,13 @@ pub fn initSession(
         const ra_mcp = session.role_arena.allocator();
         session.tools = try config_mod.discoverMcpTools(
             ra_mcp, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+        );
+    }
+    // v3.x — auto-mode MCP pre-filter: remove destructive MCP tools.
+    if (permission_store.auto_enabled) {
+        const ra_pf = session.role_arena.allocator();
+        session.tools = try config_mod.filterMcpToolsForAutoMode(
+            ra_pf, session.tools, &permission_store,
         );
     }
     // No resume_loaded cleanup — SessionState.init() handled

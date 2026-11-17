@@ -557,26 +557,25 @@ pub fn applyPermissionsSettingsOverlay(
 /// sets. The store borrows the `AutoEnv` pointer (arena-owned, session
 /// lifetime) and the set entries (settings-owned, session lifetime).
 ///
-/// Returns `true` when auto mode should be enabled (either CLI
-/// `--auto` is set OR the settings layer has auto-mode entries).
-/// The caller uses this to decide whether to attach the permission
-/// gate even when `--prompts` is off.
+/// Returns `true` when auto mode was enabled. The caller uses this
+/// to decide whether to attach the permission gate even when
+/// `--prompts` is off.
 pub fn applyAutoModeSettingsOverlay(
     store: *permissions_mod.Store,
     settings: *const settings_mod.Settings,
     cfg: *const cli_mod.Config,
     arena_allocator: std.mem.Allocator,
     workspace_root: []const u8,
-) !?*const auto_mode_mod.AutoEnv {
-    // Determine if auto mode is on.
-    const has_settings_entries = settings.auto_allow.len > 0 or
+) !bool {
+    // Auto mode is enabled when --auto is set OR the settings layer
+    // has allow/deny entries. Environment-only settings (trusted
+    // repos, domains) don't enable auto mode on their own — they're
+    // only meaningful when the classifier is already on.
+    const auto_on = cfg.auto or
+        settings.auto_allow.len > 0 or
         settings.auto_soft_deny.len > 0 or
-        settings.auto_hard_deny.len > 0 or
-        settings.auto_trusted_repos.len > 0 or
-        settings.auto_source_control.len > 0 or
-        settings.auto_trusted_domains.len > 0;
-    const auto_on = cfg.auto or has_settings_entries;
-    if (!auto_on) return null;
+        settings.auto_hard_deny.len > 0;
+    if (!auto_on) return false;
 
     // Build AutoEnv on the arena.
     const env = try arena_allocator.create(auto_mode_mod.AutoEnv);
@@ -584,9 +583,8 @@ pub fn applyAutoModeSettingsOverlay(
     env.trusted_repos = settings.auto_trusted_repos;
     env.source_control = settings.auto_source_control;
     env.trusted_domains = settings.auto_trusted_domains;
-    env.trusted_buckets = settings.auto_trusted_buckets;
-    env.internal_package_registries = settings.auto_internal_package_registries;
-    env.cicd_deploy_targets = settings.auto_cicd_deploy_targets;
+    // Removed: trusted_buckets, internal_package_registries, cicd_deploy_targets
+    // — no classifier rule reads them.
     env.cloud_metadata_reachable = settings.auto_cloud_metadata_reachable orelse false;
     env.workspace_root = settings.auto_workspace_root orelse workspace_root;
 
@@ -626,11 +624,7 @@ pub fn applyAutoModeSettingsOverlay(
         }
     }
 
-    // TODO: parse cfg.auto_env_json inline override and merge into env.
-    // For v1 we rely on settings.json for environment config; the CLI
-    // flag is accepted but the merge is a follow-up.
-
-    return env;
+    return true;
 }
 
 /// Resolve prompts default from settings when CLI didn't set it.
@@ -1158,6 +1152,41 @@ pub const BaseToolInputs = struct {
 /// `resolve()` calls this internally; rpc/proxy can call it directly when
 /// they need session-owned ctx pointers (build with null ctx first, then
 /// patch the tool.ctx field after the session struct is initialized).
+/// v3.x — pre-filter MCP tools for auto mode. Removes any MCP tool
+/// (`mcp__<server>__<tool>`) that the classifier would block (not
+/// in the safe allow-list) AND that isn't in `autoMode.allow` (exact
+/// or wildcard). This prevents the model from seeing destructive
+/// MCP tools, saving a wasted turn on an inevitable denial.
+///
+/// Non-MCP tools pass through unchanged. When auto mode is off,
+/// the caller skips this function entirely.
+pub fn filterMcpToolsForAutoMode(
+    allocator: std.mem.Allocator,
+    all: []const at.AgentTool,
+    store: *const permissions_mod.Store,
+) ![]at.AgentTool {
+    var out: std.ArrayList(at.AgentTool) = .empty;
+    errdefer out.deinit(allocator);
+    for (all) |t| {
+        if (!std.mem.startsWith(u8, t.name, "mcp__")) {
+            try out.append(allocator, t);
+            continue;
+        }
+        // Check autoMode.allow (exact + wildcard) first.
+        if (permissions_mod.Store.autoSetMatches(&store.auto_allow, t.name, "{}")) {
+            try out.append(allocator, t);
+            continue;
+        }
+        // Check the safe allow-list.
+        if (auto_mode_mod.mcpToolWouldPass(t.name)) {
+            try out.append(allocator, t);
+            continue;
+        }
+        // Tool would be blocked — skip it.
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn buildBaseToolSet(
     allocator: std.mem.Allocator,
     role: role_mod.Role,
@@ -1435,14 +1464,13 @@ pub fn resolve(
     // --prompts is off. The gate is attached below when either
     // prompts or auto mode is active.
     const ws_root: []const u8 = if (workspace_state) |ws| ws.root else "";
-    const auto_env = try applyAutoModeSettingsOverlay(
+    const auto_enabled = try applyAutoModeSettingsOverlay(
         permission_store,
         &settings,
         cfg,
         a,
         ws_root,
     );
-    const auto_enabled = auto_env != null;
 
     try permissions_mod.maybeAttachPersistence(
         permission_store,
@@ -1554,8 +1582,18 @@ pub fn resolve(
     var mcp_client_ptr: ?*mcp_mod.McpClient = null;
     const final_with_mcp = try discoverMcpTools(a, io, cfg, environ_map, all_final_tools, &mcp_client_ptr);
 
+    // v3.x — auto-mode MCP pre-filter: remove MCP tools that the
+    // classifier would block (not in the safe allow-list) AND that
+    // aren't in autoMode.allow. This prevents the model from even
+    // seeing destructive MCP tools like `delete_ticket`, saving a
+    // wasted turn + tokens on an inevitable denial.
+    const final_filtered = if (permission_store.auto_enabled)
+        try filterMcpToolsForAutoMode(a, final_with_mcp, permission_store)
+    else
+        final_with_mcp;
+
     // Update subagent ctx's parent_tools to include MCP tools.
-    subagent_ctx.parent_tools = final_with_mcp;
+    subagent_ctx.parent_tools = final_filtered;
 
     // ── Step 14: Build review config block ───────────────────────
     const review_block = try buildReviewConfigBlock(a, &settings);
@@ -1609,7 +1647,7 @@ pub fn resolve(
         .max_full_tool_results = settings.max_full_tool_results orelse 0,
         .registry = reg,
         .faux_provider = faux_ptr,
-        .tools = final_with_mcp,
+        .tools = final_filtered,
         .permission_store = permission_store,
         .session_gates = session_gates,
         .preset_registry = preset_registry,
