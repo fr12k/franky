@@ -810,11 +810,25 @@ pub fn initSession(
                 },
             );
         }
+        // v3.x — auto-mode overlay. Must run inside the settings block
+        // (settings arrays are stack-scoped here). The AutoEnv is
+        // allocated on `allocator` (session-owned, outlives this block).
+        const proxy_ws_root = environ.getPosix("PWD") orelse "";
+        _ = try print_mode.applyAutoModeSettingsOverlay(
+            &permission_store,
+            &settings,
+            cfg,
+            allocator,
+            proxy_ws_root,
+        ) orelse {};
+        // Re-check: auto mode may enable the gate even without --prompts.
+        if (permission_store.auto_enabled) prompts_enabled = true;
     }
     if (cfg.yes) permission_store.yes_to_all = true;
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
     if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
     if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
+
     try permissions_mod.maybeAttachPersistence(
         &permission_store,
         cfg.remember_permissions,

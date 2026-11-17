@@ -121,6 +121,37 @@ pub const Settings = struct {
     /// `Store`. Deny beats allow.
     permissions_always_deny_bash: [][]const u8 = &.{},
 
+    // ─── v3.x — auto-mode settings (user layer only) ──────────────
+    // `autoMode` is read ONLY from the user settings layer
+    // (`$FRANKY_HOME/settings.json`) and `--settings` inline JSON,
+    // never from the project layer. This prevents a checked-in repo
+    // from injecting its own allow rules. The loader skips the
+    // `autoMode` key when reading the project layer.
+
+    /// `autoMode.environment.trustedRepos` — trusted git remote globs.
+    auto_trusted_repos: [][]const u8 = &.{},
+    /// `autoMode.environment.sourceControl` — trusted SCM hosts.
+    auto_source_control: [][]const u8 = &.{},
+    /// `autoMode.environment.trustedDomains` — trusted internal domains.
+    auto_trusted_domains: [][]const u8 = &.{},
+    /// `autoMode.environment.trustedBuckets` — trusted cloud buckets.
+    auto_trusted_buckets: [][]const u8 = &.{},
+    /// `autoMode.environment.internalPackageRegistries`.
+    auto_internal_package_registries: [][]const u8 = &.{},
+    /// `autoMode.environment.cicdDeployTargets`.
+    auto_cicd_deploy_targets: [][]const u8 = &.{},
+    /// `autoMode.environment.networkPosture.cloudMetadataReachable`.
+    auto_cloud_metadata_reachable: ?bool = null,
+    /// `autoMode.allow` — exception entries (override soft blocks).
+    auto_allow: [][]const u8 = &.{},
+    /// `autoMode.softDeny` — soft block entries.
+    auto_soft_deny: [][]const u8 = &.{},
+    /// `autoMode.hardDeny` — hard block entries (never, even with allow).
+    auto_hard_deny: [][]const u8 = &.{},
+    /// `autoMode.workspaceRoot` — explicit workspace root override.
+    /// When null, the session cwd is used.
+    auto_workspace_root: ?[]const u8 = null,
+
     /// `prompts: bool` — settings-layer toggle for the per-tool
     /// permission overlay (§5.11). CLI `--prompts` still wins.
     prompts_default: ?bool = null,
@@ -162,6 +193,17 @@ pub const Settings = struct {
         deinitStringArray(self.allocator, self.permissions_always_allow_bash);
         deinitStringArray(self.allocator, self.permissions_always_deny_tools);
         deinitStringArray(self.allocator, self.permissions_always_deny_bash);
+        // v3.x — auto-mode arrays.
+        deinitStringArray(self.allocator, self.auto_trusted_repos);
+        deinitStringArray(self.allocator, self.auto_source_control);
+        deinitStringArray(self.allocator, self.auto_trusted_domains);
+        deinitStringArray(self.allocator, self.auto_trusted_buckets);
+        deinitStringArray(self.allocator, self.auto_internal_package_registries);
+        deinitStringArray(self.allocator, self.auto_cicd_deploy_targets);
+        deinitStringArray(self.allocator, self.auto_allow);
+        deinitStringArray(self.allocator, self.auto_soft_deny);
+        deinitStringArray(self.allocator, self.auto_hard_deny);
+        if (self.auto_workspace_root) |s| self.allocator.free(s);
         deinitStringArray(self.allocator, self.review_profiles);
         self.* = undefined;
     }
@@ -224,6 +266,12 @@ pub fn defaults(allocator: std.mem.Allocator) !Settings {
     };
 }
 
+/// v3.x — which settings layer is being applied. `autoMode`
+/// is read ONLY from the user layer (and inline `--settings`),
+/// never from the project layer, so a checked-in repo can't
+/// inject its own allow rules.
+const Layer = enum { user, project, inline_ };
+
 /// Read + merge: user → project layered on top of defaults. Each
 /// layer is optional; a missing file is not an error.
 pub fn loadLayered(
@@ -240,19 +288,19 @@ pub fn loadLayered(
     if (home_dir) |hd| {
         const path = try std.fs.path.join(allocator, &.{ hd, ".franky", "settings.json" });
         defer allocator.free(path);
-        loaded_any_layer = (try applyLayer(&settings, io, path)) or loaded_any_layer;
+        loaded_any_layer = (try applyLayer(&settings, io, path, .user)) or loaded_any_layer;
     }
     if (project_dir) |pd| {
         const path = try std.fs.path.join(allocator, &.{ pd, ".franky", "settings.json" });
         defer allocator.free(path);
-        loaded_any_layer = (try applyLayer(&settings, io, path)) or loaded_any_layer;
+        loaded_any_layer = (try applyLayer(&settings, io, path, .project)) or loaded_any_layer;
     }
 
     // If no settings layer is readable, fall back to the settings.json that was
     // present in the checkout at compile time. Tests keep the old pure-defaults
     // behavior so existing fixture expectations remain local and deterministic.
     if (!loaded_any_layer and !builtin.is_test) {
-        try applyLayerBytes(&settings, embedded_settings_json);
+        try applyLayerBytes(&settings, embedded_settings_json, .inline_);
     }
     return settings;
 }
@@ -383,6 +431,58 @@ fn applyPermissionsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     };
 }
 
+/// v3.x — parse the `autoMode` settings block. Called ONLY from
+/// the user + inline layers (never project — enforced by
+/// `applyLayerBytes`). Arrays concatenate across layers (user then
+/// inline); scalars use last-write-wins.
+fn applyAutoModeSection(settings: *Settings, obj: std.json.ObjectMap) !void {
+    const alloc = settings.allocator;
+    if (obj.get("autoMode")) |am| if (am == .object) {
+        // environment sub-object.
+        if (am.object.get("environment")) |env| if (env == .object) {
+            if (env.object.get("trustedRepos")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.auto_trusted_repos, arr.array);
+            };
+            if (env.object.get("sourceControl")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.auto_source_control, arr.array);
+            };
+            if (env.object.get("trustedDomains")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.auto_trusted_domains, arr.array);
+            };
+            if (env.object.get("trustedBuckets")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.auto_trusted_buckets, arr.array);
+            };
+            if (env.object.get("internalPackageRegistries")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.auto_internal_package_registries, arr.array);
+            };
+            if (env.object.get("cicdDeployTargets")) |arr| if (arr == .array) {
+                try appendStringArray(alloc, &settings.auto_cicd_deploy_targets, arr.array);
+            };
+            // networkPosture sub-object.
+            if (env.object.get("networkPosture")) |np| if (np == .object) {
+                if (np.object.get("cloudMetadataReachable")) |b| if (b == .bool) {
+                    settings.auto_cloud_metadata_reachable = b.bool;
+                };
+            };
+            // workspaceRoot override.
+            if (env.object.get("workspaceRoot")) |wr| if (wr == .string) {
+                if (settings.auto_workspace_root) |old| alloc.free(old);
+                settings.auto_workspace_root = try alloc.dupe(u8, wr.string);
+            };
+        };
+        // allow / softDeny / hardDeny arrays.
+        if (am.object.get("allow")) |arr| if (arr == .array) {
+            try appendStringArray(alloc, &settings.auto_allow, arr.array);
+        };
+        if (am.object.get("softDeny")) |arr| if (arr == .array) {
+            try appendStringArray(alloc, &settings.auto_soft_deny, arr.array);
+        };
+        if (am.object.get("hardDeny")) |arr| if (arr == .array) {
+            try appendStringArray(alloc, &settings.auto_hard_deny, arr.array);
+        };
+    };
+}
+
 fn applyReviewSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     const alloc = settings.allocator;
     if (obj.get("review")) |rev_v| if (rev_v == .object) {
@@ -405,7 +505,7 @@ fn applyReviewSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     };
 }
 
-fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !bool {
+fn applyLayer(settings: *Settings, io: std.Io, path: []const u8, layer: Layer) !bool {
     const alloc = settings.allocator;
     // Scratch arena for the file read only; JSON parsing has its own scratch in
     // applyLayerBytes.
@@ -422,11 +522,11 @@ fn applyLayer(settings: *Settings, io: std.Io, path: []const u8) !bool {
     const buf = sa.alloc(u8, @intCast(len)) catch return false;
     const n = f.readPositionalAll(io, buf, 0) catch return false;
 
-    try applyLayerBytes(settings, buf[0..n]);
+    try applyLayerBytes(settings, buf[0..n], layer);
     return true;
 }
 
-fn applyLayerBytes(settings: *Settings, bytes: []const u8) !void {
+fn applyLayerBytes(settings: *Settings, bytes: []const u8, layer: Layer) !void {
     const alloc = settings.allocator;
     // Scratch arena for the JSON parse only; applied values are duped onto the
     // Settings allocator before this function returns.
@@ -456,6 +556,11 @@ fn applyLayerBytes(settings: *Settings, bytes: []const u8) !void {
     };
 
     try applyReviewSection(settings, obj);
+
+    // v3.x — autoMode: only from user + inline layers, never project.
+    if (layer != .project) {
+        try applyAutoModeSection(settings, obj);
+    }
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -808,4 +913,90 @@ test "loadLayered: review.profiles concatenate across layers (A2)" {
     defer s.deinit();
     // Both layers contribute; order is user-layer first, project-layer second.
     try testing.expectEqual(@as(usize, 3), s.review_profiles.len);
+}
+
+// ─── v3.x — autoMode settings tests ───────────────────────────────
+
+test "loadLayered: autoMode parsed from user layer" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const home = "/tmp/franky_auto_home";
+    const proj = "/tmp/franky_auto_proj";
+    _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, home ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, home ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"autoMode":{"environment":{"trustedDomains":["*.internal.acme.com"],"sourceControl":["github.com"]},"allow":["Bash(go test *)"],"hardDeny":["Bash(rm -rf *)"]}}
+        );
+    }
+    var s = try loadLayered(gpa, io, proj, home);
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 1), s.auto_trusted_domains.len);
+    try testing.expectEqualStrings("*.internal.acme.com", s.auto_trusted_domains[0]);
+    try testing.expectEqual(@as(usize, 1), s.auto_source_control.len);
+    try testing.expectEqualStrings("github.com", s.auto_source_control[0]);
+    try testing.expectEqual(@as(usize, 1), s.auto_allow.len);
+    try testing.expectEqualStrings("Bash(go test *)", s.auto_allow[0]);
+    try testing.expectEqual(@as(usize, 1), s.auto_hard_deny.len);
+    try testing.expectEqualStrings("Bash(rm -rf *)", s.auto_hard_deny[0]);
+}
+
+test "loadLayered: autoMode ignored from project layer" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const home = "/tmp/franky_auto_ign_home";
+    const proj = "/tmp/franky_auto_ign_proj";
+    _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, proj ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, proj ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"autoMode":{"allow":["Bash(evil *)"]}}
+        );
+    }
+    // No user layer — project layer's autoMode must be ignored.
+    var s = try loadLayered(gpa, io, proj, "/tmp/franky_auto_ign_nohome");
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 0), s.auto_allow.len);
+}
+
+test "loadLayered: autoMode networkPosture.cloudMetadataReachable" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const home = "/tmp/franky_auto_meta_home";
+    const proj = "/tmp/franky_auto_meta_proj";
+    _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, home) catch {};
+    defer _ = std.Io.Dir.cwd().deleteTree(io, proj) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, home ++ "/.franky");
+    {
+        var f = try std.Io.Dir.cwd().createFile(io, home ++ "/.franky/settings.json", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io,
+            \\{"autoMode":{"environment":{"networkPosture":{"cloudMetadataReachable":true}}}}
+        );
+    }
+    var s = try loadLayered(gpa, io, proj, home);
+    defer s.deinit();
+    try testing.expect(s.auto_cloud_metadata_reachable != null);
+    try testing.expect(s.auto_cloud_metadata_reachable.?);
 }

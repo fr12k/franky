@@ -30,6 +30,7 @@ const auth_mod = franky.coding.auth;
 const models_mod = franky.coding.models;
 const role_mod = franky.coding.role;
 const permissions_mod = franky.coding.permissions;
+const auto_mode_mod = franky.coding.security.auto_mode;
 const skills_mod = franky.coding.skills;
 const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
@@ -549,6 +550,87 @@ pub fn applyPermissionsSettingsOverlay(
     for (settings.permissions_always_deny_bash) |fp| {
         try store.addBareEntry(fp, .deny, true);
     }
+}
+
+/// v3.x — apply `autoMode` settings overlay onto the permission store.
+/// Builds the `AutoEnv` on the config arena and seeds the auto-mode
+/// sets. The store borrows the `AutoEnv` pointer (arena-owned, session
+/// lifetime) and the set entries (settings-owned, session lifetime).
+///
+/// Returns `true` when auto mode should be enabled (either CLI
+/// `--auto` is set OR the settings layer has auto-mode entries).
+/// The caller uses this to decide whether to attach the permission
+/// gate even when `--prompts` is off.
+pub fn applyAutoModeSettingsOverlay(
+    store: *permissions_mod.Store,
+    settings: *const settings_mod.Settings,
+    cfg: *const cli_mod.Config,
+    arena_allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+) !?*const auto_mode_mod.AutoEnv {
+    // Determine if auto mode is on.
+    const has_settings_entries = settings.auto_allow.len > 0 or
+        settings.auto_soft_deny.len > 0 or
+        settings.auto_hard_deny.len > 0 or
+        settings.auto_trusted_repos.len > 0 or
+        settings.auto_source_control.len > 0 or
+        settings.auto_trusted_domains.len > 0;
+    const auto_on = cfg.auto or has_settings_entries;
+    if (!auto_on) return null;
+
+    // Build AutoEnv on the arena.
+    const env = try arena_allocator.create(auto_mode_mod.AutoEnv);
+    env.* = .{};
+    env.trusted_repos = settings.auto_trusted_repos;
+    env.source_control = settings.auto_source_control;
+    env.trusted_domains = settings.auto_trusted_domains;
+    env.trusted_buckets = settings.auto_trusted_buckets;
+    env.internal_package_registries = settings.auto_internal_package_registries;
+    env.cicd_deploy_targets = settings.auto_cicd_deploy_targets;
+    env.cloud_metadata_reachable = settings.auto_cloud_metadata_reachable orelse false;
+    env.workspace_root = settings.auto_workspace_root orelse workspace_root;
+
+    // Wire into store.
+    store.auto_enabled = true;
+    store.auto_env = env;
+
+    // Seed auto-mode sets (borrowed entries from settings).
+    for (settings.auto_allow) |entry| {
+        try store.addAutoEntry(entry, .allow);
+    }
+    for (settings.auto_soft_deny) |entry| {
+        try store.addAutoEntry(entry, .soft_deny);
+    }
+    for (settings.auto_hard_deny) |entry| {
+        try store.addAutoEntry(entry, .hard_deny);
+    }
+
+    // CLI overlays (additive, lift-only). Parse CSV into arena-owned
+    // slices and add to the sets.
+    if (cfg.auto_allow_csv) |csv| {
+        var it = std.mem.splitScalar(u8, csv, ',');
+        while (it.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (trimmed.len == 0) continue;
+            const owned = try arena_allocator.dupe(u8, trimmed);
+            try store.addAutoEntry(owned, .allow);
+        }
+    }
+    if (cfg.auto_deny_csv) |csv| {
+        var it = std.mem.splitScalar(u8, csv, ',');
+        while (it.next()) |entry| {
+            const trimmed = std.mem.trim(u8, entry, " \t");
+            if (trimmed.len == 0) continue;
+            const owned = try arena_allocator.dupe(u8, trimmed);
+            try store.addAutoEntry(owned, .hard_deny);
+        }
+    }
+
+    // TODO: parse cfg.auto_env_json inline override and merge into env.
+    // For v1 we rely on settings.json for environment config; the CLI
+    // flag is accepted but the merge is a follow-up.
+
+    return env;
 }
 
 /// Resolve prompts default from settings when CLI didn't set it.
@@ -1348,6 +1430,20 @@ pub fn resolve(
     if (cfg.allow_tools_csv) |s| try permission_store.addAllowList(s);
     if (cfg.deny_tools_csv) |s| try permission_store.addDenyList(s);
     if (cfg.ask_tools_csv) |s| try permission_store.addAskList(s);
+
+    // v3.x — auto-mode overlay. Enables the classifier even when
+    // --prompts is off. The gate is attached below when either
+    // prompts or auto mode is active.
+    const ws_root: []const u8 = if (workspace_state) |ws| ws.root else "";
+    const auto_env = try applyAutoModeSettingsOverlay(
+        permission_store,
+        &settings,
+        cfg,
+        a,
+        ws_root,
+    );
+    const auto_enabled = auto_env != null;
+
     try permissions_mod.maybeAttachPersistence(
         permission_store,
         cfg.remember_permissions,
@@ -1359,7 +1455,7 @@ pub fn resolve(
     errdefer a.destroy(session_gates);
     session_gates.* = .{
         .role = role_gate,
-        .permissions = if (prompts_enabled) permission_store else null,
+        .permissions = if (prompts_enabled or auto_enabled) permission_store else null,
     };
 
     // ── Step 10: Preset registry + extensions ────────────────────
