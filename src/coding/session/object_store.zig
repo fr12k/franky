@@ -8,7 +8,7 @@
 //! set (basic GC).
 //!
 //! Scope note (v0.6.1): this module ships the primitives. Wiring them
-//! into `transcript.json` serialization — emitting
+//! into `transcript.jsonl` serialization — emitting
 //! `{"$ref":"sha256:<hex>"}` when a content block is external — is a
 //! follow-up sub-pass that reshapes the transcript JSON shape. The
 //! primitives below are tested end-to-end on tmpdirs.
@@ -16,7 +16,7 @@
 const std = @import("std");
 const session_mod = @import("persistence.zig");
 
-/// Blobs smaller than this stay inline in `transcript.json`.
+/// Blobs smaller than this stay inline in `transcript.jsonl`.
 /// Blobs at or above this size are stored in `objects/`.
 pub const inline_threshold_bytes: usize = 32 * 1024;
 

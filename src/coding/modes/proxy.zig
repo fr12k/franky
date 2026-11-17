@@ -439,7 +439,7 @@ pub const Session = struct {
     //
     // When `parent_dir` is non-null we mirror what print mode's
     // SessionState does: every successful `runOneTurn` saves
-    // `<parent_dir>/<session_id>/{session.json, transcript.json}`
+    // `<parent_dir>/<session_id>/{session.json, transcript.jsonl}`
     // atomically. `--no-session` disables persistence and leaves
     // both disk fields null.
     //
@@ -950,7 +950,7 @@ pub fn initSession(
     // persistent sessions (parent_dir non-null).
     {
         const tfile: ?[]const u8 = if (session.parent_dir) |parent|
-            std.fs.path.join(session.role_arena.allocator(), &.{ parent, session.session_id, "transcript.json" }) catch null
+            std.fs.path.join(session.role_arena.allocator(), &.{ parent, session.session_id, "transcript.jsonl" }) catch null
         else
             null;
         session.bash_state.setSessionMetadata(
@@ -3342,18 +3342,51 @@ fn countTranscriptMessages(
     io: std.Io,
     session_dir: []const u8,
 ) !u32 {
+    // v1.30.0 — prefer the JSON Lines file; fall back to the legacy
+    // single-JSON `transcript.json` when the `.jsonl` is absent.
+    const cwd = std.Io.Dir.cwd();
+
+    const jsonl_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.jsonl" });
+    defer allocator.free(jsonl_path);
+    if (cwd.openFile(io, jsonl_path, .{})) |*f_const| {
+        var f = f_const.*;
+        defer f.close(io);
+        const len = try f.length(io);
+        const len_usize: usize = @intCast(len);
+        if (len_usize > 4 * 1024 * 1024) return 0; // 4 MiB cap; tolerate big sessions silently
+        const bytes = try allocator.alloc(u8, len_usize);
+        defer allocator.free(bytes);
+        const n = try f.readPositionalAll(io, bytes, 0);
+        // Count non-empty lines, subtracting the meta header (type:"meta")
+        // if present. This is cheaper than parsing each line as JSON.
+        var count: u32 = 0;
+        var saw_meta = false;
+        var it = std.mem.splitScalar(u8, bytes[0..n], '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (!saw_meta and std.mem.indexOf(u8, line, "\"type\":\"meta\"") != null) {
+                saw_meta = true;
+                continue;
+            }
+            count += 1;
+        }
+        return count;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    // Legacy single-JSON transcript.
     const path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
     defer allocator.free(path);
-
-    const cwd = std.Io.Dir.cwd();
-    var f = cwd.openFile(io, path, .{}) catch |err| switch (err) {
+    var f = cwd.openFile(io, path, .{}) catch |err2| switch (err2) {
         error.FileNotFound => return 0,
-        else => return err,
+        else => return err2,
     };
     defer f.close(io);
     const len = try f.length(io);
     const len_usize: usize = @intCast(len);
-    if (len_usize > 4 * 1024 * 1024) return 0; // 4 MiB cap; tolerate big sessions silently
+    if (len_usize > 4 * 1024 * 1024) return 0;
     const bytes = try allocator.alloc(u8, len_usize);
     defer allocator.free(bytes);
     const n = try f.readPositionalAll(io, bytes, 0);
@@ -3729,7 +3762,7 @@ fn updateBashStateForSession(session: *Session) void {
     }
     // Env metadata: session id + transcript path + provider/model.
     const tfile: ?[]const u8 = if (session.parent_dir) |parent|
-        std.fs.path.join(session.role_arena.allocator(), &.{ parent, session.session_id, "transcript.json" }) catch null
+        std.fs.path.join(session.role_arena.allocator(), &.{ parent, session.session_id, "transcript.jsonl" }) catch null
     else
         null;
     session.bash_state.setSessionMetadata(

@@ -2,19 +2,27 @@
 //!
 //! Implemented subset:
 //!   - ULID session ids.
-//!   - `session.json` + `transcript.json` round-trip.
+//!   - `session.json` + `transcript.jsonl` round-trip (JSON Lines —
+//!     one JSON object per line, Claude-Code-style append-only log).
 //!   - Atomic writes (tempfile + rename).
 //!   - Schema version field with forward migrations.
 //!   - **v1.5.0**: content-addressed blob extraction — any content
 //!     block whose canonical JSON is ≥ `object_store.inline_threshold_bytes`
 //!     (32 KiB) is spilled into `<session_dir>/objects/<first2>/<rest62>`
-//!     and replaced in `transcript.json` with a `{"type":"ref",
+//!     and replaced in `transcript.jsonl` with a `{"type":"ref",
 //!     "hash":"sha256:<hex>"}` pointer per §H.4.
 //!   - **v1.7.0**: per-branch transcript snapshots at
-//!     `<session_dir>/transcripts/<branch>.json`. `transcript.json`
+//!     `<session_dir>/transcripts/<branch>.jsonl`. `transcript.jsonl`
 //!     stays the "active branch" view for quick-read compatibility;
 //!     the snapshot directory lets `--checkout <branch>` resume a
 //!     different branch's history.
+//!   - **v1.30.0**: transcript on-disk format switched from a single
+//!     JSON object (`{"version":…,"messages":[…]}`) to JSON Lines.
+//!     The first line is a header `{"type":"meta","version":4,
+//!     "branch":"<name>"}`; each subsequent line is one message.
+//!     `readTranscript`/`readBranchTranscript` transparently read
+//!     legacy `.json` files (v ≤ 3) so existing sessions resume
+//!     without a migration step.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,7 +33,13 @@ const agent_mod = @import("../../agent/mod.zig");
 const object_store = @import("object_store.zig");
 
 pub const current_session_version: u32 = 3;
-pub const current_transcript_version: u32 = 3;
+/// v1.30.0 — transcript schema bumped to 4 for the JSON Lines
+/// on-disk format. Legacy `.json` transcripts at version ≤ 3 are
+/// still readable (`readTranscript` detects the old shape).
+pub const current_transcript_version: u32 = 4;
+/// Highest version accepted when reading a *legacy* single-JSON
+/// transcript (the pre-v1.30.0 `{"version":…,"messages":[…]}` shape).
+pub const legacy_transcript_version: u32 = 3;
 
 /// 26-char Crockford base32 identifier, prefix sortable by creation time.
 pub const Ulid = struct {
@@ -147,15 +161,20 @@ pub fn freeSessionHeader(allocator: std.mem.Allocator, h: SessionHeader) void {
     }
 }
 
-/// Render a transcript's canonical JSON into `out`. Oversize
-/// content blocks are spilled to `<session_dir>/objects/…` and
-/// replaced with `{"type":"ref","hash":"sha256:<hex>"}` per §H.4.
+/// Render a transcript as JSON Lines into `out` — one JSON object
+/// per line. The first line is a header `{"type":"meta","version":4,
+/// "branch":"<name>"}`; each subsequent line is one message object
+/// (identical shape to the per-message JSON the legacy array emitted).
+/// Oversize content blocks are spilled to `<session_dir>/objects/…`
+/// and replaced with `{"type":"ref","hash":"sha256:<hex>"}` per §H.4.
 ///
-/// v1.3.0 R2 — shared body between `writeTranscript` (top-level
-/// `transcript.json`) and `writeBranchTranscript` (per-branch
-/// snapshot at `transcripts/<branch>.json`). Both wrappers handle
-/// only the path-construction + file IO around this renderer.
-fn renderTranscriptJson(
+/// v1.30.0 — replaces the pre-v1.30 `renderTranscriptJson` which
+/// produced a single `{"version":…,"messages":[…]}` JSON object.
+/// Shared body between `writeTranscript` (top-level `transcript.jsonl`)
+/// and `writeBranchTranscript` (per-branch snapshot at
+/// `transcripts/<branch>.jsonl`). Both wrappers handle only the
+/// path-construction + file IO around this renderer.
+fn renderTranscriptJsonl(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -166,23 +185,35 @@ fn renderTranscriptJson(
     const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
     defer allocator.free(store_dir);
 
-    try out.appendSlice(allocator, "{\n");
-    try writeJsonField(out, allocator, "version", current_transcript_version, false);
-    try writeJsonStrField(out, allocator, "branch", branch, false);
-    try out.appendSlice(allocator, "  \"messages\": [\n");
-    for (transcript.messages.items, 0..) |m, i| {
-        if (i > 0) try out.appendSlice(allocator, ",\n");
-        try out.appendSlice(allocator, "    ");
+    // Line 1 — header / meta line. Compact (not pretty-printed) like
+    // every subsequent line; Claude Code transcripts use the same
+    // one-JSON-object-per-line convention.
+    try out.appendSlice(allocator, "{\"type\":\"meta\",\"version\":");
+    const ver = try std.fmt.allocPrint(allocator, "{d}", .{current_transcript_version});
+    defer allocator.free(ver);
+    try out.appendSlice(allocator, ver);
+    try out.appendSlice(allocator, ",\"branch\":");
+    try appendJsonStr(out, allocator, branch);
+    try out.appendSlice(allocator, "}");
+    try out.append(allocator, '\n');
+
+    // One message per line.
+    for (transcript.messages.items) |m| {
         try appendMessageJson(out, allocator, io, store_dir, m);
+        try out.append(allocator, '\n');
     }
-    try out.appendSlice(allocator, "\n  ]\n}\n");
 }
 
-/// Serialize the transcript to `session_dir/transcript.json`. Content
-/// blocks whose canonical JSON is ≥ `object_store.inline_threshold_bytes`
-/// are spilled to `<session_dir>/objects/<first2>/<rest62>` and
-/// replaced in the transcript with a `{"type":"ref","hash":"sha256:<hex>"}`
-/// pointer per §H.4.
+/// Serialize the transcript to `session_dir/transcript.jsonl` (JSON
+/// Lines — one JSON object per line). Content blocks whose canonical
+/// JSON is ≥ `object_store.inline_threshold_bytes` are spilled to
+/// `<session_dir>/objects/<first2>/<rest62>` and replaced in the
+/// transcript with a `{"type":"ref","hash":"sha256:<hex>"}` pointer
+/// per §H.4.
+///
+/// v1.30.0 — the on-disk extension changed from `.json` to `.jsonl`.
+/// `readTranscript` transparently reads the legacy `.json` file when
+/// the `.jsonl` file is absent, so existing sessions resume cleanly.
 pub fn writeTranscript(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -192,57 +223,66 @@ pub fn writeTranscript(
 ) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try renderTranscriptJson(&buf, allocator, io, session_dir, transcript, branch);
+    try renderTranscriptJsonl(&buf, allocator, io, session_dir, transcript, branch);
 
-    const path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
+    const path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.jsonl" });
     defer allocator.free(path);
     try atomicWrite(io, path, buf.items);
+
+    // Best-effort cleanup of a pre-v1.30 `transcript.json` so we don't
+    // leave a stale duplicate on disk. A failure here is harmless —
+    // the reader prefers `.jsonl` and only falls back to `.json` when
+    // the new file is missing.
+    const legacy_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
+    defer allocator.free(legacy_path);
+    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch {};
 }
 
-/// Load `transcript.json` into an owned `Transcript`. Caller deinits it.
+/// Load `transcript.jsonl` into an owned `Transcript`. Caller deinits it.
 /// Content blocks stored as `{"type":"ref","hash":"sha256:<hex>"}` are
 /// resolved from `<session_dir>/objects/…` transparently.
+///
+/// v1.30.0 — reads the new JSON Lines format. When `transcript.jsonl`
+/// is absent, falls back to the pre-v1.30 `transcript.json` (single
+/// JSON object with a `messages` array) so existing sessions resume
+/// without a migration step. Returns `error.FileNotFound` only when
+/// *neither* file exists.
 pub fn readTranscript(
     allocator: std.mem.Allocator,
     io: std.Io,
     session_dir: []const u8,
 ) !agent_mod.loop.Transcript {
-    const path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
-    defer allocator.free(path);
-
-    const bytes = try readWholeFile(allocator, io, path);
-    defer allocator.free(bytes);
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    defer parsed.deinit();
-
-    const root = parsed.value.object;
-    const version = if (root.get("version")) |v| v.integer else 0;
-    if (version > current_transcript_version) return error.UnsupportedTranscriptVersion;
-
     const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
     defer allocator.free(store_dir);
 
-    var transcript = agent_mod.loop.Transcript.init(allocator);
-    errdefer transcript.deinit();
-
-    const messages_val = root.get("messages") orelse return transcript;
-    if (messages_val != .array) return transcript;
-
-    for (messages_val.array.items) |mv| {
-        if (mv != .object) continue;
-        const msg = try parseMessage(allocator, io, store_dir, mv.object);
-        try transcript.append(msg);
+    // Prefer the v1.30 JSON Lines file.
+    const jsonl_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.jsonl" });
+    defer allocator.free(jsonl_path);
+    if (readWholeFile(allocator, io, jsonl_path)) |bytes| {
+        defer allocator.free(bytes);
+        return try parseTranscriptJsonl(allocator, io, store_dir, bytes);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
     }
 
-    return transcript;
+    // Fall back to the legacy single-JSON `transcript.json`.
+    const legacy_path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.json" });
+    defer allocator.free(legacy_path);
+    const bytes = try readWholeFile(allocator, io, legacy_path);
+    defer allocator.free(bytes);
+    return try parseTranscriptLegacyJson(allocator, io, store_dir, bytes);
 }
 
 /// v1.7.0 — write a branch-scoped snapshot at
-/// `<session_dir>/transcripts/<branch>.json`. Same serialization
+/// `<session_dir>/transcripts/<branch>.jsonl`. Same serialization
 /// rules as `writeTranscript`: oversize blocks still externalize
 /// into the shared `objects/` store (`--checkout` round-trips them
 /// transparently via `readBranchTranscript`).
+///
+/// v1.30.0 — the on-disk extension changed from `.json` to `.jsonl`.
+/// `readBranchTranscript` transparently reads the legacy `.json`
+/// snapshot when the `.jsonl` file is absent.
 pub fn writeBranchTranscript(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -259,47 +299,131 @@ pub fn writeBranchTranscript(
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try renderTranscriptJson(&buf, allocator, io, session_dir, transcript, branch);
+    try renderTranscriptJsonl(&buf, allocator, io, session_dir, transcript, branch);
 
-    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{branch});
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{branch});
     defer allocator.free(file_name);
     const path = try std.fs.path.join(allocator, &.{ snap_dir, file_name });
     defer allocator.free(path);
     try atomicWrite(io, path, buf.items);
+
+    // Best-effort cleanup of a pre-v1.30 `<branch>.json` snapshot.
+    const legacy_name = try std.fmt.allocPrint(allocator, "{s}.json", .{branch});
+    defer allocator.free(legacy_name);
+    const legacy_path = try std.fs.path.join(allocator, &.{ snap_dir, legacy_name });
+    defer allocator.free(legacy_path);
+    std.Io.Dir.cwd().deleteFile(io, legacy_path) catch {};
 }
 
 /// v1.7.0 — load a branch-scoped snapshot. Returns
 /// `error.FileNotFound` when the snapshot doesn't exist (caller
-/// decides whether to surface it or fall back to `transcript.json`).
+/// decides whether to surface it or fall back to `transcript.jsonl`).
+///
+/// v1.30.0 — reads the new JSON Lines `<branch>.jsonl` file; falls
+/// back to the legacy `<branch>.json` snapshot when the `.jsonl` is
+/// absent.
 pub fn readBranchTranscript(
     allocator: std.mem.Allocator,
     io: std.Io,
     session_dir: []const u8,
     branch: []const u8,
 ) !agent_mod.loop.Transcript {
-    const file_name = try std.fmt.allocPrint(allocator, "transcripts/{s}.json", .{branch});
-    defer allocator.free(file_name);
-    const path = try std.fs.path.join(allocator, &.{ session_dir, file_name });
-    defer allocator.free(path);
+    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
+    defer allocator.free(store_dir);
 
-    const bytes = try readWholeFile(allocator, io, path);
+    // Prefer the v1.30 JSON Lines file.
+    const jsonl_name = try std.fmt.allocPrint(allocator, "transcripts/{s}.jsonl", .{branch});
+    defer allocator.free(jsonl_name);
+    const jsonl_path = try std.fs.path.join(allocator, &.{ session_dir, jsonl_name });
+    defer allocator.free(jsonl_path);
+    if (readWholeFile(allocator, io, jsonl_path)) |bytes| {
+        defer allocator.free(bytes);
+        return try parseTranscriptJsonl(allocator, io, store_dir, bytes);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    // Fall back to the legacy single-JSON `<branch>.json`.
+    const legacy_name = try std.fmt.allocPrint(allocator, "transcripts/{s}.json", .{branch});
+    defer allocator.free(legacy_name);
+    const legacy_path = try std.fs.path.join(allocator, &.{ session_dir, legacy_name });
+    defer allocator.free(legacy_path);
+    const bytes = try readWholeFile(allocator, io, legacy_path);
     defer allocator.free(bytes);
+    return try parseTranscriptLegacyJson(allocator, io, store_dir, bytes);
+}
 
+// ─── v1.30.0 transcript parsers ───────────────────────────────────
+
+/// Parse a JSON Lines transcript (v4) — the first line is a header
+/// `{"type":"meta","version":4,"branch":…}`; each subsequent line is
+/// one message. `store_dir` is the `<session_dir>/objects` path used
+/// to resolve `ref` content blocks. Caller owns the returned
+/// `Transcript`.
+fn parseTranscriptJsonl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_dir: []const u8,
+    bytes: []const u8,
+) !agent_mod.loop.Transcript {
+    var transcript = agent_mod.loop.Transcript.init(allocator);
+    errdefer transcript.deinit();
+
+    var first_line = true;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        // Skip a trailing empty line (file ends with '\n').
+        if (line.len == 0) continue;
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const obj = parsed.value.object;
+
+        // First non-empty line may be the meta header. We validate the
+        // version but otherwise ignore it — the branch is already known
+        // to the caller (it's the active branch or the requested
+        // `--checkout` name).
+        if (first_line) {
+            first_line = false;
+            const type_str = strOpt(obj, "type") orelse "";
+            if (std.mem.eql(u8, type_str, "meta")) {
+                const version = if (obj.get("version")) |v| v.integer else 0;
+                if (version > current_transcript_version) return error.UnsupportedTranscriptVersion;
+                continue;
+            }
+            // Not a meta line — fall through and treat as a message.
+        }
+
+        const msg = try parseMessage(allocator, io, store_dir, obj);
+        try transcript.append(msg);
+    }
+    return transcript;
+}
+
+/// Parse a pre-v1.30 legacy transcript — a single JSON object
+/// `{"version":…,"messages":[…]}`. `store_dir` resolves `ref`
+/// content blocks. Caller owns the returned `Transcript`.
+fn parseTranscriptLegacyJson(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_dir: []const u8,
+    bytes: []const u8,
+) !agent_mod.loop.Transcript {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
 
     const root = parsed.value.object;
     const version = if (root.get("version")) |v| v.integer else 0;
-    if (version > current_transcript_version) return error.UnsupportedTranscriptVersion;
-
-    const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
-    defer allocator.free(store_dir);
+    if (version > legacy_transcript_version) return error.UnsupportedTranscriptVersion;
 
     var transcript = agent_mod.loop.Transcript.init(allocator);
     errdefer transcript.deinit();
 
     const messages_val = root.get("messages") orelse return transcript;
     if (messages_val != .array) return transcript;
+
     for (messages_val.array.items) |mv| {
         if (mv != .object) continue;
         const msg = try parseMessage(allocator, io, store_dir, mv.object);

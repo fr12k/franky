@@ -422,7 +422,7 @@ fn initSession(
     // v1.28.0 — RPC reuses the same synthesized rpc-<startup_ms>
     // dir that bash_state already points at (set via
     // `setSessionDir` above). Sub-agent transcripts land at
-    // `<rpc-dir>/subagents/<call_id>/transcript.json` and the
+    // `<rpc-dir>/subagents/<call_id>/transcript.jsonl` and the
     // path is surfaced in the result so the parent can `read`
     // it on demand. When neither `FRANKY_HOME` nor `HOME` is
     // set the bash_state has no session dir — sub-agent

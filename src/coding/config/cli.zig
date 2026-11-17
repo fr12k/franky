@@ -126,7 +126,7 @@ pub const Config = struct {
     fork_branch: ?[]const u8 = null,
     /// `--checkout <name>` — resume a specific branch instead of
     /// the session's saved active branch (v1.7.0). Loads
-    /// `<session_dir>/transcripts/<name>.json` on top of the tree
+    /// `<session_dir>/transcripts/<name>.jsonl` on top of the tree
     /// metadata; pairs naturally with `--resume <id>`.
     checkout_branch: ?[]const u8 = null,
     /// `--role <name>` — capability tier (`read`/`plan`/`code`/

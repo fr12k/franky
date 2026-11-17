@@ -44,7 +44,7 @@ pub const SessionState = struct {
     created_at_ms: i64,
     /// v1.6.0 — branch tree for this session. Loaded from
     /// `<session_dir>/tree.json` on `--resume`, minted fresh
-    /// otherwise. Saved alongside `session.json`/`transcript.json`
+    /// otherwise. Saved alongside `session.json`/`transcript.jsonl`
     /// in `persist`.
     tree: branching_mod.Tree,
     /// v3.0 — session-scoped CCR store for reversible compression.

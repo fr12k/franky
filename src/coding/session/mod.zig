@@ -54,7 +54,7 @@ pub const Session = struct {
     }
 };
 
-/// Write both `session.json` and `transcript.json` atomically under
+/// Write both `session.json` and `transcript.jsonl` atomically under
 /// `<parent_dir>/<session_id>/`. The directory is created if missing.
 pub fn save(
     allocator: std.mem.Allocator,
@@ -318,7 +318,7 @@ test "transcript: small block stays inline; objects/ dir stays empty" {
     };
     try save(gpa, io, base, header, &transcript);
 
-    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXSMALL/transcript.json", .{base});
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXSMALL/transcript.jsonl", .{base});
     defer gpa.free(t_path);
     const t_bytes = try readWholeFile(gpa, io, t_path);
     defer gpa.free(t_bytes);
@@ -369,7 +369,7 @@ test "transcript: 32 KiB block externalized and round-trips through $ref" {
     };
     try save(gpa, io, base, header, &transcript);
 
-    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXLARGE/transcript.json", .{base});
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXLARGE/transcript.jsonl", .{base});
     defer gpa.free(t_path);
     const t_bytes = try readWholeFile(gpa, io, t_path);
     defer gpa.free(t_bytes);
