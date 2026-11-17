@@ -1153,13 +1153,15 @@ pub const BaseToolInputs = struct {
 /// they need session-owned ctx pointers (build with null ctx first, then
 /// patch the tool.ctx field after the session struct is initialized).
 /// v3.x — pre-filter MCP tools for auto mode. Removes any MCP tool
-/// (`mcp__<server>__<tool>`) that the classifier would block (not
-/// in the safe allow-list) AND that isn't in `autoMode.allow` (exact
-/// or wildcard). This prevents the model from seeing destructive
+/// (`mcp__<server>__<tool>`) that the classifier would block AND
+/// that isn't in `autoMode.allow` (exact or wildcard). Also removes
+/// tools in `autoMode.hardDeny` / `autoMode.softDeny` (without an
+/// `allow` override). This prevents the model from seeing destructive
 /// MCP tools, saving a wasted turn on an inevitable denial.
 ///
-/// Non-MCP tools pass through unchanged. When auto mode is off,
-/// the caller skips this function entirely.
+/// Tools in `permissions.ask` are KEPT — the user needs to see them
+/// to be prompted. Non-MCP tools pass through unchanged. When auto
+/// mode is off, the caller skips this function entirely.
 pub fn filterMcpToolsForAutoMode(
     allocator: std.mem.Allocator,
     all: []const at.AgentTool,
@@ -1172,17 +1174,26 @@ pub fn filterMcpToolsForAutoMode(
             try out.append(allocator, t);
             continue;
         }
-        // Check autoMode.allow (exact + wildcard) first.
+        // Check autoMode.allow (exact + wildcard) first — overrides
+        // soft_deny and the classifier, but NOT hard_deny.
         if (permissions_mod.Store.autoSetMatches(&store.auto_allow, t.name, "{}")) {
             try out.append(allocator, t);
             continue;
+        }
+        // Check autoMode.hardDeny — always blocked, no override.
+        if (permissions_mod.Store.autoSetMatches(&store.auto_hard_deny, t.name, "{}")) {
+            continue; // skip — hard denied
+        }
+        // Check autoMode.softDeny — blocked unless allow matched.
+        if (permissions_mod.Store.autoSetMatches(&store.auto_soft_deny, t.name, "{}")) {
+            continue; // skip — soft denied
         }
         // Check the safe allow-list.
         if (auto_mode_mod.mcpToolWouldPass(t.name)) {
             try out.append(allocator, t);
             continue;
         }
-        // Tool would be blocked — skip it.
+        // Tool would be blocked by the classifier — skip it.
     }
     return out.toOwnedSlice(allocator);
 }

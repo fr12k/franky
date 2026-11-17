@@ -138,7 +138,11 @@ pub fn classify(input: ClassifierInput) Result {
 fn destructiveRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
-    const lower = lowerCmd(cmd);
+    const lower = lowerCmd(cmd) orelse return .{
+        .verdict = .block_hard,
+        .rule_name = "[Command Too Long]",
+        .reason = "command exceeds 4 KB; cannot safely evaluate for destructive patterns.",
+    };
 
     // `rm -rf` with any target — but allow `rm -rf` of paths clearly
     // inside the workspace (e.g. `rm -rf build/`). A bare `rm -rf /`
@@ -314,7 +318,7 @@ fn secretsEgressRule(input: ClassifierInput) ?Result {
 fn exfiltrationRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
-    const lower = lowerCmd(cmd);
+    const lower = lowerCmd(cmd) orelse return null; // too long → pass (no match)
 
     // curl / wget → URL argument.
     if (startsWithVerb(lower, "curl") or startsWithVerb(lower, "wget")) {
@@ -349,7 +353,7 @@ fn exfiltrationRule(input: ClassifierInput) ?Result {
 fn scmTargetRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
-    const lower = lowerCmd(cmd);
+    const lower = lowerCmd(cmd) orelse return null; // too long → pass (no match)
     if (!startsWithVerb(lower, "git")) return null;
     if (!containsToken(lower, "push")) return null;
 
@@ -520,17 +524,17 @@ pub fn extractJsonStringField(args_json: []const u8, field: []const u8) ?[]const
 }
 
 /// Stack buffer for lowercasing commands. 4 KB is enough for
-/// any realistic shell command; longer commands skip lowercasing
-/// and fall back to case-sensitive matching (acceptable — the
-/// rules are conservative, so a miss just means `pass`).
+/// any realistic shell command; longer commands are conservative-
+/// blocked (the caller treats a null return as a potential risk).
 const lower_buf_size = 4096;
-var lower_scratch: [lower_buf_size]u8 = undefined;
+threadlocal var lower_scratch: [lower_buf_size]u8 = undefined;
 
 /// Lowercase a command into the thread-local `lower_scratch`. Returns
-/// a slice of the buffer. Returns the original (case-preserved)
-/// slice if the command is too long for the buffer.
-fn lowerCmd(cmd: []const u8) []const u8 {
-    if (cmd.len > lower_scratch.len) return cmd;
+/// a slice of the buffer, or null if the command is too long (>
+/// 4 KB) — callers should treat null as a block since the rules
+/// can't safely evaluate a case-preserved command.
+fn lowerCmd(cmd: []const u8) ?[]const u8 {
+    if (cmd.len > lower_scratch.len) return null;
     for (cmd, 0..) |c, i| lower_scratch[i] = std.ascii.toLower(c);
     return lower_scratch[0..cmd.len];
 }
@@ -832,6 +836,16 @@ test "classify: rm -rf build/ passes (in-workspace)" {
     const env = AutoEnv{ .workspace_root = "/home/user/repo" };
     const r = classify(.{ .tool = "bash", .args_json = json, .env = &env });
     try testing.expectEqual(Verdict.pass, r.verdict);
+}
+
+test "classify: rm -rf /etc blocks with configured workspace" {
+    const allocator = testing.allocator;
+    const json = try mkBashJson(allocator, "rm -rf /etc");
+    defer allocator.free(json);
+    const env = AutoEnv{ .workspace_root = "/home/user/repo" };
+    const r = classify(.{ .tool = "bash", .args_json = json, .env = &env });
+    try testing.expectEqual(Verdict.block_hard, r.verdict);
+    try testing.expectEqualStrings("[Destructive Command]", r.rule_name);
 }
 
 test "classify: git push (normal) to default remote passes" {
