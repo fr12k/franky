@@ -312,9 +312,10 @@ fn secretsEgressRule(input: ClassifierInput) ?Result {
 
 // ─── rule: data exfiltration ──────────────────────────────────────
 
-/// Network commands (`curl`, `wget`, `scp`, `rsync`, `git push`)
+/// Network commands (`curl`, `wget`, `scp`, `rsync`)
 /// targeting a destination not in the trusted set. `block` (soft) —
-/// an `allow` exception can override.
+/// an `allow` exception can override. `git push` is handled
+/// separately by `scmTargetRule`.
 fn exfiltrationRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
@@ -620,15 +621,21 @@ fn isSecretEnvVar(name: []const u8) bool {
     return false;
 }
 
-/// True if the command starts with a network verb.
+/// True if the command starts with a network verb (case-insensitive).
+/// Only lowercases the first token (the verb) to avoid needing a
+/// large buffer for the full command.
 fn isNetworkVerb(cmd: []const u8) bool {
     const trimmed = std.mem.trimStart(u8, cmd, " \t");
+    // Find the end of the first token (the verb).
+    const space = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+    const verb = trimmed[0..space];
+    var lbuf: [32]u8 = undefined;
+    if (verb.len > lbuf.len) return false;
+    for (verb, 0..) |c, i| lbuf[i] = std.ascii.toLower(c);
+    const lower = lbuf[0..verb.len];
     const verbs = [_][]const u8{ "curl", "wget", "scp", "rsync", "git" };
     for (verbs) |v| {
-        if (std.mem.startsWith(u8, trimmed, v)) {
-            if (trimmed.len == v.len) return true;
-            return trimmed[v.len] == ' ' or trimmed[v.len] == '\t';
-        }
+        if (std.mem.eql(u8, lower, v)) return true;
     }
     return false;
 }
@@ -1076,6 +1083,15 @@ test "isSecretEnvVar: known + FRANKY_SECRET_" {
     try testing.expect(isSecretEnvVar("anthropic_api_key"));
     try testing.expect(isSecretEnvVar("FRANKY_SECRET_FOO"));
     try testing.expect(!isSecretEnvVar("PATH"));
+}
+
+test "isNetworkVerb: case-insensitive" {
+    try testing.expect(isNetworkVerb("curl https://evil.com"));
+    try testing.expect(isNetworkVerb("CURL https://evil.com"));
+    try testing.expect(isNetworkVerb("Wget https://evil.com"));
+    try testing.expect(isNetworkVerb("git push origin"));
+    try testing.expect(!isNetworkVerb("ls -la"));
+    try testing.expect(!isNetworkVerb("zig build"));
 }
 
 // ─── MCP allow-list tests ─────────────────────────────────────────

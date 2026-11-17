@@ -372,11 +372,12 @@ pub const Store = struct {
     /// Precedence (most → least specific):
     ///   1. `deny_tools` / `deny_bash` (hard refusal)
     ///   2. `allow_tools` / `allow_bash` (auto-allow)
-    ///   3. `ask_tools` / `ask_bash` / `ask_all` (force-ask, even
-    ///      when the default policy auto-allows)
-    ///   4. auto-mode `hardDeny` (v3.x — hard block before classifier)
-    ///   5. auto-mode classifier (v3.x — block / pass)
-    ///   6. default policy (`defaultPolicy`)
+    ///   3. `ask_tools` exact (force-ask)
+    ///   4. `ask_tools` wildcard (force-ask)
+    ///   5. `allow_tools` wildcard (auto-allow)
+    ///   6. `ask_bash` / `ask_all` (force-ask)
+    ///   7. auto-mode (v3.x): `hardDeny` → `allow` → `softDeny` → classifier
+    ///   8. default policy (`defaultPolicy`)
     ///
     /// `yes_to_all` flips a final `ask` decision into `auto_allow`,
     /// so it composes with `ask_all` to give a "gate active but
