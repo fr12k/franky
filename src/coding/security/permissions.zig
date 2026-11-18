@@ -25,6 +25,7 @@ const at = @import("../../agent/types.zig");
 // these types — a leaking abstraction that pulled the entire
 // loop implementation into the security module's dependency graph.
 const role_mod = @import("role.zig");
+const auto_mode = @import("auto_mode.zig");
 
 /// Per-call decision returned by `Store.check`.
 pub const Decision = enum {
@@ -38,6 +39,20 @@ pub const Decision = enum {
     /// otherwise the gate falls through to `auto_deny` plus a
     /// helpful error message.
     ask,
+};
+
+/// v3.x — detailed decision carrying the auto-mode classifier's
+/// rule name + reason when the classifier blocked the call.
+/// `check` returns a plain `Decision` for back-compat; `checkDetailed`
+/// returns this struct so `beforeToolCall` can surface the rule name
+/// in the synthesized tool error.
+pub const DetailedDecision = struct {
+    decision: Decision,
+    /// Bracketed rule name from the classifier, e.g. "[Destructive Command]".
+    /// null when the decision didn't come from the classifier.
+    rule_name: ?[]const u8 = null,
+    /// Human-readable reason from the classifier. null when not applicable.
+    reason: ?[]const u8 = null,
 };
 
 /// User-supplied resolution after a `tool_permission_request`
@@ -114,6 +129,19 @@ pub const Store = struct {
     /// Bash fingerprints whose default decision is forced to `ask`.
     ask_bash: std.StringHashMapUnmanaged(void) = .empty,
 
+    // ─── v3.x — auto-mode classifier fields ───────────────────────
+    // When `auto_enabled` is true, `check` consults the classifier
+    // (auto_mode.classify) after the static overlay rules. The
+    // `auto_env` pointer is borrowed (caller-owned, session lifetime).
+    // `auto_allow` / `auto_soft_deny` / `auto_hard_deny` hold
+    // `Bash(<pattern>)` or bare tool-name entries from the `autoMode`
+    // settings block. Borrowed string slices — not freed in deinit.
+    auto_enabled: bool = false,
+    auto_env: ?*const auto_mode.AutoEnv = null,
+    auto_allow: std.StringHashMapUnmanaged(void) = .empty,
+    auto_soft_deny: std.StringHashMapUnmanaged(void) = .empty,
+    auto_hard_deny: std.StringHashMapUnmanaged(void) = .empty,
+
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
     }
@@ -125,6 +153,10 @@ pub const Store = struct {
         freeStringSet(self.allocator, &self.allow_bash);
         freeStringSet(self.allocator, &self.deny_bash);
         freeStringSet(self.allocator, &self.ask_bash);
+        // v3.x — auto-mode sets are borrowed (settings-owned), not freed.
+        self.auto_allow.deinit(self.allocator);
+        self.auto_soft_deny.deinit(self.allocator);
+        self.auto_hard_deny.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -208,6 +240,28 @@ pub const Store = struct {
         try addToSet(self.allocator, set, name);
     }
 
+    /// v3.x — add a borrowed entry to an auto-mode set
+    /// (`auto_allow` / `auto_soft_deny` / `auto_hard_deny`). The
+    /// key bytes are NOT duped — they must outlive the store (owned
+    /// by the settings layer). Used by `applyAutoModeSettingsOverlay`.
+    pub fn addAutoEntry(
+        self: *Store,
+        entry: []const u8,
+        kind: AutoKind,
+    ) !void {
+        if (entry.len == 0) return;
+        const set: *std.StringHashMapUnmanaged(void) = switch (kind) {
+            .allow => &self.auto_allow,
+            .soft_deny => &self.auto_soft_deny,
+            .hard_deny => &self.auto_hard_deny,
+        };
+        // Borrowed — put the key directly without duping.
+        try set.put(self.allocator, entry, {});
+    }
+
+    /// v3.x — auto-mode entry kind.
+    pub const AutoKind = enum { allow, soft_deny, hard_deny };
+
     fn addCsv(self: *Store, csv: []const u8, kind: Kind) !void {
         var it = std.mem.tokenizeScalar(u8, csv, ',');
         while (it.next()) |raw| {
@@ -290,7 +344,25 @@ pub const Store = struct {
     pub fn entryCount(self: *const Store) usize {
         return self.allow_tools.count() + self.deny_tools.count() +
             self.ask_tools.count() + self.allow_bash.count() +
-            self.deny_bash.count() + self.ask_bash.count();
+            self.deny_bash.count() + self.ask_bash.count() +
+            self.auto_allow.count() + self.auto_soft_deny.count() +
+            self.auto_hard_deny.count();
+    }
+
+    /// v3.x — `true` when the auto-mode classifier is active.
+    pub fn isAutoMode(self: *const Store) bool {
+        return self.auto_enabled;
+    }
+
+    /// v3.x — one-line summary of auto-mode state for `/permissions`.
+    /// Returns a borrowed static string (no allocation).
+    pub fn autoModeSummary(self: *const Store) []const u8 {
+        if (!self.auto_enabled) return "auto: off";
+        const n: usize = self.auto_allow.count() +
+            self.auto_soft_deny.count() +
+            self.auto_hard_deny.count();
+        if (n == 0) return "auto: on (classifier only, no allow/deny entries)";
+        return "auto: on";
     }
 
     /// Decide whether to permit a single tool call. `args_json` is
@@ -300,70 +372,165 @@ pub const Store = struct {
     /// Precedence (most → least specific):
     ///   1. `deny_tools` / `deny_bash` (hard refusal)
     ///   2. `allow_tools` / `allow_bash` (auto-allow)
-    ///   3. `ask_tools` / `ask_bash` / `ask_all` (force-ask, even
-    ///      when the default policy auto-allows)
-    ///   4. default policy (`defaultPolicy`)
+    ///   3. `ask_tools` exact (force-ask)
+    ///   4. `ask_tools` wildcard (force-ask)
+    ///   5. `allow_tools` wildcard (auto-allow)
+    ///   6. `ask_bash` / `ask_all` (force-ask)
+    ///   7. auto-mode (v3.x): `hardDeny` → `allow` → `softDeny` → classifier
+    ///   8. default policy (`defaultPolicy`)
     ///
     /// `yes_to_all` flips a final `ask` decision into `auto_allow`,
     /// so it composes with `ask_all` to give a "gate active but
-    /// auto-confirm everything" CI shape.
+    /// auto-confirm everything" CI shape. With auto mode on,
+    /// `yes_to_all` does NOT override classifier `block_hard`
+    /// decisions — that's the whole point of auto mode vs blanket
+    /// `--yes`.
     pub fn check(
         self: *const Store,
         tool_name: []const u8,
         args_json: []const u8,
     ) Decision {
+        return self.checkDetailed(tool_name, args_json).decision;
+    }
+
+    /// v3.x — detailed decision carrying the classifier's rule name
+    /// + reason when the classifier blocked the call. `check`
+    /// delegates here and discards the extra fields for back-compat.
+    pub fn checkDetailed(
+        self: *const Store,
+        tool_name: []const u8,
+        args_json: []const u8,
+    ) DetailedDecision {
         // Step 1: deny lists (hard refusal).
-        if (self.deny_tools.contains(tool_name)) return .auto_deny;
-        if (setMatchesWildcard(&self.deny_tools, tool_name)) return .auto_deny;
+        if (self.deny_tools.contains(tool_name)) return .{ .decision = .auto_deny };
+        if (setMatchesWildcard(&self.deny_tools, tool_name)) return .{ .decision = .auto_deny };
         const is_bash = std.mem.eql(u8, tool_name, "bash");
         const bash_fp: ?[]const u8 = if (is_bash)
             (if (extractBashCommand(args_json)) |cmd| fingerprintBash(cmd) else null)
         else
             null;
         if (bash_fp) |fp| {
-            if (self.deny_bash.contains(fp)) return .auto_deny;
+            if (self.deny_bash.contains(fp)) return .{ .decision = .auto_deny };
         }
 
         // Step 2: exact-match allow (wins over exact-match ask, preserving
         // original semantics where --allow-tools read beats --ask-tools read).
         if (bash_fp) |fp| {
-            if (self.allow_bash.contains(fp)) return .auto_allow;
+            if (self.allow_bash.contains(fp)) return .{ .decision = .auto_allow };
         }
-        if (self.allow_tools.contains(tool_name)) return .auto_allow;
+        if (self.allow_tools.contains(tool_name)) return .{ .decision = .auto_allow };
 
         // Step 3: exact-match force-ask (for non-bash tools).
         if (self.ask_tools.contains(tool_name)) {
-            if (self.yes_to_all) return .auto_allow;
-            return .ask;
+            if (self.yes_to_all) return .{ .decision = .auto_allow };
+            return .{ .decision = .ask };
         }
 
         // Step 4: wildcard force-ask (checked before wildcard allow so
         // --ask-tools mcp__slack__* wins over --allow-tools mcp__*).
         if (setMatchesWildcard(&self.ask_tools, tool_name)) {
-            if (self.yes_to_all) return .auto_allow;
-            return .ask;
+            if (self.yes_to_all) return .{ .decision = .auto_allow };
+            return .{ .decision = .ask };
         }
 
         // Step 5: wildcard allow.
-        if (setMatchesWildcard(&self.allow_tools, tool_name)) return .auto_allow;
+        if (setMatchesWildcard(&self.allow_tools, tool_name)) return .{ .decision = .auto_allow };
 
         // Step 6: bash fingerprint ask (after bash allow, preserving
         // original semantics where allow_bash wins over ask_bash/ask_all).
         if (bash_fp) |fp| {
             if (self.ask_bash.contains(fp)) {
-                if (self.yes_to_all) return .auto_allow;
-                return .ask;
+                if (self.yes_to_all) return .{ .decision = .auto_allow };
+                return .{ .decision = .ask };
             }
         }
         if (self.ask_all) {
-            if (self.yes_to_all) return .auto_allow;
-            return .ask;
+            if (self.yes_to_all) return .{ .decision = .auto_allow };
+            return .{ .decision = .ask };
         }
 
-        // Step 7: default policy.
+        // Step 7 (v3.x): auto-mode classifier.
+        //
+        // When `auto_enabled` is true, consult `hardDeny` entries,
+        // then `allow` exceptions, then `softDeny` entries, and
+        // finally the classifier. `allow` exceptions override
+        // `softDeny` and classifier `block` (soft) but NOT
+        // `hardDeny` or classifier `block_hard`.
+        if (self.auto_enabled) {
+            // 7a: hardDeny — check bash-glob patterns + bare tool names.
+            if (autoSetMatches(&self.auto_hard_deny, tool_name, args_json)) {
+                return .{
+                    .decision = .auto_deny,
+                    .rule_name = "[Hard Deny]",
+                    .reason = "blocked by autoMode.hardDeny entry",
+                };
+            }
+            // 7b: allow exceptions — skip the classifier.
+            if (autoSetMatches(&self.auto_allow, tool_name, args_json)) {
+                return .{ .decision = .auto_allow };
+            }
+            // 7c: softDeny — check, but allow exceptions already
+            // handled above, so a softDeny match blocks.
+            if (autoSetMatches(&self.auto_soft_deny, tool_name, args_json)) {
+                return .{
+                    .decision = .auto_deny,
+                    .rule_name = "[Soft Deny]",
+                    .reason = "blocked by autoMode.softDeny entry",
+                };
+            }
+            // 7d: classifier.
+            if (self.auto_env) |env| {
+                const cr = auto_mode.classify(.{
+                    .tool = tool_name,
+                    .args_json = args_json,
+                    .env = env,
+                });
+                switch (cr.verdict) {
+                    .pass => return .{ .decision = .auto_allow },
+                    .block => return .{
+                        .decision = .auto_deny,
+                        .rule_name = cr.rule_name,
+                        .reason = cr.reason,
+                    },
+                    .block_hard => return .{
+                        .decision = .auto_deny,
+                        .rule_name = cr.rule_name,
+                        .reason = cr.reason,
+                    },
+                }
+            }
+            // auto_enabled but no env → auto-allow (degenerate config).
+            return .{ .decision = .auto_allow };
+        }
+
+        // Step 8: default policy.
         const default = defaultPolicy(tool_name);
-        if (default == .ask and self.yes_to_all) return .auto_allow;
-        return default;
+        if (default == .ask and self.yes_to_all) return .{ .decision = .auto_allow };
+        return .{ .decision = default };
+    }
+
+    /// v3.x — shared matching logic for auto-mode sets.
+    /// Checks exact match, wildcard patterns (e.g. `mcp__atlassian__*`),
+    /// and `Bash(<glob>)` patterns against the bash command.
+    /// Public so config.zig's MCP pre-filter can call it.
+    pub fn autoSetMatches(
+        set: *const std.StringHashMapUnmanaged(void),
+        tool_name: []const u8,
+        args_json: []const u8,
+    ) bool {
+        if (set.contains(tool_name)) return true;
+        if (setMatchesWildcard(set, tool_name)) return true;
+        if (std.mem.eql(u8, tool_name, "bash")) {
+            const cmd = extractBashCommand(args_json) orelse return false;
+            var it = set.keyIterator();
+            while (it.next()) |k| {
+                if (std.mem.startsWith(u8, k.*, "Bash(")) {
+                    const pat = k.*[5 .. k.*.len - 1];
+                    if (auto_mode.bashGlobMatches(pat, cmd)) return true;
+                }
+            }
+        }
+        return false;
     }
 };
 
@@ -632,12 +799,17 @@ pub const SessionGates = struct {
     ) at.HookDecision {
         const self: *SessionGates = @ptrCast(@alignCast(userdata.?));
         const store = self.permissions orelse return .{ .block = false };
-        const decision = store.check(tool.name, args_json);
-        switch (decision) {
+        const dd = store.checkDetailed(tool.name, args_json);
+        switch (dd.decision) {
             .auto_allow => return .{ .block = false },
-            .auto_deny => return .{
-                .block = true,
-                .reason_text = "permission gate: tool denied by --deny-tools or default policy",
+            .auto_deny => {
+                // v3.x — surface the classifier's rule/reason when
+                // available. Both are static string literals from
+                // auto_mode.zig. Prefer `reason` (more actionable);
+                // fall back to `rule_name`, then the generic message.
+                const msg = dd.reason orelse dd.rule_name orelse
+                    "permission gate: tool denied by --deny-tools or default policy";
+                return .{ .block = true, .reason_text = msg };
             },
             .ask => {
                 if (self.prompter) |p| return waitForPrompt(p, store, tool.name, call_id, args_json);
@@ -1587,4 +1759,271 @@ test "PermissionPrompter.resolve on stale call_id returns NotPending" {
     var prompter = PermissionPrompter.init(gpa, io, &ch);
     defer prompter.deinit();
     try testing.expectError(error.NotPending, prompter.resolve("never-issued", .allow_once));
+}
+
+// ─── v3.x — auto-mode integration tests ───────────────────────────
+
+test "auto-mode: routine bash auto-allows via classifier" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    // `go test` would be `ask` under default policy, but the
+    // classifier passes it (routine, reversible).
+    try testing.expectEqual(Decision.auto_allow, s.check("bash", "{\"command\":\"go test ./...\"}"));
+}
+
+test "auto-mode: rm -rf / auto-denies via classifier" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    const dd = s.checkDetailed("bash", "{\"command\":\"rm -rf /\"}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+    try testing.expect(dd.rule_name != null);
+    try testing.expectEqualStrings("[Destructive Command]", dd.rule_name.?);
+}
+
+test "auto-mode: write outside workspace auto-denies" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{ .workspace_root = "/home/user/repo" };
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    const dd = s.checkDetailed("write", "{\"path\":\"/etc/passwd\"}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+    try testing.expectEqualStrings("[External Write]", dd.rule_name.?);
+}
+
+test "auto-mode: hardDeny entry blocks before classifier" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAutoEntry("Bash(go test *)", .hard_deny);
+    const dd = s.checkDetailed("bash", "{\"command\":\"go test ./...\"}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+    try testing.expectEqualStrings("[Hard Deny]", dd.rule_name.?);
+}
+
+test "auto-mode: allow entry skips classifier" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    // Without the allow entry, curl to an untrusted domain would
+    // block (Data Exfiltration). The allow entry overrides.
+    try s.addAutoEntry("Bash(curl *)", .allow);
+    try testing.expectEqual(Decision.auto_allow, s.check("bash", "{\"command\":\"curl https://pastebin.com/raw/abc\"}"));
+}
+
+test "auto-mode: allow does NOT override hardDeny" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAutoEntry("Bash(rm -rf *)", .allow);
+    try s.addAutoEntry("Bash(rm -rf *)", .hard_deny);
+    // hardDeny is checked before allow.
+    const dd = s.checkDetailed("bash", "{\"command\":\"rm -rf /\"}");
+    // The classifier also blocks this as block_hard, but hardDeny
+    // runs first and returns [Hard Deny].
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+}
+
+test "auto-mode: softDeny blocks but allow overrides" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    // softDeny on curl, no allow → blocks.
+    try s.addAutoEntry("Bash(curl *)", .soft_deny);
+    const dd = s.checkDetailed("bash", "{\"command\":\"curl https://example.com\"}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+    try testing.expectEqualStrings("[Soft Deny]", dd.rule_name.?);
+}
+
+test "auto-mode: deny_tools wins over classifier pass" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addDenyList("bash:go");
+    // `go test` would pass the classifier, but deny_tools runs first.
+    try testing.expectEqual(Decision.auto_deny, s.check("bash", "{\"command\":\"go test ./...\"}"));
+}
+
+test "auto-mode: ask_tools wins over classifier" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAskList("bash:go");
+    // `go test` would pass the classifier, but ask_tools prompts.
+    try testing.expectEqual(Decision.ask, s.check("bash", "{\"command\":\"go test ./...\"}"));
+}
+
+test "auto-mode: off → default policy unchanged" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    // auto_enabled is false by default.
+    try testing.expectEqual(Decision.ask, s.check("bash", "{\"command\":\"rm -rf /\"}"));
+    try testing.expectEqual(Decision.auto_allow, s.check("read", "{}"));
+}
+
+test "auto-mode: deny_tools + auto allow entry — deny wins" {
+    // Even with an auto-allow entry for a tool, the static deny
+    // list (from --deny-tools or permissions.deny) takes precedence.
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAutoEntry("write", .allow);
+    try s.addDenyList("write");
+    try testing.expectEqual(Decision.auto_deny, s.check("write", "{\"path\":\"src/x.zig\"}"));
+}
+
+test "auto-mode: allow_tools (static) skips classifier even for destructive cmd" {
+    // A static --allow-tools entry for bash:rm bypasses the
+    // classifier entirely (step 2 runs before step 7).
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAllowList("bash:rm");
+    try testing.expectEqual(Decision.auto_allow, s.check("bash", "{\"command\":\"rm -rf /\"}"));
+}
+
+test "auto-mode: auto_hard_deny cannot be overridden by static allow_tools" {
+    // Static allow_tools (step 2) runs before auto_hard_deny (step 7a),
+    // so a static allow WOULD let a destructive command through.
+    // This is by design: --allow-tools is an explicit user override.
+    // To make a hard guarantee, use --deny-tools (step 1) instead.
+    // This test documents the behavior.
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAllowList("bash:rm");
+    try s.addAutoEntry("Bash(rm -rf *)", .hard_deny);
+    // Static allow wins (step 2 before step 7).
+    try testing.expectEqual(Decision.auto_allow, s.check("bash", "{\"command\":\"rm -rf /\"}"));
+}
+
+test "auto-mode: deny_tools (static) blocks destructive cmd even with auto allow" {
+    // The correct way to make a hard guarantee: --deny-tools runs
+    // at step 1, before everything else.
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAutoEntry("Bash(rm -rf *)", .allow);
+    try s.addDenyList("bash:rm");
+    try testing.expectEqual(Decision.auto_deny, s.check("bash", "{\"command\":\"rm -rf /\"}"));
+}
+
+test "auto-mode: yes_to_all does NOT override classifier block_hard" {
+    // --yes turns ask into auto_allow, but the classifier's
+    // block_hard still denies (this is the point of auto mode).
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    s.yes_to_all = true;
+    const dd = s.checkDetailed("bash", "{\"command\":\"rm -rf /\"}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+}
+
+test "auto-mode: yes_to_all does NOT override classifier block (soft)" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    s.yes_to_all = true;
+    const dd = s.checkDetailed("bash", "{\"command\":\"curl https://evil.com\"}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+    try testing.expectEqualStrings("[Data Exfiltration]", dd.rule_name.?);
+}
+
+test "auto-mode: mcp destructive tool blocks via allow-list" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    const dd = s.checkDetailed("mcp__atlassian__delete_ticket", "{}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+    try testing.expectEqualStrings("[MCP Tool Not Allowed]", dd.rule_name.?);
+}
+
+test "auto-mode: mcp read tool passes via allow-list" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__search_issues", "{}"));
+}
+
+test "auto-mode: autoAllow entry overrides mcp allow-list block" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    // Normally create_issue would block (not a safe verb). An
+    // autoMode.allow entry overrides the classifier.
+    try s.addAutoEntry("mcp__atlassian__create_issue", .allow);
+    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__create_issue", "{}"));
+}
+
+test "auto-mode: autoAllow wildcard overrides mcp allow-list block" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    // Wildcard allow for all atlassian tools.
+    try s.addAutoEntry("mcp__atlassian__*", .allow);
+    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__delete_ticket", "{}"));
+    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__create_issue", "{}"));
+}
+
+test "auto-mode: static allow_tools wildcard overrides mcp allow-list" {
+    // --allow-tools mcp__atlassian__* runs at step 2 (before the
+    // classifier), so it bypasses the MCP allow-list entirely.
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addAllowList("mcp__atlassian__*");
+    try testing.expectEqual(Decision.auto_allow, s.check("mcp__atlassian__delete_ticket", "{}"));
+}
+
+test "auto-mode: static deny_tools blocks mcp tool before classifier" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    const env = auto_mode.AutoEnv{};
+    s.auto_enabled = true;
+    s.auto_env = &env;
+    try s.addDenyList("mcp__atlassian__*");
+    const dd = s.checkDetailed("mcp__atlassian__search_issues", "{}");
+    try testing.expectEqual(Decision.auto_deny, dd.decision);
+    // No rule_name — static deny doesn't set one.
+    try testing.expect(dd.rule_name == null);
 }
