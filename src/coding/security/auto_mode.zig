@@ -134,20 +134,101 @@ pub fn classify(input: ClassifierInput) Result {
 // ─── rule: destructive / irreversible commands ────────────────────
 
 /// Bash commands that are irreversible or broadly destructive.
-/// These are `block_hard` — an `allow` exception cannot override.
+/// These are `block_hard` -- an `allow` exception cannot override.
+///
+/// Most patterns are declarative: a table of verb + required
+/// tokens/flags + optional substring, evaluated in a loop. The
+/// `rm -rf` case is special-cased because it needs a target-path
+/// safety check via `rmTargetIsUnsafe`.
+const DestructivePattern = struct {
+    /// Verb that must start the command (via `startsWithVerb`).
+    verb: []const u8,
+    /// Tokens that must all be present (via `containsToken`).
+    required_tokens: []const []const u8 = &.{},
+    /// Flags that must all be present (via `hasFlag`).
+    required_flags: []const []const u8 = &.{},
+    /// Substring that must be present anywhere in the command.
+    /// null = skip this check.
+    required_substring: ?[]const u8 = null,
+    /// Reason shown to the user.
+    reason: []const u8,
+};
+
+const destructive_patterns = [_]DestructivePattern{
+    .{
+        .verb = "git",
+        .required_tokens = &.{"push"},
+        .required_flags = &.{"--force"},
+        .reason = "git push --force rewrites remote history. Add to `hardDeny` to make this explicit, or `permissions.deny` for a hard guarantee.",
+    },
+    .{
+        .verb = "git",
+        .required_tokens = &.{"push"},
+        .required_flags = &.{"-f"},
+        .reason = "git push --force rewrites remote history. Add to `hardDeny` to make this explicit, or `permissions.deny` for a hard guarantee.",
+    },
+    .{
+        .verb = "git",
+        .required_tokens = &.{"push"},
+        .required_substring = "--force-with-lease",
+        .reason = "git push --force rewrites remote history. Add to `hardDeny` to make this explicit, or `permissions.deny` for a hard guarantee.",
+    },
+    .{
+        .verb = "git",
+        .required_tokens = &.{"reset"},
+        .required_flags = &.{"--hard"},
+        .reason = "git reset --hard discards uncommitted changes. Use `git stash` or commit first.",
+    },
+    .{
+        .verb = "git",
+        .required_tokens = &.{"clean"},
+        .required_flags = &.{"-fdx"},
+        .reason = "git clean -fdx removes ignored and untracked files including build artifacts and dependencies.",
+    },
+    .{
+        .verb = "mkfs",
+        .reason = "mkfs formats a filesystem -- irreversible.",
+    },
+    .{
+        .verb = "dd",
+        .required_substring = "of=/dev/",
+        .reason = "dd writing to a block device is irreversible.",
+    },
+};
+
+/// Check a single destructive pattern against the lowercased command.
+fn matchesDestructivePattern(lower: []const u8, pat: DestructivePattern) bool {
+    if (!startsWithVerb(lower, pat.verb)) return false;
+    for (pat.required_tokens) |tok| {
+        if (!containsToken(lower, tok)) return false;
+    }
+    for (pat.required_flags) |flag| {
+        if (!hasFlag(lower, flag)) return false;
+    }
+    if (pat.required_substring) |sub| {
+        if (std.mem.indexOf(u8, lower, sub) == null) return false;
+    }
+    return true;
+}
+
 fn destructiveRule(input: ClassifierInput) ?Result {
     if (!std.mem.eql(u8, input.tool, "bash")) return null;
     const cmd = extractBashCommand(input.args_json) orelse return null;
-    const lower = lowerCmd(cmd) orelse return .{
-        .verdict = .block_hard,
-        .rule_name = "[Command Too Long]",
-        .reason = "command exceeds 4 KB; cannot safely evaluate for destructive patterns.",
-    };
+    const maybe_lower = lowerCmd(cmd);
+    if (maybe_lower == null) {
+        return .{
+            .verdict = .block_hard,
+            .rule_name = "[Command Too Long]",
+            .reason = "command exceeds 4 KB; cannot safely evaluate for destructive patterns.",
+        };
+    }
+    const lower = maybe_lower orelse unreachable; // null checked above
 
-    // `rm -rf` with any target — but allow `rm -rf` of paths clearly
-    // inside the workspace (e.g. `rm -rf build/`). A bare `rm -rf /`
-    // or `rm -rf ~` or `rm -rf $HOME` is always hard-blocked.
-    if (containsToken(lower, "rm") and (hasFlag(lower, "-rf") or hasFlag(lower, "-fr") or (hasFlag(lower, "-r") and hasFlag(lower, "-f")))) {
+    // `rm -rf` is special-cased: needs target-path safety check.
+    const has_rm = containsToken(lower, "rm");
+    const has_rf = hasFlag(lower, "-rf") or hasFlag(lower, "-fr");
+    const has_split = hasFlag(lower, "-r") and hasFlag(lower, "-f");
+    if (has_rm and (has_rf or has_split)) {
         if (rmTargetIsUnsafe(lower, input.env)) {
             return .{
                 .verdict = .block_hard,
@@ -157,75 +238,28 @@ fn destructiveRule(input: ClassifierInput) ?Result {
         }
     }
 
-    // Force-push / force-with-lease to any branch — rewrites history.
-    if (startsWithVerb(lower, "git")) {
-        if (containsToken(lower, "push") and (hasFlag(lower, "--force") or hasFlag(lower, "-f") or containsToken(lower, "--force-with-lease"))) {
-            return .{
-                .verdict = .block_hard,
-                .rule_name = "[Destructive Command]",
-                .reason = "git push --force rewrites remote history. Add to `hardDeny` to make this explicit, or `permissions.deny` for a hard guarantee.",
-            };
-        }
-        // `git reset --hard` on a tracked branch — loses uncommitted work.
-        if (containsToken(lower, "reset") and hasFlag(lower, "--hard")) {
-            return .{
-                .verdict = .block_hard,
-                .rule_name = "[Destructive Command]",
-                .reason = "git reset --hard discards uncommitted changes. Use `git stash` or commit first.",
-            };
-        }
-        // `git clean -fdx` — removes ignored + untracked files.
-        if (containsToken(lower, "clean") and hasFlag(lower, "-fdx")) {
-            return .{
-                .verdict = .block_hard,
-                .rule_name = "[Destructive Command]",
-                .reason = "git clean -fdx removes ignored and untracked files including build artifacts and dependencies.",
-            };
+    // Table-driven destructive patterns.
+    for (destructive_patterns) |pat| {
+        if (matchesDestructivePattern(lower, pat)) {
+            return .{ .verdict = .block_hard, .rule_name = "[Destructive Command]", .reason = pat.reason };
         }
     }
 
-    // Filesystem-level destructive verbs.
-    if (startsWithVerb(lower, "mkfs")) {
-        return .{
-            .verdict = .block_hard,
-            .rule_name = "[Destructive Command]",
-            .reason = "mkfs formats a filesystem — irreversible.",
-        };
-    }
-    if (startsWithVerb(lower, "dd") and (containsToken(lower, "of=/dev/") or std.mem.indexOf(u8, lower, "of=/dev/") != null)) {
-        return .{
-            .verdict = .block_hard,
-            .rule_name = "[Destructive Command]",
-            .reason = "dd writing to a block device is irreversible.",
-        };
-    }
-    // Database drops / truncates. These appear inside quoted SQL
-    // strings, so use substring search rather than token search.
+    // Substring-only patterns (no verb prefix).
     if (std.mem.indexOf(u8, lower, "drop ") != null and
         (std.mem.indexOf(u8, lower, "database") != null or
             std.mem.indexOf(u8, lower, "table") != null or
             std.mem.indexOf(u8, lower, "schema") != null))
     {
-        return .{
-            .verdict = .block_hard,
-            .rule_name = "[Destructive Command]",
-            .reason = "DROP DATABASE/TABLE/SCHEMA is irreversible.",
-        };
+        return .{ .verdict = .block_hard, .rule_name = "[Destructive Command]", .reason = "DROP DATABASE/TABLE/SCHEMA is irreversible." };
     }
     if (std.mem.indexOf(u8, lower, "truncate") != null) {
-        return .{
-            .verdict = .block_hard,
-            .rule_name = "[Destructive Command]",
-            .reason = "TRUNCATE empties a table without a WHERE clause.",
-        };
+        return .{ .verdict = .block_hard, .rule_name = "[Destructive Command]", .reason = "TRUNCATE empties a table without a WHERE clause." };
     }
-    // `chmod -R 777 /` / `chmod 777 /` — broad permission relaxation.
-    if (containsToken(lower, "chmod") and containsToken(lower, "777") and (std.mem.indexOf(u8, lower, " /") != null or std.mem.startsWith(u8, std.mem.trim(u8, lower, " \t"), "chmod 777 /"))) {
-        return .{
-            .verdict = .block_hard,
-            .rule_name = "[Destructive Command]",
-            .reason = "chmod 777 on a root path relaxes permissions broadly.",
-        };
+    if (containsToken(lower, "chmod") and containsToken(lower, "777") and
+        (std.mem.indexOf(u8, lower, " /") != null or std.mem.startsWith(u8, std.mem.trim(u8, lower, " \t"), "chmod 777 /")))
+    {
+        return .{ .verdict = .block_hard, .rule_name = "[Destructive Command]", .reason = "chmod 777 on a root path relaxes permissions broadly." };
     }
 
     return null;
