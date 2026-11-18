@@ -1108,6 +1108,7 @@ pub fn applyPermissionsSettingsOverlay(
     }
 }
 
+
 /// v1.19.0 — settings-layer default for `--prompts`. CLI flag
 /// always wins. Returns `true` when prompts should be enabled
 /// at this layer (settings says so AND CLI didn't set it).

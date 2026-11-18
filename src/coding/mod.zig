@@ -66,6 +66,8 @@ pub const security = struct {
     pub const auth = @import("security/auth.zig");
     pub const path_safety = @import("security/path_safety.zig");
     pub const env_denylist = @import("security/env_denylist.zig");
+    /// v3.x — auto-mode classifier (local rule engine).
+    pub const auto_mode = @import("security/auto_mode.zig");
 };
 pub const model_catalog = struct {
     pub const models = @import("model_catalog/models.zig");
@@ -129,6 +131,7 @@ test {
     _ = security.auth;
     _ = security.path_safety;
     _ = security.env_denylist;
+    _ = security.auto_mode;
     _ = model_catalog.models;
     _ = model_catalog.render;
     _ = model_catalog.fetch;

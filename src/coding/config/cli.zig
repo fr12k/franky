@@ -265,6 +265,19 @@ pub const Config = struct {
     /// runs. Off by default — every session is fresh-state.
     remember_permissions: bool = false,
 
+    // ─── v3.x — auto mode (classifier-based permission gating) ──────
+    /// `--auto` — enable the auto-mode classifier. Auto-approves
+    /// routine, reversible, in-scope tool calls; blocks irreversible /
+    /// destructive / exfiltration-y calls with a named rule. Honors
+    /// `permissions.deny` / `permissions.ask` (evaluated first) and
+    /// `autoMode.allow` (exceptions that skip the classifier).
+    auto: bool = false,
+    /// `--auto-allow <csv>` — append to `autoMode.allow` for this run
+    /// (lift-only, additive over settings).
+    auto_allow_csv: ?[]const u8 = null,
+    /// `--auto-deny <csv>` — append to `autoMode.hardDeny` for this run.
+    auto_deny_csv: ?[]const u8 = null,
+
     /// `--mcp-configs <csv>` — comma-separated paths to MCP server
     /// config files (JSON with `mcpServers` key). Tools from all
     /// configured servers are discovered at startup and appended to
@@ -482,6 +495,11 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--remember-permissions")) {
         cfg.remember_permissions = true;
+        return true;
+    }
+    // v3.x — auto mode flags.
+    if (std.mem.eql(u8, name, "--auto")) {
+        cfg.auto = true;
         return true;
     }
     if (std.mem.eql(u8, name, "--log-per-session")) {
@@ -720,6 +738,10 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         cfg.deny_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--ask-tools")) {
         cfg.ask_tools_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--auto-allow")) {
+        cfg.auto_allow_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
+    } else if (std.mem.eql(u8, name, "--auto-deny")) {
+        cfg.auto_deny_csv = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--mcp-configs")) {
         const v = try takeValue(argv, i, inline_value);
         if (cfg.mcp_configs) |existing| {
@@ -830,6 +852,11 @@ pub const usage_text: []const u8 =
     \\  --ask-tools LIST             CSV; demote default-auto_allow tools to "ask"
     \\                               (e.g. read,find or "all" for every tool)
     \\  --remember-permissions       Persist always-allow/deny to permissions.json
+    \\  --auto                       Enable auto-mode classifier (v3.x): auto-approve
+    \\                               routine calls, block destructive/exfiltration ones.
+    \\                               Honors permissions.deny/ask; autoMode.allow is exceptions.
+    \\  --auto-allow LIST            CSV appended to autoMode.allow (additive over settings)
+    \\  --auto-deny LIST             CSV appended to autoMode.hardDeny (additive over settings)
     \\  --mcp-configs FILES          Comma-separated MCP server config files (JSON
     \\                               with `mcpServers` key). Repeatable. Tools from
     \\                               all servers are discovered at startup and added
