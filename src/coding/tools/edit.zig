@@ -746,8 +746,9 @@ fn computeUnifiedDiff(
 /// transcript aggregate. Runs the same LCS diff as `computeUnifiedDiff`
 /// but only tallies `.add`/`.remove` ops (no string building), so it is
 /// cheaper and shares the 2000-line cap. On `error.TooLarge` it falls
-/// back to a raw line-count delta (added = new lines, removed = 0) so
-/// the cost-state line is still populated for large edits.
+/// back to a raw line-count delta (net added = new−old lines, or net
+/// removed = old−new lines) so the cost-state line is still populated
+/// for large edits.
 const LineCounts = struct { added: u64, removed: u64 };
 
 pub fn countDiffLines(

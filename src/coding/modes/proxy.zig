@@ -3404,7 +3404,7 @@ fn countTranscriptMessages(
         var it = std.mem.splitScalar(u8, bytes[0..n], '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
-            if (line.len > 10 and std.mem.eql(u8, line[0..9], "{\"type\":\"")) continue;
+            if (line.len >= 9 and std.mem.eql(u8, line[0..9], "{\"type\":\"")) continue;
             count += 1;
         }
         return count;
@@ -3760,6 +3760,8 @@ fn swapToFreshSession(session: *Session, id_override: ?[]const u8) !void {
 
     session.transcript.deinit();
     session.transcript = new_transcript;
+    // v1.32.0 — reset the cost-state accumulator for the fresh session.
+    session.cost_state = .{};
     session.allocator.free(session.session_id);
     session.session_id = new_id;
     session.created_at_ms = ai.stream.nowMillis();
@@ -3774,6 +3776,10 @@ fn swapToLoadedSession(session: *Session, loaded: *session_mod.Session, target_i
 
     session.transcript.deinit();
     session.transcript = loaded.transcript;
+    // v1.32.0 — restore the cost-state accumulator from the loaded
+    // transcript so resumed sessions keep their cumulative durations /
+    // line counts / start time.
+    session.cost_state = if (loaded.transcript.cost_state) |cs| cs else .{};
     session.allocator.free(session.session_id);
     session.session_id = new_id;
     session.created_at_ms = loaded.header.created_at_ms;

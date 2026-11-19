@@ -140,6 +140,10 @@ pub const SessionState = struct {
                 .created_at_ms = created_ms,
                 .tree = tree,
                 .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator, io),
+                // v1.32.0 — restore the cost-state accumulator from the
+                // loaded transcript so resumed sessions keep their
+                // cumulative durations / line counts / start time.
+                .cost_state = if (transcript.cost_state) |cs| cs else .{},
             };
             state.ccr_ctx = .{ .store = &state.ccr_store, .stats = &state.compression_stats };
             state.compression_ctx.ccr_store = &state.ccr_store;

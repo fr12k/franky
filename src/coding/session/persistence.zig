@@ -423,8 +423,17 @@ fn parseTranscriptJsonl(
         // than mis-parsed as empty user messages.
         const type_str = strOpt(obj, "type") orelse "";
         if (type_str.len > 0) {
-            if (first_line and std.mem.eql(u8, type_str, "meta")) {
+            // Validate the schema version whenever we see a meta line,
+            // regardless of position — a hand-edited file could place
+            // a cost-state line before the meta header.
+            if (std.mem.eql(u8, type_str, "meta")) {
                 if (parseVersionField(obj) > current_transcript_version) return error.UnsupportedTranscriptVersion;
+            }
+            // v1.32.0 — restore the CostState accumulator from the
+            // last cost-state line so resumed sessions keep their
+            // cumulative durations / line counts / start time.
+            if (std.mem.eql(u8, type_str, "cost-state")) {
+                transcript.cost_state = parseCostState(obj);
             }
             first_line = false;
             // All typed lines (meta, cost-state, …) are bookkeeping —
@@ -466,6 +475,36 @@ fn parseTranscriptLegacyJson(
         try transcript.append(msg);
     }
     return transcript;
+}
+
+/// v1.32.0 — parse a `cost-state` line back into a `CostState` so
+/// resumed sessions keep their cumulative durations, line counts, and
+/// start time. Only the fields that cannot be derived from
+/// per-message usage are restored; `modelUsage` / `totalCostUSD` /
+/// `hasUnknownModelCost` are always recomputed from the transcript
+/// at write time, so they are not stored here.
+fn parseCostState(o: std.json.ObjectMap) ai.types.CostState {
+    var cs: ai.types.CostState = .{};
+    if (o.get("totalAPIDuration")) |v| if (v == .integer and v.integer >= 0) {
+        cs.total_api_duration_ms = @intCast(v.integer);
+    };
+    if (o.get("totalAPIDurationWithoutRetries")) |v| if (v == .integer and v.integer >= 0) {
+        cs.total_api_duration_without_retries_ms = @intCast(v.integer);
+    };
+    if (o.get("totalToolDuration")) |v| if (v == .integer and v.integer >= 0) {
+        cs.total_tool_duration_ms = @intCast(v.integer);
+    };
+    if (o.get("totalLinesAdded")) |v| if (v == .integer and v.integer >= 0) {
+        cs.total_lines_added = @intCast(v.integer);
+    };
+    if (o.get("totalLinesRemoved")) |v| if (v == .integer and v.integer >= 0) {
+        cs.total_lines_removed = @intCast(v.integer);
+    };
+    if (o.get("startTime")) |v| if (v == .integer) {
+        cs.start_time_ms = v.integer;
+        cs.started = true;
+    };
+    return cs;
 }
 
 /// Compute the SHA-256 of a canonical UTF-8 string. Used for
@@ -723,13 +762,19 @@ fn renderCostStateLine(
         if (u.isEmpty()) continue;
         const prov = m.provider orelse "unknown";
         const mdl = m.model orelse "unknown";
+        // Allocate the accumulator BEFORE inserting so a create() failure
+        // can't leave an uninitialized value pointer in the map. The
+        // key is freed on the found-existing path or owned by the map
+        // on the insert path; errdefer covers the getOrPut-failure case.
         const key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prov, mdl });
+        errdefer allocator.free(key);
         const gop = try models.getOrPut(key);
         if (gop.found_existing) {
             allocator.free(key);
         } else {
-            gop.value_ptr.* = try allocator.create(ModelUsageAccum);
-            gop.value_ptr.*.* = .{};
+            const acc = try allocator.create(ModelUsageAccum);
+            acc.* = .{};
+            gop.value_ptr.* = acc;
         }
         const acc = gop.value_ptr.*;
         acc.input_tokens += u.input;

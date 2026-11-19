@@ -152,6 +152,12 @@ pub const AfterToolCallFn = *const fn (
 pub const Transcript = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(AgentMessage) = .empty,
+    /// v1.32.0 — session cost-state accumulator, restored from the
+    /// `cost-state` line on `readTranscript` so resumed sessions keep
+    /// their cumulative durations / line counts / start time. `null`
+    /// when the transcript has no cost-state line (fresh session or
+    /// pre-v1.32 transcript).
+    cost_state: ?ai.types.CostState = null,
 
     pub fn init(allocator: std.mem.Allocator) Transcript {
         return .{ .allocator = allocator };

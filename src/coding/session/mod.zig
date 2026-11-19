@@ -943,11 +943,18 @@ test "v1.32: cost-state line is appended and round-trips" {
     try testing.expect(std.mem.indexOf(u8, t_bytes, "\"hasUnknownModelCost\":false") != null);
 
     // Round-trip: readTranscript must skip the cost-state line (not
-    // treat it as a message).
+    // treat it as a message) AND restore the CostState accumulator.
     var loaded = try load(gpa, io, base, "01JCOST");
     defer loaded.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
     try testing.expectEqual(@as(u64, 2), loaded.transcript.messages.items[0].usage.?.input);
     try testing.expectEqual(@as(u64, 824), loaded.transcript.messages.items[0].usage.?.thinking_tokens);
     try testing.expectEqual(@as(u64, 30175), loaded.transcript.messages.items[0].usage.?.cache_creation_ephemeral_5m);
+    // v1.32.0 — CostState restored from the cost-state line.
+    try testing.expect(loaded.transcript.cost_state != null);
+    const rcs = loaded.transcript.cost_state.?;
+    try testing.expectEqual(@as(u64, 13121), rcs.total_api_duration_ms);
+    try testing.expectEqual(@as(u64, 13069), rcs.total_api_duration_without_retries_ms);
+    try testing.expectEqual(@as(u64, 1793834435445), @as(u64, @intCast(rcs.start_time_ms)));
+    try testing.expect(rcs.started);
 }
