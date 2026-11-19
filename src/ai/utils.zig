@@ -342,3 +342,101 @@ test "sanitizeJsonString: result decodes through std.json" {
     const new_val = parsed.value.object.get("new").?.string;
     try testing.expectEqualStrings("<|\\const x", new_val);
 }
+
+// ─── JSON field extraction helpers ────────────────────────────────
+//
+// These replace the repetitive `if (obj.get("key")) |v| if (v == .X)`
+// idiom that appears 85+ times across providers, session, config, and
+// security modules. Each helper does the lookup + type check + cast
+// in one call, returning null when the key is absent or the value is
+// the wrong type.
+
+/// Extract an integer field as u64, or null if absent/not an integer.
+/// Negative integers return null (the value does not fit in u64).
+pub fn jsonInt(o: std.json.ObjectMap, key: []const u8) ?u64 {
+    if (o.get(key)) |v| if (v == .integer and v.integer >= 0) return @intCast(v.integer);
+    return null;
+}
+
+/// Extract a string field as a borrowed slice, or null if absent/not a
+/// string. Caller does NOT own the slice — it lives as long as the
+/// `std.json.Value` it came from.
+pub fn jsonStr(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (o.get(key)) |v| if (v == .string) return v.string;
+    return null;
+}
+
+/// Extract a float field as f64, accepting both `.float` and `.integer`
+/// JSON value tags (many providers send costs as integers). Returns null
+/// if absent or not numeric.
+pub fn jsonFloat(o: std.json.ObjectMap, key: []const u8) ?f64 {
+    if (o.get(key)) |v| return jsonF64Value(v);
+    return null;
+}
+
+/// Extract a bool field, or null if absent/not a bool.
+pub fn jsonBool(o: std.json.ObjectMap, key: []const u8) ?bool {
+    if (o.get(key)) |v| if (v == .bool) return v.bool;
+    return null;
+}
+
+/// Extract a nested object field as an `ObjectMap`, or null if absent/
+/// not an object.
+pub fn jsonObj(o: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    if (o.get(key)) |v| if (v == .object) return v.object;
+    return null;
+}
+
+/// Extract a nested array field, or null if absent/not an array.
+pub fn jsonArr(o: std.json.ObjectMap, key: []const u8) ?std.json.Array {
+    if (o.get(key)) |v| if (v == .array) return v.array;
+    return null;
+}
+
+/// Coerce a single `std.json.Value` to f64 (accepts `.float` and
+/// `.integer`). This is the value-level variant of `jsonFloat`; use
+/// it when you already have the value (e.g. from a `switch` arm).
+pub fn jsonF64Value(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .float => v.float,
+        .integer => @floatFromInt(v.integer),
+        else => null,
+    };
+}
+
+test "jsonInt: extracts integer or null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"a\":42,\"b\":\"x\"}", .{});
+    const obj = parsed.value.object;
+    try testing.expectEqual(@as(?u64, 42), jsonInt(obj, "a"));
+    try testing.expectEqual(@as(?u64, null), jsonInt(obj, "b"));
+    try testing.expectEqual(@as(?u64, null), jsonInt(obj, "missing"));
+}
+
+test "jsonStr: extracts string or null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"a\":\"hi\",\"b\":1}", .{});
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("hi", jsonStr(obj, "a").?);
+    try testing.expectEqual(@as(?[]const u8, null), jsonStr(obj, "b"));
+}
+
+test "jsonFloat: accepts integer and float" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"a\":3,\"b\":1.5}", .{});
+    const obj = parsed.value.object;
+    try testing.expectEqual(@as(?f64, 3.0), jsonFloat(obj, "a"));
+    try testing.expectEqual(@as(?f64, 1.5), jsonFloat(obj, "b"));
+}
+
+test "jsonBool: extracts bool or null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), "{\"a\":true,\"b\":1}", .{});
+    const obj = parsed.value.object;
+    try testing.expectEqual(@as(?bool, true), jsonBool(obj, "a"));
+    try testing.expectEqual(@as(?bool, null), jsonBool(obj, "b"));
+}

@@ -21,6 +21,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const utils = @import("../../ai/utils.zig");
 
 /// Local-checkout fallback settings embedded into the binary by build.zig. This
 /// is primarily useful when Franky is copied into an isolated benchmark/container
@@ -301,128 +302,128 @@ pub fn loadLayered(
 
 fn applyTopLevelFields(settings: *Settings, obj: std.json.ObjectMap) !void {
     const alloc = settings.allocator;
-    if (obj.get("defaultProvider")) |v| if (v == .string) {
+    if (utils.jsonStr(obj, "defaultProvider")) |s| {
         alloc.free(settings.default_provider);
-        settings.default_provider = try alloc.dupe(u8, v.string);
-    };
-    if (obj.get("defaultModels")) |v| if (v == .object) {
-        if (v.object.get("anthropic")) |a| if (a == .string) {
+        settings.default_provider = try alloc.dupe(u8, s);
+    }
+    if (utils.jsonObj(obj, "defaultModels")) |dm| {
+        if (utils.jsonStr(dm, "anthropic")) |s| {
             alloc.free(settings.default_model_anthropic);
-            settings.default_model_anthropic = try alloc.dupe(u8, a.string);
-        };
-        if (v.object.get("openai")) |o| if (o == .string) {
+            settings.default_model_anthropic = try alloc.dupe(u8, s);
+        }
+        if (utils.jsonStr(dm, "openai")) |s| {
             alloc.free(settings.default_model_openai);
-            settings.default_model_openai = try alloc.dupe(u8, o.string);
-        };
-    };
-    if (obj.get("thinking")) |v| if (v == .string) {
+            settings.default_model_openai = try alloc.dupe(u8, s);
+        }
+    }
+    if (utils.jsonStr(obj, "thinking")) |s| {
         alloc.free(settings.thinking);
-        settings.thinking = try alloc.dupe(u8, v.string);
-    };
-    if (obj.get("autoCompact")) |v| if (v == .bool) {
-        settings.auto_compact = v.bool;
-    };
-    if (obj.get("keybindings")) |v| if (v == .string) {
-        if (std.mem.eql(u8, v.string, "vi")) settings.keybindings = .vi;
-        if (std.mem.eql(u8, v.string, "emacs")) settings.keybindings = .emacs;
-    };
-    if (obj.get("theme")) |v| if (v == .string) {
+        settings.thinking = try alloc.dupe(u8, s);
+    }
+    if (utils.jsonBool(obj, "autoCompact")) |b| {
+        settings.auto_compact = b;
+    }
+    if (utils.jsonStr(obj, "keybindings")) |s| {
+        if (std.mem.eql(u8, s, "vi")) settings.keybindings = .vi;
+        if (std.mem.eql(u8, s, "emacs")) settings.keybindings = .emacs;
+    }
+    if (utils.jsonStr(obj, "theme")) |s| {
         alloc.free(settings.theme);
-        settings.theme = try alloc.dupe(u8, v.string);
-    };
+        settings.theme = try alloc.dupe(u8, s);
+    }
 }
 
 fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
-    if (obj.get("tools")) |tools_v| if (tools_v == .object) {
-        if (tools_v.object.get("bash")) |bash_v| if (bash_v == .object) {
-            if (bash_v.object.get("timeoutMs")) |t| if (t == .integer and t.integer >= 1) {
-                settings.bash_timeout_ms = @intCast(t.integer);
+    if (utils.jsonObj(obj, "tools")) |tools_v| {
+        if (utils.jsonObj(tools_v, "bash")) |bash_v| {
+            if (utils.jsonInt(bash_v, "timeoutMs")) |t| if (t >= 1) {
+                settings.bash_timeout_ms = @intCast(t);
             };
+        }
+        if (utils.jsonObj(tools_v, "read")) |read_v| {
+            if (utils.jsonInt(read_v, "maxBytes")) |m| if (m >= 1) {
+                settings.read_max_bytes = @intCast(m);
+            };
+        }
+        if (utils.jsonInt(tools_v, "maxFullToolResults")) |v| if (v <= std.math.maxInt(u32)) {
+            settings.max_full_tool_results = @intCast(v);
         };
-        if (tools_v.object.get("read")) |read_v| if (read_v == .object) {
-            if (read_v.object.get("maxBytes")) |m| if (m == .integer and m.integer >= 1) {
-                settings.read_max_bytes = @intCast(m.integer);
+        if (utils.jsonObj(tools_v, "retry")) |retry_v| {
+            if (utils.jsonInt(retry_v, "maxAttempts")) |rv| if (rv <= std.math.maxInt(u32)) {
+                settings.retry_max_attempts = @intCast(rv);
             };
-        };
-        if (tools_v.object.get("maxFullToolResults")) |v| if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
-            settings.max_full_tool_results = @intCast(v.integer);
-        };
-        if (tools_v.object.get("retry")) |retry_v| if (retry_v == .object) {
-            if (retry_v.object.get("maxAttempts")) |rv| if (rv == .integer and rv.integer >= 0 and rv.integer <= std.math.maxInt(u32)) {
-                settings.retry_max_attempts = @intCast(rv.integer);
+            if (utils.jsonInt(retry_v, "maxTotalMs")) |t| {
+                settings.retry_max_total_ms = @intCast(t);
+            }
+        }
+        if (utils.jsonObj(tools_v, "compress")) |compress_v| {
+            if (utils.jsonBool(compress_v, "enabled")) |b| {
+                settings.compress_enabled = b;
+            }
+            if (utils.jsonInt(compress_v, "minBytes")) |v| if (v >= 1) {
+                settings.compress_min_bytes = @intCast(v);
             };
-            if (retry_v.object.get("maxTotalMs")) |t| if (t == .integer and t.integer >= 0) {
-                settings.retry_max_total_ms = @intCast(t.integer);
-            };
-        };
-        if (tools_v.object.get("compress")) |compress_v| if (compress_v == .object) {
-            if (compress_v.object.get("enabled")) |v| if (v == .bool) {
-                settings.compress_enabled = v.bool;
-            };
-            if (compress_v.object.get("minBytes")) |v| if (v == .integer and v.integer >= 1) {
-                settings.compress_min_bytes = @intCast(v.integer);
-            };
-            if (compress_v.object.get("ccr")) |v| if (v == .bool) {
-                settings.compress_ccr = v.bool;
-            };
-            if (compress_v.object.get("json")) |v| if (v == .bool) {
-                settings.compress_json = v.bool;
-            };
-            if (compress_v.object.get("logs")) |v| if (v == .bool) {
-                settings.compress_logs = v.bool;
-            };
-            if (compress_v.object.get("search")) |v| if (v == .bool) {
-                settings.compress_search = v.bool;
-            };
-            if (compress_v.object.get("diff")) |v| if (v == .bool) {
-                settings.compress_diff = v.bool;
-            };
-            if (compress_v.object.get("code")) |v| if (v == .bool) {
-                settings.compress_code = v.bool;
-            };
-            if (compress_v.object.get("plainText")) |v| if (v == .bool) {
-                settings.compress_plain_text = v.bool;
-            };
-        };
+            if (utils.jsonBool(compress_v, "ccr")) |b| {
+                settings.compress_ccr = b;
+            }
+            if (utils.jsonBool(compress_v, "json")) |b| {
+                settings.compress_json = b;
+            }
+            if (utils.jsonBool(compress_v, "logs")) |b| {
+                settings.compress_logs = b;
+            }
+            if (utils.jsonBool(compress_v, "search")) |b| {
+                settings.compress_search = b;
+            }
+            if (utils.jsonBool(compress_v, "diff")) |b| {
+                settings.compress_diff = b;
+            }
+            if (utils.jsonBool(compress_v, "code")) |b| {
+                settings.compress_code = b;
+            }
+            if (utils.jsonBool(compress_v, "plainText")) |b| {
+                settings.compress_plain_text = b;
+            }
+        }
 
         // v3.2 — tools.memory.{enabled, nudge}
-        if (tools_v.object.get("memory")) |mem_v| if (mem_v == .object) {
-            if (mem_v.object.get("enabled")) |v| if (v == .bool) {
-                settings.memory_enabled = v.bool;
-            };
-            if (mem_v.object.get("nudge")) |v| if (v == .bool) {
-                settings.memory_nudge = v.bool;
-            };
-        };
-    };
+        if (utils.jsonObj(tools_v, "memory")) |mem_v| {
+            if (utils.jsonBool(mem_v, "enabled")) |b| {
+                settings.memory_enabled = b;
+            }
+            if (utils.jsonBool(mem_v, "nudge")) |b| {
+                settings.memory_nudge = b;
+            }
+        }
+    }
 }
 
 fn applyPermissionsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     const alloc = settings.allocator;
-    if (obj.get("permissions")) |perms_v| if (perms_v == .object) {
-        if (perms_v.object.get("ask_all")) |b| if (b == .bool) {
-            settings.permissions_ask_all = b.bool;
-        };
-        if (perms_v.object.get("yes_to_all")) |b| if (b == .bool) {
-            settings.permissions_yes_to_all = b.bool;
-        };
-        if (perms_v.object.get("always_allow")) |aa| if (aa == .object) {
-            if (aa.object.get("tools")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.permissions_always_allow_tools, arr.array);
-            };
-            if (aa.object.get("bash")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.permissions_always_allow_bash, arr.array);
-            };
-        };
-        if (perms_v.object.get("always_deny")) |ad| if (ad == .object) {
-            if (ad.object.get("tools")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.permissions_always_deny_tools, arr.array);
-            };
-            if (ad.object.get("bash")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.permissions_always_deny_bash, arr.array);
-            };
-        };
-    };
+    if (utils.jsonObj(obj, "permissions")) |perms_v| {
+        if (utils.jsonBool(perms_v, "ask_all")) |b| {
+            settings.permissions_ask_all = b;
+        }
+        if (utils.jsonBool(perms_v, "yes_to_all")) |b| {
+            settings.permissions_yes_to_all = b;
+        }
+        if (utils.jsonObj(perms_v, "always_allow")) |aa| {
+            if (utils.jsonArr(aa, "tools")) |arr| {
+                try appendStringArray(alloc, &settings.permissions_always_allow_tools, arr);
+            }
+            if (utils.jsonArr(aa, "bash")) |arr| {
+                try appendStringArray(alloc, &settings.permissions_always_allow_bash, arr);
+            }
+        }
+        if (utils.jsonObj(perms_v, "always_deny")) |ad| {
+            if (utils.jsonArr(ad, "tools")) |arr| {
+                try appendStringArray(alloc, &settings.permissions_always_deny_tools, arr);
+            }
+            if (utils.jsonArr(ad, "bash")) |arr| {
+                try appendStringArray(alloc, &settings.permissions_always_deny_bash, arr);
+            }
+        }
+    }
 }
 
 /// v3.x — parse the `autoMode` settings block. Called ONLY from
@@ -431,65 +432,65 @@ fn applyPermissionsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
 /// inline); scalars use last-write-wins.
 fn applyAutoModeSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     const alloc = settings.allocator;
-    if (obj.get("autoMode")) |am| if (am == .object) {
+    if (utils.jsonObj(obj, "autoMode")) |am| {
         // environment sub-object.
-        if (am.object.get("environment")) |env| if (env == .object) {
-            if (env.object.get("trustedRepos")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.auto_trusted_repos, arr.array);
-            };
-            if (env.object.get("sourceControl")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.auto_source_control, arr.array);
-            };
-            if (env.object.get("trustedDomains")) |arr| if (arr == .array) {
-                try appendStringArray(alloc, &settings.auto_trusted_domains, arr.array);
-            };
+        if (utils.jsonObj(am, "environment")) |env| {
+            if (utils.jsonArr(env, "trustedRepos")) |arr| {
+                try appendStringArray(alloc, &settings.auto_trusted_repos, arr);
+            }
+            if (utils.jsonArr(env, "sourceControl")) |arr| {
+                try appendStringArray(alloc, &settings.auto_source_control, arr);
+            }
+            if (utils.jsonArr(env, "trustedDomains")) |arr| {
+                try appendStringArray(alloc, &settings.auto_trusted_domains, arr);
+            }
             // Removed: trustedBuckets, internalPackageRegistries, cicdDeployTargets
             // — no classifier rule reads them.
             // networkPosture sub-object.
-            if (env.object.get("networkPosture")) |np| if (np == .object) {
-                if (np.object.get("cloudMetadataReachable")) |b| if (b == .bool) {
-                    settings.auto_cloud_metadata_reachable = b.bool;
-                };
-            };
+            if (utils.jsonObj(env, "networkPosture")) |np| {
+                if (utils.jsonBool(np, "cloudMetadataReachable")) |b| {
+                    settings.auto_cloud_metadata_reachable = b;
+                }
+            }
             // workspaceRoot override.
-            if (env.object.get("workspaceRoot")) |wr| if (wr == .string) {
+            if (utils.jsonStr(env, "workspaceRoot")) |wr| {
                 if (settings.auto_workspace_root) |old| alloc.free(old);
-                settings.auto_workspace_root = try alloc.dupe(u8, wr.string);
-            };
-        };
+                settings.auto_workspace_root = try alloc.dupe(u8, wr);
+            }
+        }
         // allow / softDeny / hardDeny arrays.
-        if (am.object.get("allow")) |arr| if (arr == .array) {
-            try appendStringArray(alloc, &settings.auto_allow, arr.array);
-        };
-        if (am.object.get("softDeny")) |arr| if (arr == .array) {
-            try appendStringArray(alloc, &settings.auto_soft_deny, arr.array);
-        };
-        if (am.object.get("hardDeny")) |arr| if (arr == .array) {
-            try appendStringArray(alloc, &settings.auto_hard_deny, arr.array);
-        };
-    };
+        if (utils.jsonArr(am, "allow")) |arr| {
+            try appendStringArray(alloc, &settings.auto_allow, arr);
+        }
+        if (utils.jsonArr(am, "softDeny")) |arr| {
+            try appendStringArray(alloc, &settings.auto_soft_deny, arr);
+        }
+        if (utils.jsonArr(am, "hardDeny")) |arr| {
+            try appendStringArray(alloc, &settings.auto_hard_deny, arr);
+        }
+    }
 }
 
 fn applyReviewSection(settings: *Settings, obj: std.json.ObjectMap) !void {
     const alloc = settings.allocator;
-    if (obj.get("review")) |rev_v| if (rev_v == .object) {
-        if (rev_v.object.get("profiles")) |p| if (p == .array) {
-            try appendStringArray(alloc, &settings.review_profiles, p.array);
+    if (utils.jsonObj(obj, "review")) |rev_v| {
+        if (utils.jsonArr(rev_v, "profiles")) |p| {
+            try appendStringArray(alloc, &settings.review_profiles, p);
+        }
+        if (utils.jsonInt(rev_v, "minModels")) |m| if (m >= 1) {
+            settings.review_min_models = @intCast(m);
         };
-        if (rev_v.object.get("minModels")) |m| if (m == .integer and m.integer >= 1) {
-            settings.review_min_models = @intCast(m.integer);
+        if (utils.jsonInt(rev_v, "maxModels")) |m| if (m >= 1) {
+            settings.review_max_models = @intCast(m);
         };
-        if (rev_v.object.get("maxModels")) |m| if (m == .integer and m.integer >= 1) {
-            settings.review_max_models = @intCast(m.integer);
-        };
-        if (rev_v.object.get("timeoutMs")) |t| if (t == .integer and t.integer >= 1) {
-            settings.review_timeout_ms = @intCast(t.integer);
+        if (utils.jsonInt(rev_v, "timeoutMs")) |t| if (t >= 1) {
+            settings.review_timeout_ms = @intCast(t);
         };
         // v2.16 — validate that minModels <= maxModels; clamp if not.
         if (settings.review_min_models > settings.review_max_models) {
             settings.review_min_models = settings.review_max_models;
         }
-    };
+    }
 }
 
 fn applyLayer(settings: *Settings, io: std.Io, path: []const u8, layer: Layer) !bool {

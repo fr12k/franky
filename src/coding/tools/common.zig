@@ -12,6 +12,7 @@ const std = @import("std");
 const mem = std.mem;
 const ai = struct {
     pub const types = @import("../../ai/types.zig");
+    pub const utils = @import("../../ai/utils.zig");
 };
 const at = @import("../../agent/types.zig");
 const gitignore = @import("../gitignore.zig");

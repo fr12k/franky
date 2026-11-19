@@ -37,15 +37,7 @@ const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
 pub const default_endpoint: []const u8 = "https://api.openai.com/v1/chat/completions";
 
-/// Extract an f64 from a JSON value that may be either `.float`
-/// or `.integer` (whole-number costs like `0` are tagged `.integer`).
-fn jsonF64(v: std.json.Value) ?f64 {
-    return switch (v) {
-        .float => v.float,
-        .integer => @floatFromInt(v.integer),
-        else => null,
-    };
-}
+// v1.33.0 — `jsonF64` moved to `ai/utils.zig` as `jsonF64Value`.
 
 // ─── request serialization ────────────────────────────────────────
 
@@ -450,17 +442,17 @@ const Driver = struct {
             // and MLX-serve expose `completion_tokens_details.reasoning_tokens`.
             var thinking: u64 = 0;
             if (uv.object.get("prompt_tokens_details")) |ptd| if (ptd == .object) {
-                if (ptd.object.get("cached_tokens")) |v| if (v == .integer) {
-                    cache_read = @intCast(v.integer);
-                };
-                if (ptd.object.get("cache_write_tokens")) |v| if (v == .integer) {
-                    cache_write = @intCast(v.integer);
-                };
+                if (utils.jsonInt(ptd.object, "cached_tokens")) |v| {
+                    cache_read = v;
+                }
+                if (utils.jsonInt(ptd.object, "cache_write_tokens")) |v| {
+                    cache_write = v;
+                }
             };
             if (uv.object.get("completion_tokens_details")) |ctd| if (ctd == .object) {
-                if (ctd.object.get("reasoning_tokens")) |v| if (v == .integer) {
-                    thinking = @intCast(v.integer);
-                };
+                if (utils.jsonInt(ctd.object, "reasoning_tokens")) |v| {
+                    thinking = v;
+                }
             };
 
             // OpenRouter puts a top-level `cost` (total USD) plus a
@@ -472,16 +464,16 @@ const Driver = struct {
             var cost_output: ?f64 = null;
             if (uv.object.get("cost_details")) |cd| if (cd == .object) {
                 if (cd.object.get("upstream_inference_prompt_cost")) |v| {
-                    cost_input = jsonF64(v);
+                    cost_input = utils.jsonF64Value(v);
                 }
                 if (cd.object.get("upstream_inference_completions_cost")) |v| {
-                    cost_output = jsonF64(v);
+                    cost_output = utils.jsonF64Value(v);
                 }
             };
             // Top-level `cost` (total USD). Used as a fallback for
             // any category that cost_details did not fill.
             const top_cost: ?f64 = blk: {
-                if (uv.object.get("cost")) |v| break :blk jsonF64(v);
+                if (uv.object.get("cost")) |v| break :blk utils.jsonF64Value(v);
                 break :blk null;
             };
             if (top_cost) |tc| {

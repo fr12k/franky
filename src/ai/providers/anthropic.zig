@@ -506,26 +506,26 @@ const Driver = struct {
                 // v1.31.0 — Anthropic cache tokens.
                 var cache_read: u64 = 0;
                 var cache_write: u64 = 0;
-                if (uv.object.get("cache_read_input_tokens")) |v| if (v == .integer) {
-                    cache_read = @intCast(v.integer);
-                };
+                if (utils.jsonInt(uv.object, "cache_read_input_tokens")) |v| {
+                    cache_read = v;
+                }
                 var eph_5m: u64 = 0;
                 var eph_1h: u64 = 0;
-                if (uv.object.get("cache_creation_input_tokens")) |v| if (v == .integer) {
-                    cache_write = @intCast(v.integer);
-                };
+                if (utils.jsonInt(uv.object, "cache_creation_input_tokens")) |v| {
+                    cache_write = v;
+                }
                 // v1.32.0 — Anthropic breaks cache_creation down by TTL
                 // window in a `cache_creation` sub-object. The aggregate
                 // `cache_creation_input_tokens` equals 5m + 1h; we keep
                 // both the aggregate (cache_write) and the per-TTL split
                 // for the cost-state line.
                 if (uv.object.get("cache_creation")) |cc| if (cc == .object) {
-                    if (cc.object.get("ephemeral_5m_input_tokens")) |e| if (e == .integer) {
-                        eph_5m = @intCast(e.integer);
-                    };
-                    if (cc.object.get("ephemeral_1h_input_tokens")) |e| if (e == .integer) {
-                        eph_1h = @intCast(e.integer);
-                    };
+                    if (utils.jsonInt(cc.object, "ephemeral_5m_input_tokens")) |e| {
+                        eph_5m = e;
+                    }
+                    if (utils.jsonInt(cc.object, "ephemeral_1h_input_tokens")) |e| {
+                        eph_1h = e;
+                    }
                 };
                 // Fallback: when the sub-object is absent but the
                 // aggregate is non-zero, attribute it all to 5m (the
@@ -535,9 +535,9 @@ const Driver = struct {
                 // `output_tokens_details.thinking_tokens`.
                 var thinking: u64 = 0;
                 if (uv.object.get("output_tokens_details")) |otd| if (otd == .object) {
-                    if (otd.object.get("thinking_tokens")) |t| if (t == .integer) {
-                        thinking = @intCast(t.integer);
-                    };
+                    if (utils.jsonInt(otd.object, "thinking_tokens")) |t| {
+                        thinking = t;
+                    }
                 };
                 try self.out.push(self.io, .{ .usage = .{
                     .input = inp,

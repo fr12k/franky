@@ -351,15 +351,15 @@ const Driver = struct {
                     var cache_read: u64 = 0;
                     var thinking: u64 = 0;
                     if (uv.object.get("input_tokens_details")) |itd| if (itd == .object) {
-                        if (itd.object.get("cached_tokens")) |v| if (v == .integer) {
-                            cache_read = @intCast(v.integer);
-                        };
+                        if (utils.jsonInt(itd.object, "cached_tokens")) |v| {
+                            cache_read = v;
+                        }
                     };
                     // v1.32.0 — reasoning tokens.
                     if (uv.object.get("output_tokens_details")) |otd| if (otd == .object) {
-                        if (otd.object.get("reasoning_tokens")) |v| if (v == .integer) {
-                            thinking = @intCast(v.integer);
-                        };
+                        if (utils.jsonInt(otd.object, "reasoning_tokens")) |v| {
+                            thinking = v;
+                        }
                     };
 
                     try self.out.push(self.io, .{ .usage = .{

@@ -43,6 +43,7 @@ const builtin = @import("builtin");
 const ai = struct {
     pub const types = @import("../../ai/types.zig");
     pub const log = @import("../../ai/log.zig");
+    pub const utils = @import("../../ai/utils.zig");
 };
 const agent_mod = @import("../../agent/mod.zig");
 const object_store = @import("object_store.zig");
@@ -556,42 +557,12 @@ pub fn sha256Hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 
 // ─── JSON helpers ─────────────────────────────────────────────────
 
+// v1.33.0 — JSON field extraction helpers (jsonInt, jsonFloat, jsonStr,
+// jsonBool, jsonObj, jsonArr, jsonF64Value) are now shared from
+// `ai/utils.zig`. The local `strOpt` is kept for backward compat with
+// existing call sites that use it; new code should prefer `ai.utils.jsonStr`.
 fn strOpt(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    if (o.get(key)) |v| if (v == .string) return v.string;
-    return null;
-}
-
-/// Extract an f64 from a JSON value that may be either `.float`
-/// or `.integer` (whole-number costs serialized as `0` or `1` are
-/// tagged `.integer` by the JSON parser). Returns `null` for any
-/// other variant.
-fn jsonF64(v: std.json.Value) ?f64 {
-    return switch (v) {
-        .float => v.float,
-        .integer => @floatFromInt(v.integer),
-        else => null,
-    };
-}
-
-/// Look up `key` in `o` and return its value as a u64 integer,
-/// or null if absent/not an integer.
-fn jsonInt(o: std.json.ObjectMap, key: []const u8) ?u64 {
-    if (o.get(key)) |v| if (v == .integer) return @intCast(v.integer);
-    return null;
-}
-
-/// Look up `key` in `o` and return its value as f64, or null if
-/// absent/not numeric.
-fn jsonFloat(o: std.json.ObjectMap, key: []const u8) ?f64 {
-    if (o.get(key)) |v| return jsonF64(v);
-    return null;
-}
-
-/// Look up `key` in `o` and return its value as a string slice,
-/// or null if absent/not a string.
-fn jsonStr(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    if (o.get(key)) |v| if (v == .string) return v.string;
-    return null;
+    return ai.utils.jsonStr(o, key);
 }
 
 /// Format an epoch-millisecond timestamp as a Claude-Code-compatible
@@ -1257,19 +1228,19 @@ fn parseMessage(
         // v5 `input_tokens` is the uncached portion; v4 `input` is the
         // total (incl. cached). We restore the TOTAL into `Usage.input`
         // so the internal model sees the provider-reported total.
-        const input_from_v4 = jsonInt(uobj, "input");
-        const input_from_v5 = jsonInt(uobj, "input_tokens");
-        usage.output = jsonInt(uobj, "output") orelse jsonInt(uobj, "output_tokens") orelse 0;
-        usage.cache_read = jsonInt(uobj, "cacheRead") orelse jsonInt(uobj, "cache_read_input_tokens") orelse 0;
-        usage.cache_write = jsonInt(uobj, "cacheWrite") orelse jsonInt(uobj, "cache_creation_input_tokens") orelse 0;
-        usage.thinking_tokens = jsonInt(uobj, "thinkingTokens") orelse jsonInt(uobj, "thinking_tokens") orelse 0;
-        usage.cache_creation_ephemeral_5m = jsonInt(uobj, "cacheCreationEphemeral5m") orelse jsonInt(uobj, "cache_creation_5m_input_tokens") orelse 0;
-        usage.cache_creation_ephemeral_1h = jsonInt(uobj, "cacheCreationEphemeral1h") orelse jsonInt(uobj, "cache_creation_1h_input_tokens") orelse 0;
-        usage.web_search_requests = jsonInt(uobj, "webSearchRequests") orelse jsonInt(uobj, "web_search_requests") orelse 0;
-        usage.cost_input = jsonFloat(uobj, "costInput") orelse jsonFloat(uobj, "cost_input");
-        usage.cost_output = jsonFloat(uobj, "costOutput") orelse jsonFloat(uobj, "cost_output");
-        usage.cost_cache_read = jsonFloat(uobj, "costCacheRead") orelse jsonFloat(uobj, "cost_cache_read");
-        usage.cost_cache_write = jsonFloat(uobj, "costCacheWrite") orelse jsonFloat(uobj, "cost_cache_write");
+        const input_from_v4 = ai.utils.jsonInt(uobj, "input");
+        const input_from_v5 = ai.utils.jsonInt(uobj, "input_tokens");
+        usage.output = ai.utils.jsonInt(uobj, "output") orelse ai.utils.jsonInt(uobj, "output_tokens") orelse 0;
+        usage.cache_read = ai.utils.jsonInt(uobj, "cacheRead") orelse ai.utils.jsonInt(uobj, "cache_read_input_tokens") orelse 0;
+        usage.cache_write = ai.utils.jsonInt(uobj, "cacheWrite") orelse ai.utils.jsonInt(uobj, "cache_creation_input_tokens") orelse 0;
+        usage.thinking_tokens = ai.utils.jsonInt(uobj, "thinkingTokens") orelse ai.utils.jsonInt(uobj, "thinking_tokens") orelse 0;
+        usage.cache_creation_ephemeral_5m = ai.utils.jsonInt(uobj, "cacheCreationEphemeral5m") orelse ai.utils.jsonInt(uobj, "cache_creation_5m_input_tokens") orelse 0;
+        usage.cache_creation_ephemeral_1h = ai.utils.jsonInt(uobj, "cacheCreationEphemeral1h") orelse ai.utils.jsonInt(uobj, "cache_creation_1h_input_tokens") orelse 0;
+        usage.web_search_requests = ai.utils.jsonInt(uobj, "webSearchRequests") orelse ai.utils.jsonInt(uobj, "web_search_requests") orelse 0;
+        usage.cost_input = ai.utils.jsonFloat(uobj, "costInput") orelse ai.utils.jsonFloat(uobj, "cost_input");
+        usage.cost_output = ai.utils.jsonFloat(uobj, "costOutput") orelse ai.utils.jsonFloat(uobj, "cost_output");
+        usage.cost_cache_read = ai.utils.jsonFloat(uobj, "costCacheRead") orelse ai.utils.jsonFloat(uobj, "cost_cache_read");
+        usage.cost_cache_write = ai.utils.jsonFloat(uobj, "costCacheWrite") orelse ai.utils.jsonFloat(uobj, "cost_cache_write");
         // Fix up: if we only had v5 `input_tokens` (uncached), add back
         // the cached tokens to restore the provider-reported total.
         usage.input = input_from_v4 orelse (input_from_v5 orelse 0) + usage.cache_read + usage.cache_write;
@@ -1320,9 +1291,9 @@ fn parseMessage(
         .stop_reason = stop_reason,
         .tool_call_id = tool_call_id,
         .is_error = is_error,
-        .provider = if (jsonStr(msg_obj, "provider")) |s| try allocator.dupe(u8, s) else if (jsonStr(o, "provider")) |s| try allocator.dupe(u8, s) else null,
-        .model = if (jsonStr(msg_obj, "model")) |s| try allocator.dupe(u8, s) else if (jsonStr(o, "model")) |s| try allocator.dupe(u8, s) else null,
-        .api = if (jsonStr(msg_obj, "api")) |s| try allocator.dupe(u8, s) else if (jsonStr(o, "api")) |s| try allocator.dupe(u8, s) else null,
+        .provider = if (ai.utils.jsonStr(msg_obj, "provider")) |s| try allocator.dupe(u8, s) else if (ai.utils.jsonStr(o, "provider")) |s| try allocator.dupe(u8, s) else null,
+        .model = if (ai.utils.jsonStr(msg_obj, "model")) |s| try allocator.dupe(u8, s) else if (ai.utils.jsonStr(o, "model")) |s| try allocator.dupe(u8, s) else null,
+        .api = if (ai.utils.jsonStr(msg_obj, "api")) |s| try allocator.dupe(u8, s) else if (ai.utils.jsonStr(o, "api")) |s| try allocator.dupe(u8, s) else null,
         .custom_role = if (role == .custom) try allocator.dupe(u8, role_src) else null,
         .usage = usage_opt,
         .diagnostics = diag_opt,
