@@ -483,12 +483,6 @@ pub const Session = struct {
     /// null when --mcp-configs is not set. Owned by role_arena.
     mcp_client: ?*franky.coding.mcp.McpClient = null,
 
-    /// v3.x — all MCP tool names discovered before auto-mode
-    /// filtering. Used by `respondRole` so the web UI tooltip shows
-    /// every configured MCP tool, not just the subset that passed
-    /// the safe-verb allow-list. Owned by role_arena.
-    all_mcp_tool_names: []const []const u8 = &.{},
-
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
     tool_usage: std.StringHashMap(u32) = undefined,
@@ -944,16 +938,6 @@ pub fn initSession(
         session.tools = try config_mod.discoverMcpTools(
             ra_mcp, io, cfg, session.environ_map, session.tools, &session.mcp_client,
         );
-        // Capture all MCP tool names before auto-mode filtering so
-        // the web UI role tooltip can display every configured MCP
-        // tool, not just the safe-verb subset that survives the filter.
-        var mcp_names: std.ArrayList([]const u8) = .empty;
-        for (session.tools) |t| {
-            if (std.mem.startsWith(u8, t.name, "mcp__")) {
-                mcp_names.append(ra_mcp, t.name) catch {};
-            }
-        }
-        session.all_mcp_tool_names = try mcp_names.toOwnedSlice(ra_mcp);
     }
     // v3.x — auto-mode MCP pre-filter: remove destructive MCP tools.
     if (permission_store.auto_enabled) {
@@ -2815,32 +2799,16 @@ fn respondRole(
 ) void {
     const sandboxed = role_mod.detectSandboxFromMap(session.environ_map);
     // Collect extension tool names so the web UI tooltip shows
-    // them alongside the built-in core tools.
+    // them alongside the built-in core tools. This reflects exactly
+    // what the model sees — in --auto mode, filtered-out MCP tools
+    // are absent from session.tools and therefore absent from the
+    // tooltip.
     var ext_tool_names: std.ArrayList([]const u8) = .empty;
     defer ext_tool_names.deinit(allocator);
-    // Track which MCP tools are already included from session.tools
-    // so we don't duplicate them when adding filtered-out names.
     for (session.tools) |t| {
         if (session.role_gate.set.allows(t.name)) continue;
         if (session.role_gate.set.isKnownButDisabled(t.name)) continue;
         ext_tool_names.append(allocator, t.name) catch {};
-    }
-    // v3.x — also include MCP tools that were filtered out by
-    // auto-mode so the user sees all configured MCP tools in the
-    // tooltip, not just the safe-verb subset. The model still only
-    // gets the filtered set; this is display-only.
-    if (session.all_mcp_tool_names.len > 0) {
-        // Build a quick set of names already in ext_tool_names.
-        const ra = session.role_arena.allocator();
-        var seen = std.StringHashMap(void).init(ra);
-        defer seen.deinit();
-        for (ext_tool_names.items) |name| {
-            seen.put(name, {}) catch {};
-        }
-        for (session.all_mcp_tool_names) |name| {
-            if (seen.contains(name)) continue;
-            ext_tool_names.append(allocator, name) catch {};
-        }
     }
     const body = role_mod.renderRoleStatusJson(
         allocator,
