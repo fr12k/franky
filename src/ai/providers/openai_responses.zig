@@ -344,7 +344,22 @@ const Driver = struct {
                     const inp: u64 = if (uv.object.get("input_tokens")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
                     const out: u64 = if (uv.object.get("output_tokens")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
                     self.candidates_tokens = out;
-                    try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
+
+                    // v1.31.0 — cache token enrichment.
+                    // OpenAI Responses API exposes cached input via
+                    // `input_tokens_details.cached_tokens`.
+                    var cache_read: u64 = 0;
+                    if (uv.object.get("input_tokens_details")) |itd| if (itd == .object) {
+                        if (itd.object.get("cached_tokens")) |v| if (v == .integer) {
+                            cache_read = @intCast(v.integer);
+                        };
+                    };
+
+                    try self.out.push(self.io, .{ .usage = .{
+                        .input = inp,
+                        .output = out,
+                        .cache_read = cache_read,
+                    } });
                 };
             };
             self.stop_reason = .stop;
