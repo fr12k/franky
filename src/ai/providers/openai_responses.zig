@@ -349,9 +349,16 @@ const Driver = struct {
                     // OpenAI Responses API exposes cached input via
                     // `input_tokens_details.cached_tokens`.
                     var cache_read: u64 = 0;
+                    var thinking: u64 = 0;
                     if (uv.object.get("input_tokens_details")) |itd| if (itd == .object) {
                         if (itd.object.get("cached_tokens")) |v| if (v == .integer) {
                             cache_read = @intCast(v.integer);
+                        };
+                    };
+                    // v1.32.0 — reasoning tokens.
+                    if (uv.object.get("output_tokens_details")) |otd| if (otd == .object) {
+                        if (otd.object.get("reasoning_tokens")) |v| if (v == .integer) {
+                            thinking = @intCast(v.integer);
                         };
                     };
 
@@ -359,6 +366,7 @@ const Driver = struct {
                         .input = inp,
                         .output = out,
                         .cache_read = cache_read,
+                        .thinking_tokens = thinking,
                     } });
                 };
             };

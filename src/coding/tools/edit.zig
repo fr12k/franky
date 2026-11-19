@@ -288,10 +288,17 @@ pub fn applyEdits(
             break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"diff\":null,\"path\":\"{s}\"}}", .{ edits.len, path });
         }
     };
+    const line_counts = countDiffLines(allocator, original, buf.items);
+
     const text = try allocator.dupe(u8, summary.items);
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .details_json = details };
+    return .{
+        .content = arr,
+        .details_json = details,
+        .lines_added = line_counts.added,
+        .lines_removed = line_counts.removed,
+    };
 }
 
 const DiffRow = struct { old: []const u8, new: []const u8 };
@@ -536,22 +543,19 @@ var tmp_counter: std.atomic.Value(u32) = .init(0);
 
 // ─── Unified diff generation (§6.8) ───────────────────────────────
 
-/// Compute a standard unified diff between `original` and `modified`.
-/// Returns the full diff including `--- a/<path>` / `+++ b/<path>` headers
-/// and hunks with up to 3 context lines. Uses a simple LCS DP table
-/// suitable for files up to ~2000 lines. Returns null on any error
-/// (OOM, too large, etc.) — callers should fall back gracefully.
-///
-/// Format contract: paired with `parseUnifiedDiff` in
-/// `src/coding/modes/web/app.js`. See the `wire-format contract tests`
-/// block at the bottom of this file before changing the emit shape.
-fn computeUnifiedDiff(
+/// v1.32.0 — Shared LCS DP + traceback. Computes the edit script
+/// (forward-order `DiffOp` slice) between `original` and `modified`.
+/// Both `computeUnifiedDiff` (renders a unified-diff string) and
+/// `countDiffLines` (tallies adds/removes for the cost-state line)
+/// call this instead of each duplicating the O(n*m) DP table and
+/// the traceback. Caller owns the returned slice. Returns
+/// `error.TooLarge` when either side exceeds 2000 lines (matching
+/// `computeUnifiedDiff`'s prior cap).
+fn computeLcsOps(
     allocator: std.mem.Allocator,
     original: []const u8,
     modified: []const u8,
-    path: []const u8,
-) ![]u8 {
-    // Split into lines, preserving trailing-newline in each slice.
+) ![]DiffOp {
     const orig_lines = try splitLines(allocator, original);
     defer allocator.free(orig_lines);
     const mod_lines = try splitLines(allocator, modified);
@@ -567,14 +571,12 @@ fn computeUnifiedDiff(
     const cols = m + 1;
     const dp = try allocator.alloc(usize, (n + 1) * cols);
     defer allocator.free(dp);
-
-    var i: usize = 0;
+    @memset(dp, 0);
+    var i: usize = 1;
     while (i <= n) : (i += 1) {
-        var j: usize = 0;
+        var j: usize = 1;
         while (j <= m) : (j += 1) {
-            if (i == 0 or j == 0) {
-                dp[i * cols + j] = 0;
-            } else if (std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
+            if (std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
                 dp[i * cols + j] = dp[(i - 1) * cols + (j - 1)] + 1;
             } else {
                 dp[i * cols + j] = @max(dp[(i - 1) * cols + j], dp[i * cols + (j - 1)]);
@@ -583,37 +585,60 @@ fn computeUnifiedDiff(
     }
 
     // Trace back to produce a forward edit script.
-    // We collect DiffOp values in forward order.
     var ops: std.ArrayList(DiffOp) = .empty;
-    defer ops.deinit(allocator);
+    i = n;
+    var j: usize = m;
+    var rev: std.ArrayList(DiffOp) = .empty;
+    defer rev.deinit(allocator);
 
-    {
-        i = n;
-        var j: usize = m;
-        var rev: std.ArrayList(DiffOp) = .empty;
-        defer rev.deinit(allocator);
-
-        while (i > 0 or j > 0) {
-            if (i > 0 and j > 0 and std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
-                try rev.append(allocator, .{ .kind = .keep, .orig_idx = i - 1, .mod_idx = j - 1 });
-                i -= 1;
-                j -= 1;
-            } else if (j > 0 and (i == 0 or dp[i * cols + (j - 1)] >= dp[(i - 1) * cols + j])) {
-                try rev.append(allocator, .{ .kind = .add, .orig_idx = null, .mod_idx = j - 1 });
-                j -= 1;
-            } else if (i > 0) {
-                try rev.append(allocator, .{ .kind = .remove, .orig_idx = i - 1, .mod_idx = null });
-                i -= 1;
-            }
-        }
-
-        // Reverse into forward order.
-        var ri: usize = rev.items.len;
-        while (ri > 0) {
-            ri -= 1;
-            try ops.append(allocator, rev.items[ri]);
+    while (i > 0 or j > 0) {
+        if (i > 0 and j > 0 and std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
+            try rev.append(allocator, .{ .kind = .keep, .orig_idx = i - 1, .mod_idx = j - 1 });
+            i -= 1;
+            j -= 1;
+        } else if (j > 0 and (i == 0 or dp[i * cols + (j - 1)] >= dp[(i - 1) * cols + j])) {
+            try rev.append(allocator, .{ .kind = .add, .orig_idx = null, .mod_idx = j - 1 });
+            j -= 1;
+        } else if (i > 0) {
+            try rev.append(allocator, .{ .kind = .remove, .orig_idx = i - 1, .mod_idx = null });
+            i -= 1;
         }
     }
+
+    // Reverse into forward order.
+    var ri: usize = rev.items.len;
+    while (ri > 0) {
+        ri -= 1;
+        try ops.append(allocator, rev.items[ri]);
+    }
+    return ops.toOwnedSlice(allocator);
+}
+
+/// Compute a standard unified diff between `original` and `modified`.
+/// Returns the full diff including `--- a/<path>` / `+++ b/<path>` headers
+/// and hunks with up to 3 context lines. Uses a simple LCS DP table
+/// suitable for files up to ~2000 lines. Returns null on any error
+/// (OOM, too large, etc.) — callers should fall back gracefully.
+///
+/// Format contract: paired with `parseUnifiedDiff` in
+/// `src/coding/modes/web/app.js`. See the `wire-format contract tests`
+/// block at the bottom of this file before changing the emit shape.
+fn computeUnifiedDiff(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    modified: []const u8,
+    path: []const u8,
+) ![]u8 {
+    // v1.32.0 — delegate the LCS DP + traceback to the shared
+    // `computeLcsOps` helper (also used by `countDiffLines`).
+    // Errors propagate; callers catch with `catch null` (see line 280).
+    const ops = try computeLcsOps(allocator, original, modified);
+    defer allocator.free(ops);
+    // Keep the line slices alive for the hunk-body rendering below.
+    const orig_lines = try splitLines(allocator, original);
+    defer allocator.free(orig_lines);
+    const mod_lines = try splitLines(allocator, modified);
+    defer allocator.free(mod_lines);
 
     // Group ops into hunks. For each change op (add/remove), expand
     // outward by `ctx` keeps on either side; merge ranges that touch
@@ -626,10 +651,10 @@ fn computeUnifiedDiff(
     var ranges: std.ArrayList(Range) = .empty;
     defer ranges.deinit(allocator);
 
-    for (ops.items, 0..) |op, idx| {
+    for (ops, 0..) |op, idx| {
         if (op.kind == .keep) continue;
         const start = if (idx >= ctx) idx - ctx else 0;
-        const end = @min(idx + ctx + 1, ops.items.len);
+        const end = @min(idx + ctx + 1, ops.len);
         if (ranges.items.len > 0 and ranges.items[ranges.items.len - 1].end >= start) {
             // Overlaps or touches the previous range — extend it.
             if (ranges.items[ranges.items.len - 1].end < end) {
@@ -641,7 +666,7 @@ fn computeUnifiedDiff(
     }
 
     for (ranges.items) |range| {
-        const hunk_ops = ops.items[range.start..range.end];
+        const hunk_ops = ops[range.start..range.end];
 
         // Compute line numbers for hunk header.
         var orig_start: ?usize = null;
@@ -733,6 +758,44 @@ fn computeUnifiedDiff(
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+/// v1.32.0 — count lines added/removed by an edit, for the `cost-state`
+/// transcript aggregate. Runs the same LCS diff as `computeUnifiedDiff`
+/// but only tallies `.add`/`.remove` ops (no string building), so it is
+/// cheaper and shares the 2000-line cap. On `error.TooLarge` it falls
+/// back to a raw line-count delta (net added = new−old lines, or net
+/// removed = old−new lines) so the cost-state line is still populated
+/// for large edits.
+const LineCounts = struct { added: u64, removed: u64 };
+
+pub fn countDiffLines(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    modified: []const u8,
+) LineCounts {
+    // v1.32.0 — delegate the LCS DP + traceback to the shared
+    // `computeLcsOps` helper and just tally the ops.
+    const ops = computeLcsOps(allocator, original, modified) catch return countLinesFallback(original, modified);
+    defer allocator.free(ops);
+    var added: u64 = 0;
+    var removed: u64 = 0;
+    for (ops) |op| switch (op.kind) {
+        .add => added += 1,
+        .remove => removed += 1,
+        .keep => {},
+    };
+    return .{ .added = added, .removed = removed };
+}
+
+fn countLinesFallback(original: []const u8, modified: []const u8) LineCounts {
+    const orig_lines = common.countLines(original);
+    const mod_lines = common.countLines(modified);
+    if (mod_lines > orig_lines) {
+        return .{ .added = mod_lines - orig_lines, .removed = 0 };
+    } else {
+        return .{ .added = 0, .removed = orig_lines - mod_lines };
+    }
 }
 
 const DiffOpKind = enum { keep, remove, add };

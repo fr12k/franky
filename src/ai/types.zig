@@ -131,6 +131,19 @@ pub const Usage = struct {
     output: u64 = 0,
     cache_read: u64 = 0,
     cache_write: u64 = 0,
+    /// v1.32.0 — thinking (reasoning) tokens for this turn.
+    /// Anthropic reports this in `usage.output_tokens_details.thinking_tokens`;
+    /// OpenRouter/gateways may surface it in `completion_tokens_details.reasoning_tokens`.
+    thinking_tokens: u64 = 0,
+    /// v1.32.0 — Anthropic splits `cache_creation_input_tokens` across
+    /// ephemeral TTL windows. We keep the aggregate in `cache_write`
+    /// (above) and the TTL breakdown here for the cost-state line.
+    cache_creation_ephemeral_5m: u64 = 0,
+    cache_creation_ephemeral_1h: u64 = 0,
+    /// v1.32.0 — number of web-search server-tool requests billed for
+    /// this turn (Anthropic web-search tool, OpenRouter, etc.). 0 when
+    /// the provider did not report any.
+    web_search_requests: u64 = 0,
     /// USD, per category. Optional; providers without pricing data omit.
     cost_input: ?f64 = null,
     cost_output: ?f64 = null,
@@ -141,6 +154,19 @@ pub const Usage = struct {
         return self.input + self.output + self.cache_read + self.cache_write;
     }
 
+    /// Sum of every USD cost field, or `null` when no cost data at all
+    /// was reported for this turn. Used by the cost-state aggregator to
+    /// detect `hasUnknownModelCost`.
+    pub fn costTotal(self: Usage) ?f64 {
+        var sum: f64 = 0;
+        var any: bool = false;
+        if (self.cost_input) |v| { sum += v; any = true; }
+        if (self.cost_output) |v| { sum += v; any = true; }
+        if (self.cost_cache_read) |v| { sum += v; any = true; }
+        if (self.cost_cache_write) |v| { sum += v; any = true; }
+        return if (any) sum else null;
+    }
+
     /// True when every field is default — used by the transcript
     /// serializer to omit the `usage` object for messages that never
     /// touched a provider (user / tool_result rows, or assistant
@@ -148,9 +174,43 @@ pub const Usage = struct {
     pub fn isEmpty(self: Usage) bool {
         return self.input == 0 and self.output == 0 and
             self.cache_read == 0 and self.cache_write == 0 and
+            self.thinking_tokens == 0 and
+            self.cache_creation_ephemeral_5m == 0 and
+            self.cache_creation_ephemeral_1h == 0 and
+            self.web_search_requests == 0 and
             self.cost_input == null and self.cost_output == null and
             self.cost_cache_read == null and self.cost_cache_write == null;
     }
+};
+
+/// v1.32.0 — Session-level cost-state accumulators for the
+/// `cost-state` aggregate line in transcript.jsonl. These track the
+/// values that CANNOT be derived from per-message `Usage` (durations
+/// and edit line counts); the rest of the cost-state line
+/// (`totalCostUSD`, `modelUsage`, `hasUnknownModelCost`) is computed
+/// at write time from the transcript's assistant messages.
+///
+/// One instance per session. Updated by `agentLoop`/`runTurn`/
+/// `runToolsParallel` via `Config.cost_state`. Thread-safe access is
+/// NOT required — the agent loop runs single-threaded per prompt.
+pub const CostState = struct {
+    /// Wall-clock ms spent in provider API calls (all retries).
+    total_api_duration_ms: u64 = 0,
+    /// Wall-clock ms spent in provider API calls excluding retries.
+    /// Without retry instrumentation this equals `total_api_duration_ms`;
+    /// the loop updates it on the first attempt of each turn.
+    total_api_duration_without_retries_ms: u64 = 0,
+    /// Wall-clock ms spent executing tools (sum across all calls).
+    total_tool_duration_ms: u64 = 0,
+    /// Lines added by `write`/`edit` tools this session.
+    total_lines_added: u64 = 0,
+    /// Lines removed by `edit` tools this session.
+    total_lines_removed: u64 = 0,
+    /// Unix-ms timestamp of the session's first turn (set on first
+    /// `runTurn`). Used for `totalDuration` = last_write - startTime.
+    start_time_ms: i64 = 0,
+    /// True once `start_time_ms` has been latched.
+    started: bool = false,
 };
 
 pub const StopReason = enum {

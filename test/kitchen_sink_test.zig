@@ -260,7 +260,7 @@ test "kitchen-sink: oversize block spills to objects/ and round-trips" {
         .api = "faux",
         .thinking_level = "off",
     };
-    try session_mod.save(gpa, io, base, header, &transcript);
+    try session_mod.save(gpa, io, base, header, &transcript, null);
 
     // transcript.jsonl contains a ref, objects/ has the blob.
     const t_path = try std.fmt.allocPrint(gpa, "{s}/01KITCHEN/transcript.jsonl", .{base});
@@ -312,7 +312,7 @@ test "kitchen-sink: session + tree persist side by side" {
         .api = "faux",
         .thinking_level = "off",
     };
-    try session_mod.save(gpa, io, base, header, &transcript);
+    try session_mod.save(gpa, io, base, header, &transcript, null);
 
     var tree = try branching_mod.Tree.init(gpa);
     defer tree.deinit();
@@ -494,7 +494,7 @@ test "kitchen-sink: sdk.session round-trips a simple transcript" {
         .api = "faux",
         .thinking_level = "off",
     };
-    try sdk.session.save(gpa, io, base, header, &transcript);
+    try sdk.session.save(gpa, io, base, header, &transcript, null);
 
     var loaded = try sdk.session.load(gpa, io, base, "01SDK");
     defer loaded.deinit(gpa);

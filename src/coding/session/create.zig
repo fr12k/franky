@@ -60,6 +60,11 @@ pub const SessionState = struct {
     /// `coding/compression.zig`).
     compression_ctx: compression_mod.CompressionContext = .{ .config = .{} },
 
+    /// v1.32.0 — session cost-state accumulator for the `cost-state`
+    /// transcript line. Updated by `agentLoop`/`runTurn` via
+    /// `Config.cost_state`; persisted in `persist`.
+    cost_state: ai.types.CostState = .{},
+
     /// Initialise a `SessionState` from a parsed CLI config.
     ///
     /// Three cases:
@@ -135,6 +140,10 @@ pub const SessionState = struct {
                 .created_at_ms = created_ms,
                 .tree = tree,
                 .ccr_store = ccr_store_mod.CcrSessionStore.init(allocator, io),
+                // v1.32.0 — restore the cost-state accumulator from the
+                // loaded transcript so resumed sessions keep their
+                // cumulative durations / line counts / start time.
+                .cost_state = if (transcript.cost_state) |cs| cs else .{},
             };
             state.ccr_ctx = .{ .store = &state.ccr_store, .stats = &state.compression_stats };
             state.compression_ctx.ccr_store = &state.ccr_store;
@@ -220,7 +229,7 @@ pub const SessionState = struct {
             .thinking_level = cfg.thinking.toString(),
         };
 
-        try session_mod.save(allocator, io, parent, header, &self.transcript);
+        try session_mod.save(allocator, io, parent, header, &self.transcript, &self.cost_state);
 
         // v1.6.0 — persist the branch tree alongside the header
         // and transcript.

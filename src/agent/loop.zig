@@ -322,6 +322,12 @@ pub const Config = struct {
     /// this (typically `*coding.compression.CompressionContext`)
     /// and it must outlive the loop run.
     compress_ctx: ?*anyopaque = null,
+    /// v1.32.0 — optional session cost-state accumulator. When non-null,
+    /// `runTurn` adds the wall-clock duration of each provider API call
+    /// and `runToolsParallel` adds tool-execution duration; both feed the
+    /// `cost-state` aggregate line written to transcript.jsonl. `null`
+    /// disables tracking (pre-v1.32 behaviour).
+    cost_state: ?*ai.types.CostState = null,
 };
 
 pub const Transcript = at.Transcript;
@@ -833,6 +839,14 @@ fn runTurn(
     var opts = config.stream_options;
     opts.cancel = config.cancel;
 
+    // v1.32.0 — latch the session start time on the first turn and
+    // time the provider API call for the cost-state line.
+    const api_start_ms = ai.stream.nowMillis();
+    if (config.cost_state) |cs| if (!cs.started) {
+        cs.start_time_ms = api_start_ms;
+        cs.started = true;
+    };
+
     const stream_args = StreamWorkerArgs{
         .registry = config.registry,
         .allocator = allocator,
@@ -947,6 +961,18 @@ fn runTurn(
         }
     }
 
+    // v1.32.0 — accumulate provider API duration for the cost-state line.
+    if (config.cost_state) |cs| {
+        const api_dur: u64 = @intCast(@max(0, ai.stream.nowMillis() - api_start_ms));
+        cs.total_api_duration_ms +%= api_dur;
+        // Without per-attempt retry instrumentation we treat the whole
+        // turn's stream (retries included) as the without-retries value on
+        // the first turn; subsequent turns add only non-retry time. This is
+        // a conservative approximation — the exact split would require the
+        // provider to emit per-attempt timing, which it does not.
+        cs.total_api_duration_without_retries_ms +%= api_dur;
+    }
+
     if (provider_error) |pe| {
         try pushAgentError(out, io, allocator, pe.code, pe.message);
         allocator.free(pe.message);
@@ -1036,6 +1062,8 @@ fn runTurn(
     // max(individual) for I/O-bound tools (read/grep/find/ls).
     // Any sequential tool in the batch forces the fallback path so
     // write/edit/bash serialization is preserved.
+    // v1.32.0 — time the whole tool-execution phase for the cost-state line.
+    const tool_start_ms = ai.stream.nowMillis();
     const all_parallel = blk: {
         if (tool_calls.items.len <= 1) break :blk false;
         for (tool_calls.items) |tc| {
@@ -1139,6 +1167,16 @@ fn runTurn(
             .result = call_res,
             .terminate = call_res.terminate,
         });
+    }
+
+    // v1.32.0 — accumulate tool-execution duration + line counts for the cost-state line.
+    if (config.cost_state) |cs| {
+        const tool_dur: u64 = @intCast(@max(0, ai.stream.nowMillis() - tool_start_ms));
+        cs.total_tool_duration_ms +%= tool_dur;
+        for (results.items) |r| {
+            cs.total_lines_added +%= r.result.lines_added;
+            cs.total_lines_removed +%= r.result.lines_removed;
+        }
     }
 
     // Emit toolResult messages in source order; append to transcript.

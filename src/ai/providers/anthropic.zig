@@ -509,14 +509,44 @@ const Driver = struct {
                 if (uv.object.get("cache_read_input_tokens")) |v| if (v == .integer) {
                     cache_read = @intCast(v.integer);
                 };
+                var eph_5m: u64 = 0;
+                var eph_1h: u64 = 0;
                 if (uv.object.get("cache_creation_input_tokens")) |v| if (v == .integer) {
                     cache_write = @intCast(v.integer);
+                };
+                // v1.32.0 — Anthropic breaks cache_creation down by TTL
+                // window in a `cache_creation` sub-object. The aggregate
+                // `cache_creation_input_tokens` equals 5m + 1h; we keep
+                // both the aggregate (cache_write) and the per-TTL split
+                // for the cost-state line.
+                if (uv.object.get("cache_creation")) |cc| if (cc == .object) {
+                    if (cc.object.get("ephemeral_5m_input_tokens")) |e| if (e == .integer) {
+                        eph_5m = @intCast(e.integer);
+                    };
+                    if (cc.object.get("ephemeral_1h_input_tokens")) |e| if (e == .integer) {
+                        eph_1h = @intCast(e.integer);
+                    };
+                };
+                // Fallback: when the sub-object is absent but the
+                // aggregate is non-zero, attribute it all to 5m (the
+                // default TTL window) so the split still sums correctly.
+                if (cache_write > 0 and eph_5m == 0 and eph_1h == 0) eph_5m = cache_write;
+                // v1.32.0 — thinking tokens. Anthropic nests these under
+                // `output_tokens_details.thinking_tokens`.
+                var thinking: u64 = 0;
+                if (uv.object.get("output_tokens_details")) |otd| if (otd == .object) {
+                    if (otd.object.get("thinking_tokens")) |t| if (t == .integer) {
+                        thinking = @intCast(t.integer);
+                    };
                 };
                 try self.out.push(self.io, .{ .usage = .{
                     .input = inp,
                     .output = out,
                     .cache_read = cache_read,
                     .cache_write = cache_write,
+                    .thinking_tokens = thinking,
+                    .cache_creation_ephemeral_5m = eph_5m,
+                    .cache_creation_ephemeral_1h = eph_1h,
                 } });
             };
             return;

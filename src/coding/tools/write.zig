@@ -120,21 +120,38 @@ pub fn writeFile(
         }
     };
 
+    // v1.32.0 — capture the original content BEFORE overwriting so we
+    // can count removed lines for the cost-state aggregate. Best-effort:
+    // a read failure (new file, permissions) just yields removed=0.
+    var old_content: ?[]u8 = null;
+    if (overwrite) {
+        old_content = cwd.readFileAlloc(io, path, allocator, .limited(1 << 24)) catch null;
+    }
+    defer if (old_content) |old| allocator.free(old);
+
     var file = cwd.createFile(io, path, .{}) catch |err|
         return common.toolError(allocator, "create_failed", @errorName(err));
     defer file.close(io);
     file.writeStreamingAll(io, content) catch |err|
         return common.toolError(allocator, "write_failed", @errorName(err));
 
+    // v1.32.0 — line counts for the cost-state aggregate.
+    // New file: all lines added. Overwrite: removed = old file lines,
+    // added = new content lines (a full-replace approximation; the
+    // edit tool does a true per-line diff, but `write` is a wholesale
+    // replace so a line-count delta is the right semantic).
+    const added = common.countLines(content);
+    const removed: u64 = if (old_content) |old| common.countLines(old) else 0;
+
     const details = try std.fmt.allocPrint(allocator, "{{\"bytesWritten\":{d},\"parentCreated\":{}}}", .{ content.len, parent_created });
     const text = try std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ content.len, path });
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .details_json = details };
+    return .{ .content = arr, .details_json = details, .lines_added = added, .lines_removed = removed };
 }
 
 
-// ─── tests ────────────────────────────────────────────────────────────
+// ─── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const test_h = @import("../../test_helpers.zig");

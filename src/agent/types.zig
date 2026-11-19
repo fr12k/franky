@@ -23,6 +23,12 @@ pub const ToolResult = struct {
     tool_code: ?[]const u8 = null,
     /// Ask the loop to stop after this tool's batch completes.
     terminate: bool = false,
+    /// v1.32.0 — lines added/removed by file-mutating tools
+    /// (`edit`, `write`). 0 for non-mutating tools and error results.
+    /// Aggregated by the agent loop into `CostState` for the
+    /// `cost-state` transcript line.
+    lines_added: u64 = 0,
+    lines_removed: u64 = 0,
 
     pub fn deinit(self: *ToolResult, allocator: std.mem.Allocator) void {
         for (self.content) |cb| cb.deinit(allocator);
@@ -146,6 +152,12 @@ pub const AfterToolCallFn = *const fn (
 pub const Transcript = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(AgentMessage) = .empty,
+    /// v1.32.0 — session cost-state accumulator, restored from the
+    /// `cost-state` line on `readTranscript` so resumed sessions keep
+    /// their cumulative durations / line counts / start time. `null`
+    /// when the transcript has no cost-state line (fresh session or
+    /// pre-v1.32 transcript).
+    cost_state: ?ai.types.CostState = null,
 
     pub fn init(allocator: std.mem.Allocator) Transcript {
         return .{ .allocator = allocator };
