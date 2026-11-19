@@ -472,6 +472,18 @@ fn strOpt(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Extract an f64 from a JSON value that may be either `.float`
+/// or `.integer` (whole-number costs serialized as `0` or `1` are
+/// tagged `.integer` by the JSON parser). Returns `null` for any
+/// other variant.
+fn jsonF64(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .float => v.float,
+        .integer => @floatFromInt(v.integer),
+        else => null,
+    };
+}
+
 fn appendMessageJson(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -547,22 +559,22 @@ fn appendMessageJson(
         }
         if (u.cost_input) |ci| {
             if (!first) try buf.append(allocator, ',');
-            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costInput\":", ci);
+            try appendJsonF64Field(buf, allocator, "\"costInput\":", ci);
             first = false;
         }
         if (u.cost_output) |co| {
             if (!first) try buf.append(allocator, ',');
-            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costOutput\":", co);
+            try appendJsonF64Field(buf, allocator, "\"costOutput\":", co);
             first = false;
         }
         if (u.cost_cache_read) |cr| {
             if (!first) try buf.append(allocator, ',');
-            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costCacheRead\":", cr);
+            try appendJsonF64Field(buf, allocator, "\"costCacheRead\":", cr);
             first = false;
         }
         if (u.cost_cache_write) |cw| {
             if (!first) try buf.append(allocator, ',');
-            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costCacheWrite\":", cw);
+            try appendJsonF64Field(buf, allocator, "\"costCacheWrite\":", cw);
             first = false;
         }
         try buf.append(allocator, '}');
@@ -791,18 +803,18 @@ fn parseMessage(
         if (uobj.get("cacheWrite")) |v| if (v == .integer) {
             usage.cache_write = @intCast(v.integer);
         };
-        if (uobj.get("costInput")) |v| if (v == .float) {
-            usage.cost_input = v.float;
-        };
-        if (uobj.get("costOutput")) |v| if (v == .float) {
-            usage.cost_output = v.float;
-        };
-        if (uobj.get("costCacheRead")) |v| if (v == .float) {
-            usage.cost_cache_read = v.float;
-        };
-        if (uobj.get("costCacheWrite")) |v| if (v == .float) {
-            usage.cost_cache_write = v.float;
-        };
+        if (uobj.get("costInput")) |v| {
+            usage.cost_input = jsonF64(v);
+        }
+        if (uobj.get("costOutput")) |v| {
+            usage.cost_output = jsonF64(v);
+        }
+        if (uobj.get("costCacheRead")) |v| {
+            usage.cost_cache_read = jsonF64(v);
+        }
+        if (uobj.get("costCacheWrite")) |v| {
+            usage.cost_cache_write = jsonF64(v);
+        }
         usage_opt = usage;
     };
 
@@ -973,22 +985,27 @@ fn appendJsonU64Field(
     try buf.appendSlice(allocator, s);
 }
 
-/// Serialize an optional f64 cost field as a JSON number. Emits the
-/// `prefix` + value only when `value` is non-null; returns `false`
-/// (no output) otherwise so the caller can drive the comma logic the
-/// same way `appendJsonU64Field` does for diagnostics counters.
-fn appendJsonF64FieldOpt(
+/// Serialize an f64 cost field as a JSON number. Always emits a
+/// decimal point (even for whole numbers like `0` or `1`) so the
+/// JSON parser tags it as `.float` on round-trip. Guards against
+/// non-finite values (nan/inf are not valid JSON).
+fn appendJsonF64Field(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     prefix: []const u8,
-    value: ?f64,
-) !bool {
-    const v = value orelse return false;
+    value: f64,
+) !void {
+    if (!std.math.isFinite(value)) return; // skip nan/inf
     try buf.appendSlice(allocator, prefix);
-    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
+    const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
     defer allocator.free(s);
     try buf.appendSlice(allocator, s);
-    return true;
+    // Ensure a decimal point so the value is always tagged .float.
+    if (std.mem.indexOfScalar(u8, s, '.') == null and
+        std.mem.indexOfScalar(u8, s, 'e') == null)
+    {
+        try buf.appendSlice(allocator, ".0");
+    }
 }
 
 // ─── filesystem ───────────────────────────────────────────────────

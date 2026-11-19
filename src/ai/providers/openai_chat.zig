@@ -37,6 +37,16 @@ const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
 pub const default_endpoint: []const u8 = "https://api.openai.com/v1/chat/completions";
 
+/// Extract an f64 from a JSON value that may be either `.float`
+/// or `.integer` (whole-number costs like `0` are tagged `.integer`).
+fn jsonF64(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .float => v.float,
+        .integer => @floatFromInt(v.integer),
+        else => null,
+    };
+}
+
 // ─── request serialization ────────────────────────────────────────
 
 pub fn buildRequestJson(
@@ -448,35 +458,38 @@ const Driver = struct {
             // OpenRouter puts a top-level `cost` (total USD) plus a
             // `cost_details` sub-object with per-category breakdown.
             // We extract the granular fields when present, falling
-            // back to the top-level `cost` split across input/output
-            // proportionally by token count when only the aggregate
-            // is available.
+            // back to the top-level `cost` for any category that
+            // `cost_details` did not cover.
             var cost_input: ?f64 = null;
             var cost_output: ?f64 = null;
-            const cost_cache_read: ?f64 = null;
-            const cost_cache_write: ?f64 = null;
             if (uv.object.get("cost_details")) |cd| if (cd == .object) {
-                if (cd.object.get("upstream_inference_prompt_cost")) |v| if (v == .float) {
-                    cost_input = v.float;
-                };
-                if (cd.object.get("upstream_inference_completions_cost")) |v| if (v == .float) {
-                    cost_output = v.float;
-                };
+                if (cd.object.get("upstream_inference_prompt_cost")) |v| {
+                    cost_input = jsonF64(v);
+                }
+                if (cd.object.get("upstream_inference_completions_cost")) |v| {
+                    cost_output = jsonF64(v);
+                }
             };
-            // Some gateways (OpenRouter) also expose a top-level
-            // `cost` (total). If cost_details was absent, use it as a
-            // fallback split by token proportion.
-            if (cost_input == null and cost_output == null) {
-                if (uv.object.get("cost")) |v| if (v == .float) {
-                    const total_cost = v.float;
+            // Top-level `cost` (total USD). Used as a fallback for
+            // any category that cost_details did not fill.
+            const top_cost: ?f64 = blk: {
+                if (uv.object.get("cost")) |v| break :blk jsonF64(v);
+                break :blk null;
+            };
+            if (top_cost) |tc| {
+                if (cost_input == null or cost_output == null) {
                     const total_tok = inp + out;
                     if (total_tok > 0) {
-                        cost_input = total_cost * @as(f64, @floatFromInt(inp)) / @as(f64, @floatFromInt(total_tok));
-                        cost_output = total_cost * @as(f64, @floatFromInt(out)) / @as(f64, @floatFromInt(total_tok));
+                        const ratio_in = @as(f64, @floatFromInt(inp)) / @as(f64, @floatFromInt(total_tok));
+                        if (cost_input == null) cost_input = tc * ratio_in;
+                        if (cost_output == null) cost_output = tc * (1.0 - ratio_in);
                     } else {
-                        cost_input = total_cost;
+                        // No tokens to split by; assign full cost
+                        // to both so the total is recoverable.
+                        if (cost_input == null) cost_input = tc;
+                        if (cost_output == null) cost_output = 0.0;
                     }
-                };
+                }
             }
 
             try self.out.push(self.io, .{ .usage = .{
@@ -486,8 +499,6 @@ const Driver = struct {
                 .cache_write = cache_write,
                 .cost_input = cost_input,
                 .cost_output = cost_output,
-                .cost_cache_read = cost_cache_read,
-                .cost_cache_write = cost_cache_write,
             } });
         };
 

@@ -157,6 +157,24 @@ test "session round-trips through disk" {
             },
         });
     }
+    // Second assistant message with whole-number costs to verify
+    // that {d} -> .integer -> jsonF64 round-trip works.
+    {
+        const content = try gpa.alloc(ai.types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok") } };
+        try transcript.append(.{
+            .role = .assistant,
+            .content = content,
+            .timestamp = 1600,
+            .stop_reason = .stop,
+            .usage = .{
+                .input = 50,
+                .output = 10,
+                .cost_input = 1.0,
+                .cost_output = 0.0,
+            },
+        });
+    }
 
     const header = SessionHeader{
         .id = "01JXTEST",
@@ -176,7 +194,7 @@ test "session round-trips through disk" {
 
     try testing.expectEqualStrings("test session", loaded.header.title);
     try testing.expectEqualStrings("faux", loaded.header.provider);
-    try testing.expectEqual(@as(usize, 2), loaded.transcript.messages.items.len);
+    try testing.expectEqual(@as(usize, 3), loaded.transcript.messages.items.len);
 
     const m0 = loaded.transcript.messages.items[0];
     try testing.expectEqual(ai.types.Role.user, m0.role);
@@ -200,6 +218,18 @@ test "session round-trips through disk" {
     try testing.expectEqual(@as(f64, 0.0002), u.cost_cache_write.?);
     // user message should have no usage.
     try testing.expect(m0.usage == null);
+    // Second assistant message — whole-number cost round-trip.
+    const m2 = loaded.transcript.messages.items[2];
+    try testing.expectEqual(ai.types.Role.assistant, m2.role);
+    const usage2 = m2.usage orelse return error.Usage2Missing;
+    try testing.expectEqual(@as(u64, 50), usage2.input);
+    try testing.expectEqual(@as(u64, 10), usage2.output);
+    // 1.0 serializes as "1.0" and 0.0 as "0.0" — must survive round-trip.
+    try testing.expectEqual(@as(f64, 1.0), usage2.cost_input.?);
+    try testing.expectEqual(@as(f64, 0.0), usage2.cost_output.?);
+    // No cache fields set — should be null/0.
+    try testing.expectEqual(@as(u64, 0), usage2.cache_read);
+    try testing.expect(usage2.cost_cache_read == null);
 }
 
 test "migrateSessionIfNeeded: v1 → current backs up + rewrites" {
