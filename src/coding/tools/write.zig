@@ -140,8 +140,8 @@ pub fn writeFile(
     // added = new content lines (a full-replace approximation; the
     // edit tool does a true per-line diff, but `write` is a wholesale
     // replace so a line-count delta is the right semantic).
-    const added = countLines(content);
-    const removed: u64 = if (old_content) |old| countLines(old) else 0;
+    const added = common.countLines(content);
+    const removed: u64 = if (old_content) |old| common.countLines(old) else 0;
 
     const details = try std.fmt.allocPrint(allocator, "{{\"bytesWritten\":{d},\"parentCreated\":{}}}", .{ content.len, parent_created });
     const text = try std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ content.len, path });
@@ -150,18 +150,8 @@ pub fn writeFile(
     return .{ .content = arr, .details_json = details, .lines_added = added, .lines_removed = removed };
 }
 
-fn countLines(s: []const u8) u64 {
-    if (s.len == 0) return 0;
-    var n: u64 = 1;
-    for (s) |c| {
-        if (c == '\n') n += 1;
-    }
-    if (s[s.len - 1] == '\n') n -= 1;
-    return n;
-}
 
-
-// ─── tests ────────────────────────────────────────────────────────────
+// ─── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const test_h = @import("../../test_helpers.zig");

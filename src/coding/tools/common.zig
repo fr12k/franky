@@ -46,6 +46,20 @@ pub fn toolError(
     return .{ .content = arr, .is_error = true, .tool_code = code_dup };
 }
 
+/// v1.32.0 — count the number of lines in a UTF-8 string. A single
+/// trailing newline does not produce an extra empty line. Returns 0
+/// for an empty string. Shared by `edit` and `write` for the
+/// cost-state `totalLinesAdded`/`totalLinesRemoved` aggregate.
+pub fn countLines(s: []const u8) u64 {
+    if (s.len == 0) return 0;
+    var n: u64 = 1;
+    for (s) |c| {
+        if (c == '\n') n += 1;
+    }
+    if (s[s.len - 1] == '\n') n -= 1; // trailing newline → no extra empty line
+    return n;
+}
+
 /// §6.9 — return a `contextignored` `ToolResult` if `abs_path` is
 /// suppressed by any `.contextignore` under `workspace.root`, else
 /// null. Used by single-path tools (`read`/`write`/`edit`) to
