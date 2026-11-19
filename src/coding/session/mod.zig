@@ -145,6 +145,16 @@ test "session round-trips through disk" {
             .provider = try gpa.dupe(u8, "faux"),
             .model = try gpa.dupe(u8, "faux-1"),
             .api = try gpa.dupe(u8, "faux"),
+            .usage = .{
+                .input = 120,
+                .output = 34,
+                .cache_read = 10,
+                .cache_write = 5,
+                .cost_input = 0.0012,
+                .cost_output = 0.0008,
+                .cost_cache_read = 0.0001,
+                .cost_cache_write = 0.0002,
+            },
         });
     }
 
@@ -178,6 +188,18 @@ test "session round-trips through disk" {
     try testing.expectEqualStrings("let me help", m1.content[0].text.text);
     try testing.expectEqualStrings("echo", m1.content[1].tool_call.name);
     try testing.expectEqual(ai.types.StopReason.tool_use, m1.stop_reason.?);
+    // v1.31.0 — usage round-trips through disk.
+    const u = m1.usage orelse return error.UsageMissing;
+    try testing.expectEqual(@as(u64, 120), u.input);
+    try testing.expectEqual(@as(u64, 34), u.output);
+    try testing.expectEqual(@as(u64, 10), u.cache_read);
+    try testing.expectEqual(@as(u64, 5), u.cache_write);
+    try testing.expectEqual(@as(f64, 0.0012), u.cost_input.?);
+    try testing.expectEqual(@as(f64, 0.0008), u.cost_output.?);
+    try testing.expectEqual(@as(f64, 0.0001), u.cost_cache_read.?);
+    try testing.expectEqual(@as(f64, 0.0002), u.cost_cache_write.?);
+    // user message should have no usage.
+    try testing.expect(m0.usage == null);
 }
 
 test "migrateSessionIfNeeded: v1 → current backs up + rewrites" {

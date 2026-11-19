@@ -140,6 +140,17 @@ pub const Usage = struct {
     pub fn total(self: Usage) u64 {
         return self.input + self.output + self.cache_read + self.cache_write;
     }
+
+    /// True when every field is default — used by the transcript
+    /// serializer to omit the `usage` object for messages that never
+    /// touched a provider (user / tool_result rows, or assistant
+    /// rows from a provider that reported no usage).
+    pub fn isEmpty(self: Usage) bool {
+        return self.input == 0 and self.output == 0 and
+            self.cache_read == 0 and self.cache_write == 0 and
+            self.cost_input == null and self.cost_output == null and
+            self.cost_cache_read == null and self.cost_cache_write == null;
+    }
 };
 
 pub const StopReason = enum {

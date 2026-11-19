@@ -519,6 +519,54 @@ fn appendMessageJson(
         try buf.appendSlice(allocator, ",\"api\":");
         try appendJsonStr(buf, allocator, p);
     }
+    // v1.31.0 — Message.Usage (per-turn token counts + USD costs).
+    // Only emit when at least one field is non-default; pre-v1.31
+    // transcripts (and user/tool_result rows that never carry usage)
+    // round-trip unchanged.
+    if (m.usage) |u| if (!u.isEmpty()) {
+        try buf.appendSlice(allocator, ",\"usage\":{");
+        var first = true;
+        if (u.input != 0) {
+            try appendJsonU64Field(buf, allocator, "\"input\":", u.input);
+            first = false;
+        }
+        if (u.output != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"output\":", u.output);
+            first = false;
+        }
+        if (u.cache_read != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"cacheRead\":", u.cache_read);
+            first = false;
+        }
+        if (u.cache_write != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"cacheWrite\":", u.cache_write);
+            first = false;
+        }
+        if (u.cost_input) |ci| {
+            if (!first) try buf.append(allocator, ',');
+            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costInput\":", ci);
+            first = false;
+        }
+        if (u.cost_output) |co| {
+            if (!first) try buf.append(allocator, ',');
+            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costOutput\":", co);
+            first = false;
+        }
+        if (u.cost_cache_read) |cr| {
+            if (!first) try buf.append(allocator, ',');
+            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costCacheRead\":", cr);
+            first = false;
+        }
+        if (u.cost_cache_write) |cw| {
+            if (!first) try buf.append(allocator, ',');
+            _ = try appendJsonF64FieldOpt(buf, allocator, "\"costCacheWrite\":", cw);
+            first = false;
+        }
+        try buf.append(allocator, '}');
+    };
     // v1.29.0 — Message.Diagnostics. Only emit when at least one
     // field is non-default; pre-v1.29 transcripts round-trip
     // unchanged.
@@ -724,6 +772,40 @@ fn parseMessage(
         diag_opt = diag;
     };
 
+    // v1.31.0 — Usage round-trip. Old transcripts without the
+    // field decode as null and round-trip cleanly. Token counts
+    // arrive as JSON integers; cost fields as JSON floats.
+    var usage_opt: ?ai.types.Usage = null;
+    if (o.get("usage")) |uv| if (uv == .object) {
+        const uobj = uv.object;
+        var usage: ai.types.Usage = .{};
+        if (uobj.get("input")) |v| if (v == .integer) {
+            usage.input = @intCast(v.integer);
+        };
+        if (uobj.get("output")) |v| if (v == .integer) {
+            usage.output = @intCast(v.integer);
+        };
+        if (uobj.get("cacheRead")) |v| if (v == .integer) {
+            usage.cache_read = @intCast(v.integer);
+        };
+        if (uobj.get("cacheWrite")) |v| if (v == .integer) {
+            usage.cache_write = @intCast(v.integer);
+        };
+        if (uobj.get("costInput")) |v| if (v == .float) {
+            usage.cost_input = v.float;
+        };
+        if (uobj.get("costOutput")) |v| if (v == .float) {
+            usage.cost_output = v.float;
+        };
+        if (uobj.get("costCacheRead")) |v| if (v == .float) {
+            usage.cost_cache_read = v.float;
+        };
+        if (uobj.get("costCacheWrite")) |v| if (v == .float) {
+            usage.cost_cache_write = v.float;
+        };
+        usage_opt = usage;
+    };
+
     return .{
         .role = role,
         .content = try content.toOwnedSlice(allocator),
@@ -735,6 +817,7 @@ fn parseMessage(
         .model = if (o.get("model")) |v| try allocator.dupe(u8, v.string) else null,
         .api = if (o.get("api")) |v| try allocator.dupe(u8, v.string) else null,
         .custom_role = if (role == .custom) try allocator.dupe(u8, role_str) else null,
+        .usage = usage_opt,
         .diagnostics = diag_opt,
     };
 }
@@ -888,6 +971,24 @@ fn appendJsonU64Field(
     const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
     defer allocator.free(s);
     try buf.appendSlice(allocator, s);
+}
+
+/// Serialize an optional f64 cost field as a JSON number. Emits the
+/// `prefix` + value only when `value` is non-null; returns `false`
+/// (no output) otherwise so the caller can drive the comma logic the
+/// same way `appendJsonU64Field` does for diagnostics counters.
+fn appendJsonF64FieldOpt(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    value: ?f64,
+) !bool {
+    const v = value orelse return false;
+    try buf.appendSlice(allocator, prefix);
+    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
+    defer allocator.free(s);
+    try buf.appendSlice(allocator, s);
+    return true;
 }
 
 // ─── filesystem ───────────────────────────────────────────────────
