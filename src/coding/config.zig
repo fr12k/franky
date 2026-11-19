@@ -1174,9 +1174,12 @@ pub fn filterMcpToolsForAutoMode(
             try out.append(allocator, t);
             continue;
         }
-        // Check autoMode.allow (exact + wildcard) first — overrides
-        // soft_deny and the classifier, but NOT hard_deny.
-        if (permissions_mod.Store.autoSetMatches(&store.auto_allow, t.name, "{}")) {
+        // Check --allow-tools CLI flag and autoMode.allow (exact +
+        // wildcard) first — overrides soft_deny and the classifier,
+        // but NOT hard_deny.
+        if (permissions_mod.Store.autoSetMatches(&store.auto_allow, t.name, "{}") or
+            permissions_mod.Store.autoSetMatches(&store.allow_tools, t.name, "{}"))
+        {
             try out.append(allocator, t);
             continue;
         }
