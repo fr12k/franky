@@ -2810,6 +2810,12 @@ fn respondRole(
         if (session.role_gate.set.isKnownButDisabled(t.name)) continue;
         ext_tool_names.append(allocator, t.name) catch {};
     }
+    // Sort alphabetically so the tooltip displays tools in a stable order.
+    std.mem.sort([]const u8, ext_tool_names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
     const body = role_mod.renderRoleStatusJson(
         allocator,
         session.role_gate.role,
