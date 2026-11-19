@@ -23,6 +23,12 @@ pub const ToolResult = struct {
     tool_code: ?[]const u8 = null,
     /// Ask the loop to stop after this tool's batch completes.
     terminate: bool = false,
+    /// v1.32.0 — lines added/removed by file-mutating tools
+    /// (`edit`, `write`). 0 for non-mutating tools and error results.
+    /// Aggregated by the agent loop into `CostState` for the
+    /// `cost-state` transcript line.
+    lines_added: u64 = 0,
+    lines_removed: u64 = 0,
 
     pub fn deinit(self: *ToolResult, allocator: std.mem.Allocator) void {
         for (self.content) |cb| cb.deinit(allocator);

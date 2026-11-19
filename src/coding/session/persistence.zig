@@ -182,6 +182,8 @@ fn renderTranscriptJsonl(
     session_dir: []const u8,
     transcript: *const agent_mod.loop.Transcript,
     branch: []const u8,
+    cost_state: ?*const ai.types.CostState,
+    session_id: ?[]const u8,
 ) !void {
     const store_dir = try std.fs.path.join(allocator, &.{ session_dir, "objects" });
     defer allocator.free(store_dir);
@@ -203,6 +205,15 @@ fn renderTranscriptJsonl(
         try appendMessageJson(out, allocator, io, store_dir, m);
         try out.append(allocator, '\n');
     }
+
+    // v1.32.0 — cost-state aggregate line. Appended LAST so it reflects
+    // the complete session totals at write time. Omitted when no
+    // `cost_state` accumulator was provided (pre-v1.32 callers, or
+    // --no-session tooling that re-renders without a live session).
+    if (cost_state) |cs| {
+        try renderCostStateLine(out, allocator, cs, session_id, transcript);
+        try out.append(allocator, '\n');
+    }
 }
 
 /// Serialize the transcript to `session_dir/transcript.jsonl` (JSON
@@ -221,10 +232,12 @@ pub fn writeTranscript(
     session_dir: []const u8,
     transcript: *const agent_mod.loop.Transcript,
     branch: []const u8,
+    cost_state: ?*const ai.types.CostState,
+    session_id: ?[]const u8,
 ) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try renderTranscriptJsonl(&buf, allocator, io, session_dir, transcript, branch);
+    try renderTranscriptJsonl(&buf, allocator, io, session_dir, transcript, branch, cost_state, session_id);
 
     const path = try std.fs.path.join(allocator, &.{ session_dir, "transcript.jsonl" });
     defer allocator.free(path);
@@ -279,7 +292,7 @@ pub fn writeBranchTranscript(
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try renderTranscriptJsonl(&buf, allocator, io, session_dir, transcript, branch);
+    try renderTranscriptJsonl(&buf, allocator, io, session_dir, transcript, branch, null, null);
 
     const file_name = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{branch});
     defer allocator.free(file_name);
@@ -402,19 +415,23 @@ fn parseTranscriptJsonl(
         if (parsed.value != .object) continue;
         const obj = parsed.value.object;
 
-        // First non-empty line may be the meta header. We validate the
-        // version but otherwise ignore it — the branch is already known
-        // to the caller (it's the active branch or the requested
-        // `--checkout` name).
-        if (first_line) {
-            first_line = false;
-            const type_str = strOpt(obj, "type") orelse "";
-            if (std.mem.eql(u8, type_str, "meta")) {
+        // v1.32.0 — typed non-message lines. The meta header carries
+        // `type:"meta"`; the cost-state aggregate carries
+        // `type:"cost-state"`. Messages have NO `type` field, so any
+        // line with a recognized non-message `type` is skipped here.
+        // Unknown `type` values are also skipped (forward-compat) rather
+        // than mis-parsed as empty user messages.
+        const type_str = strOpt(obj, "type") orelse "";
+        if (type_str.len > 0) {
+            if (first_line and std.mem.eql(u8, type_str, "meta")) {
                 if (parseVersionField(obj) > current_transcript_version) return error.UnsupportedTranscriptVersion;
-                continue;
             }
-            // Not a meta line — fall through and treat as a message.
+            first_line = false;
+            // All typed lines (meta, cost-state, …) are bookkeeping —
+            // they are not conversation messages, so skip them.
+            continue;
         }
+        first_line = false;
 
         const msg = try parseMessage(allocator, io, store_dir, obj);
         try transcript.append(msg);
@@ -557,6 +574,26 @@ fn appendMessageJson(
             try appendJsonU64Field(buf, allocator, "\"cacheWrite\":", u.cache_write);
             first = false;
         }
+        if (u.thinking_tokens != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"thinkingTokens\":", u.thinking_tokens);
+            first = false;
+        }
+        if (u.cache_creation_ephemeral_5m != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"cacheCreationEphemeral5m\":", u.cache_creation_ephemeral_5m);
+            first = false;
+        }
+        if (u.cache_creation_ephemeral_1h != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"cacheCreationEphemeral1h\":", u.cache_creation_ephemeral_1h);
+            first = false;
+        }
+        if (u.web_search_requests != 0) {
+            if (!first) try buf.append(allocator, ',');
+            try appendJsonU64Field(buf, allocator, "\"webSearchRequests\":", u.web_search_requests);
+            first = false;
+        }
         if (u.cost_input) |ci| {
             if (!first) try buf.append(allocator, ',');
             try appendJsonF64Field(buf, allocator, "\"costInput\":", ci);
@@ -633,6 +670,131 @@ fn appendMessageJson(
         try buf.append(allocator, '}');
     };
     try buf.appendSlice(allocator, "}");
+}
+
+/// v1.32.0 — per-model usage accumulator used while building the
+/// `cost-state` line's `modelUsage` map. Keyed by `"<provider>/<model>"`.
+const ModelUsageAccum = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    thinking_tokens: u64 = 0,
+    cache_read_input_tokens: u64 = 0,
+    cache_creation_input_tokens: u64 = 0,
+    cache_creation_ephemeral_5m_input_tokens: u64 = 0,
+    cache_creation_ephemeral_1h_input_tokens: u64 = 0,
+    web_search_requests: u64 = 0,
+    cost_usd: f64 = 0,
+    /// True when at least one turn for this model reported no cost data.
+    has_unknown_cost: bool = false,
+};
+
+/// v1.32.0 — render the `cost-state` aggregate line.
+///
+/// `totalCostUSD`, `modelUsage`, and `hasUnknownModelCost` are computed
+/// by scanning the transcript's assistant messages (each carries a
+/// `usage` object populated by the stream Reducer). The duration and
+/// line-count fields come from the live `CostState` accumulator updated
+/// by `agentLoop`/`runTurn`. `totalDuration` is `now - startTime`.
+///
+/// Matches the Claude Code transcript `cost-state` line shape so the
+/// two formats are interchangeable for downstream tooling.
+fn renderCostStateLine(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    cs: *const ai.types.CostState,
+    session_id: ?[]const u8,
+    transcript: *const agent_mod.loop.Transcript,
+) !void {
+    // Aggregate per-model usage from assistant messages.
+    var models = std.StringHashMap(*ModelUsageAccum).init(allocator);
+    defer {
+        var it = models.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.destroy(e.value_ptr.*);
+        }
+        models.deinit();
+    }
+    var total_cost_usd: f64 = 0;
+    var any_unknown_cost = false;
+    for (transcript.messages.items) |m| {
+        if (m.role != .assistant) continue;
+        const u = m.usage orelse continue;
+        if (u.isEmpty()) continue;
+        const prov = m.provider orelse "unknown";
+        const mdl = m.model orelse "unknown";
+        const key = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prov, mdl });
+        const gop = try models.getOrPut(key);
+        if (gop.found_existing) {
+            allocator.free(key);
+        } else {
+            gop.value_ptr.* = try allocator.create(ModelUsageAccum);
+            gop.value_ptr.*.* = .{};
+        }
+        const acc = gop.value_ptr.*;
+        acc.input_tokens += u.input;
+        acc.output_tokens += u.output;
+        acc.thinking_tokens += u.thinking_tokens;
+        acc.cache_read_input_tokens += u.cache_read;
+        acc.cache_creation_input_tokens += u.cache_write;
+        acc.cache_creation_ephemeral_5m_input_tokens += u.cache_creation_ephemeral_5m;
+        acc.cache_creation_ephemeral_1h_input_tokens += u.cache_creation_ephemeral_1h;
+        acc.web_search_requests += u.web_search_requests;
+        if (u.costTotal()) |c| {
+            acc.cost_usd += c;
+            total_cost_usd += c;
+        } else {
+            acc.has_unknown_cost = true;
+            any_unknown_cost = true;
+        }
+    }
+
+    // totalDuration = now - startTime (wall-clock session length).
+    const now_ms = @import("../../ai/stream.zig").nowMillis();
+    const total_duration: u64 = if (cs.started)
+        @intCast(@max(0, now_ms - cs.start_time_ms))
+    else
+        0;
+
+    try out.appendSlice(allocator, "{\"type\":\"cost-state\"");
+    if (session_id) |sid| if (sid.len > 0) {
+        try out.appendSlice(allocator, ",\"sessionId\":");
+        try appendJsonStr(out, allocator, sid);
+    };
+    try appendJsonF64Field(out, allocator, ",\"totalCostUSD\":", total_cost_usd);
+    try appendJsonU64Field(out, allocator, ",\"totalAPIDuration\":", cs.total_api_duration_ms);
+    try appendJsonU64Field(out, allocator, ",\"totalAPIDurationWithoutRetries\":", cs.total_api_duration_without_retries_ms);
+    try appendJsonU64Field(out, allocator, ",\"totalToolDuration\":", cs.total_tool_duration_ms);
+    try appendJsonU64Field(out, allocator, ",\"totalLinesAdded\":", cs.total_lines_added);
+    try appendJsonU64Field(out, allocator, ",\"totalLinesRemoved\":", cs.total_lines_removed);
+    try appendJsonU64Field(out, allocator, ",\"totalDuration\":", total_duration);
+    try appendJsonU64Field(out, allocator, ",\"startTime\":", @as(u64, @intCast(cs.start_time_ms)));
+
+    // modelUsage map.
+    try out.appendSlice(allocator, ",\"modelUsage\":{");
+    var first = true;
+    var mit = models.iterator();
+    while (mit.next()) |e| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try appendJsonStr(out, allocator, e.key_ptr.*);
+        try out.appendSlice(allocator, ":{\"inputTokens\":");
+        try appendJsonU64Field(out, allocator, "", e.value_ptr.*.input_tokens);
+        try appendJsonU64Field(out, allocator, ",\"outputTokens\":", e.value_ptr.*.output_tokens);
+        try appendJsonU64Field(out, allocator, ",\"thinkingTokens\":", e.value_ptr.*.thinking_tokens);
+        try appendJsonU64Field(out, allocator, ",\"cacheReadInputTokens\":", e.value_ptr.*.cache_read_input_tokens);
+        try appendJsonU64Field(out, allocator, ",\"cacheCreationInputTokens\":", e.value_ptr.*.cache_creation_input_tokens);
+        try appendJsonU64Field(out, allocator, ",\"cacheCreationEphemeral5mInputTokens\":", e.value_ptr.*.cache_creation_ephemeral_5m_input_tokens);
+        try appendJsonU64Field(out, allocator, ",\"cacheCreationEphemeral1hInputTokens\":", e.value_ptr.*.cache_creation_ephemeral_1h_input_tokens);
+        try appendJsonU64Field(out, allocator, ",\"webSearchRequests\":", e.value_ptr.*.web_search_requests);
+        try appendJsonF64Field(out, allocator, ",\"costUSD\":", e.value_ptr.*.cost_usd);
+        try out.appendSlice(allocator, "}");
+    }
+    try out.appendSlice(allocator, "}");
+
+    try out.appendSlice(allocator, ",\"hasUnknownModelCost\":");
+    try out.appendSlice(allocator, if (any_unknown_cost) "true" else "false");
+    try out.append(allocator, '}');
 }
 
 /// Render a content block's canonical JSON inline. Pure — no IO.
@@ -802,6 +964,18 @@ fn parseMessage(
         };
         if (uobj.get("cacheWrite")) |v| if (v == .integer) {
             usage.cache_write = @intCast(v.integer);
+        };
+        if (uobj.get("thinkingTokens")) |v| if (v == .integer) {
+            usage.thinking_tokens = @intCast(v.integer);
+        };
+        if (uobj.get("cacheCreationEphemeral5m")) |v| if (v == .integer) {
+            usage.cache_creation_ephemeral_5m = @intCast(v.integer);
+        };
+        if (uobj.get("cacheCreationEphemeral1h")) |v| if (v == .integer) {
+            usage.cache_creation_ephemeral_1h = @intCast(v.integer);
+        };
+        if (uobj.get("webSearchRequests")) |v| if (v == .integer) {
+            usage.web_search_requests = @intCast(v.integer);
         };
         if (uobj.get("costInput")) |v| {
             usage.cost_input = jsonF64(v);

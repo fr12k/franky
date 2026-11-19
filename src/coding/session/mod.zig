@@ -62,6 +62,7 @@ pub fn save(
     parent_dir: []const u8,
     header: SessionHeader,
     transcript: *const agent_mod.loop.Transcript,
+    cost_state: ?*const ai.types.CostState,
 ) !void {
     const session_dir = try std.fs.path.join(allocator, &.{ parent_dir, header.id });
     defer allocator.free(session_dir);
@@ -73,7 +74,7 @@ pub fn save(
     };
 
     try writeSessionHeader(allocator, io, session_dir, header);
-    try writeTranscript(allocator, io, session_dir, transcript, header.active_branch);
+    try writeTranscript(allocator, io, session_dir, transcript, header.active_branch, cost_state, header.id);
 }
 
 /// Load a session from `<parent_dir>/<session_id>/`. Caller owns the
@@ -187,7 +188,7 @@ test "session round-trips through disk" {
         .thinking_level = "off",
     };
 
-    try save(gpa, io, base, header, &transcript);
+    try save(gpa, io, base, header, &transcript, null);
 
     var loaded = try load(gpa, io, base, "01JXTEST");
     defer loaded.deinit(gpa);
@@ -368,7 +369,7 @@ test "transcript: small block stays inline; objects/ dir stays empty" {
         .api = "faux",
         .thinking_level = "off",
     };
-    try save(gpa, io, base, header, &transcript);
+    try save(gpa, io, base, header, &transcript, null);
 
     const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXSMALL/transcript.jsonl", .{base});
     defer gpa.free(t_path);
@@ -419,7 +420,7 @@ test "transcript: 32 KiB block externalized and round-trips through $ref" {
         .api = "faux",
         .thinking_level = "off",
     };
-    try save(gpa, io, base, header, &transcript);
+    try save(gpa, io, base, header, &transcript, null);
 
     const t_path = try std.fmt.allocPrint(gpa, "{s}/01JXLARGE/transcript.jsonl", .{base});
     defer gpa.free(t_path);
@@ -470,7 +471,7 @@ test "transcript: missing blob during load surfaces a structured error" {
         .api = "faux",
         .thinking_level = "off",
     };
-    try save(gpa, io, base, header, &transcript);
+    try save(gpa, io, base, header, &transcript, null);
 
     // Delete the objects dir so the ref cannot be resolved.
     const obj_path = try std.fmt.allocPrint(gpa, "{s}/01JXMISS/objects", .{base});
@@ -593,7 +594,7 @@ test "transcript: threshold edge — just below stays inline, at threshold spill
             .api = "faux",
             .thinking_level = "off",
         };
-        try save(gpa, io, base, header, &transcript);
+        try save(gpa, io, base, header, &transcript, null);
 
         var loaded = try load(gpa, io, base, "01JXEDGE1");
         defer loaded.deinit(gpa);
@@ -635,7 +636,7 @@ test "transcript: threshold edge — just below stays inline, at threshold spill
             .api = "faux",
             .thinking_level = "off",
         };
-        try save(gpa, io, base, header, &transcript);
+        try save(gpa, io, base, header, &transcript, null);
 
         var loaded = try load(gpa, io, base, "01JXEDGE2");
         defer loaded.deinit(gpa);
@@ -685,7 +686,7 @@ test "Diagnostics round-trips through writeTranscript / readTranscript (v1.29.0)
         .api = "google-gemini",
         .thinking_level = "high",
     };
-    try save(gpa, io, base, header, &transcript);
+    try save(gpa, io, base, header, &transcript, null);
 
     var loaded = try load(gpa, io, base, "01JDIAG");
     defer loaded.deinit(gpa);
@@ -860,4 +861,93 @@ test "v1.30: legacy .json branch snapshot is read when .jsonl is absent" {
     defer loaded.deinit();
     try testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
     try testing.expectEqualStrings("old branch", loaded.messages.items[0].content[0].text.text);
+}
+
+test "v1.32: cost-state line is appended and round-trips" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky-session-coststate";
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    // One assistant message with rich usage (tokens + cost + cache split).
+    const c = try gpa.alloc(ai.types.ContentBlock, 1);
+    c[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok") } };
+    try transcript.append(.{
+        .role = .assistant,
+        .content = c,
+        .timestamp = 100,
+        .stop_reason = .stop,
+        .provider = try gpa.dupe(u8, "anthropic"),
+        .model = try gpa.dupe(u8, "claude-sonnet-5"),
+        .api = try gpa.dupe(u8, "anthropic"),
+        .usage = .{
+            .input = 2,
+            .output = 1069,
+            .cache_read = 0,
+            .cache_write = 30175,
+            .thinking_tokens = 824,
+            .cache_creation_ephemeral_5m = 30175,
+            .cache_creation_ephemeral_1h = 0,
+            .cost_input = 0.08,
+            .cost_output = 0.0061315,
+        },
+    });
+
+    var cost_state: ai.types.CostState = .{
+        .total_api_duration_ms = 13121,
+        .total_api_duration_without_retries_ms = 13069,
+        .total_tool_duration_ms = 0,
+        .total_lines_added = 0,
+        .total_lines_removed = 0,
+        .start_time_ms = 1793834435445,
+        .started = true,
+    };
+
+    const header: SessionHeader = .{
+        .id = "01JCOST",
+        .created_at_ms = 1793834435445,
+        .updated_at_ms = 1793834435445,
+        .title = "cost",
+        .provider = "anthropic",
+        .model = "claude-sonnet-5",
+        .api = "anthropic",
+        .thinking_level = "high",
+    };
+    try save(gpa, io, base, header, &transcript, &cost_state);
+
+    // Read the raw file and verify the cost-state line is present.
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01JCOST/transcript.jsonl", .{base});
+    defer gpa.free(t_path);
+    const t_bytes = try readWholeFile(gpa, io, t_path);
+    defer gpa.free(t_bytes);
+
+    // The cost-state line must exist and carry the expected fields.
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"type\":\"cost-state\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"sessionId\":\"01JCOST\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"totalAPIDuration\":13121") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"totalAPIDurationWithoutRetries\":13069") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"startTime\":1793834435445") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"anthropic/claude-sonnet-5\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"inputTokens\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"outputTokens\":1069") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"thinkingTokens\":824") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"cacheCreationInputTokens\":30175") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"cacheCreationEphemeral5mInputTokens\":30175") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"hasUnknownModelCost\":false") != null);
+
+    // Round-trip: readTranscript must skip the cost-state line (not
+    // treat it as a message).
+    var loaded = try load(gpa, io, base, "01JCOST");
+    defer loaded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
+    try testing.expectEqual(@as(u64, 2), loaded.transcript.messages.items[0].usage.?.input);
+    try testing.expectEqual(@as(u64, 824), loaded.transcript.messages.items[0].usage.?.thinking_tokens);
+    try testing.expectEqual(@as(u64, 30175), loaded.transcript.messages.items[0].usage.?.cache_creation_ephemeral_5m);
 }

@@ -60,6 +60,11 @@ pub const SessionState = struct {
     /// `coding/compression.zig`).
     compression_ctx: compression_mod.CompressionContext = .{ .config = .{} },
 
+    /// v1.32.0 — session cost-state accumulator for the `cost-state`
+    /// transcript line. Updated by `agentLoop`/`runTurn` via
+    /// `Config.cost_state`; persisted in `persist`.
+    cost_state: ai.types.CostState = .{},
+
     /// Initialise a `SessionState` from a parsed CLI config.
     ///
     /// Three cases:
@@ -220,7 +225,7 @@ pub const SessionState = struct {
             .thinking_level = cfg.thinking.toString(),
         };
 
-        try session_mod.save(allocator, io, parent, header, &self.transcript);
+        try session_mod.save(allocator, io, parent, header, &self.transcript, &self.cost_state);
 
         // v1.6.0 — persist the branch tree alongside the header
         // and transcript.

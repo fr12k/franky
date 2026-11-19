@@ -487,6 +487,11 @@ pub const Session = struct {
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
     tool_usage: std.StringHashMap(u32) = undefined,
 
+    /// v1.32.0 — session cost-state accumulator for the `cost-state`
+    /// transcript line. Updated by `agentLoop`/`runTurn` via
+    /// `Config.cost_state`; persisted by `session_mod.save`.
+    cost_state: ai.types.CostState = .{},
+
     /// Single-flight gate around the agent loop. Concurrent
     /// `POST /prompt` requests queue here.
     run_mutex: std.Io.Mutex = .init,
@@ -1793,7 +1798,7 @@ fn persistSession(session: *Session) void {
         .api = session.provider.api_tag,
         .thinking_level = session.cfg.thinking.toString(),
     };
-    session_mod.save(session.allocator, session.io, parent, header, &session.transcript) catch |err| {
+    session_mod.save(session.allocator, session.io, parent, header, &session.transcript, &session.cost_state) catch |err| {
         ai.log.log(.warn, "proxy", "session_save_failed", "id={s} error={s}", .{
             session.session_id,
             @errorName(err),
@@ -2402,6 +2407,7 @@ fn runOneTurnInternal(
                 .nudge_on_autocontinue = session.cfg.autocontinue,
                 .max_full_tool_results = session.max_full_tool_results,
                 .offload_dir = offload_dir,
+                .cost_state = &session.cost_state,
                 .stop_requested_fn = proxyStopRequestedFn,
                 .max_turns = print_mode.resolveMaxTurnsFromMap(session.cfg, session.environ_map) orelse @as(u32, 100),
                 .stream_options = .{
@@ -3387,18 +3393,18 @@ fn countTranscriptMessages(
         const bytes = try allocator.alloc(u8, len_usize);
         defer allocator.free(bytes);
         const n = try f.readPositionalAll(io, bytes, 0);
-        // Count non-empty lines, subtracting the meta header
-        // (type:"meta") if it is the first non-empty line. This is
-        // cheaper than parsing each line as JSON.
+        // Count non-empty lines, subtracting bookkeeping lines (meta
+        // header, cost-state aggregate). Bookkeeping lines start with
+        // `{"type":"` (a top-level `type` field); conversation
+        // messages start with `{"role":"` and have no top-level
+        // `type`. Content blocks nest a `"type":"` field but it is
+        // never at the start of the line. This is cheaper than parsing
+        // each line as JSON.
         var count: u32 = 0;
-        var first_non_empty = true;
         var it = std.mem.splitScalar(u8, bytes[0..n], '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
-            if (first_non_empty) {
-                first_non_empty = false;
-                if (std.mem.indexOf(u8, line, "\"type\":\"meta\"") != null) continue;
-            }
+            if (line.len > 10 and std.mem.eql(u8, line[0..9], "{\"type\":\"")) continue;
             count += 1;
         }
         return count;

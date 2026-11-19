@@ -1786,7 +1786,7 @@ fn persistSubagentSession(
         .api = args.api,
         .thinking_level = args.thinking_level,
         .active_branch = "main",
-    }, args.transcript);
+    }, args.transcript, null);
 
     // meta.json sidecar — debugging context.
     const meta_path = try std.fs.path.join(allocator, &.{ subagents_dir, args.call_id, "meta.json" });

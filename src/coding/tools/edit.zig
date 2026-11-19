@@ -288,10 +288,17 @@ pub fn applyEdits(
             break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"diff\":null,\"path\":\"{s}\"}}", .{ edits.len, path });
         }
     };
+    const line_counts = countDiffLines(allocator, original, buf.items);
+
     const text = try allocator.dupe(u8, summary.items);
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };
-    return .{ .content = arr, .details_json = details };
+    return .{
+        .content = arr,
+        .details_json = details,
+        .lines_added = line_counts.added,
+        .lines_removed = line_counts.removed,
+    };
 }
 
 const DiffRow = struct { old: []const u8, new: []const u8 };
@@ -733,6 +740,82 @@ fn computeUnifiedDiff(
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+/// v1.32.0 — count lines added/removed by an edit, for the `cost-state`
+/// transcript aggregate. Runs the same LCS diff as `computeUnifiedDiff`
+/// but only tallies `.add`/`.remove` ops (no string building), so it is
+/// cheaper and shares the 2000-line cap. On `error.TooLarge` it falls
+/// back to a raw line-count delta (added = new lines, removed = 0) so
+/// the cost-state line is still populated for large edits.
+const LineCounts = struct { added: u64, removed: u64 };
+
+pub fn countDiffLines(
+    allocator: std.mem.Allocator,
+    original: []const u8,
+    modified: []const u8,
+) LineCounts {
+    const orig_lines = splitLines(allocator, original) catch return countLinesFallback(original, modified);
+    defer allocator.free(orig_lines);
+    const mod_lines = splitLines(allocator, modified) catch return countLinesFallback(original, modified);
+    defer allocator.free(mod_lines);
+    const n = orig_lines.len;
+    const m = mod_lines.len;
+    if (n > 2000 or m > 2000) return countLinesFallback(original, modified);
+
+    const cols = m + 1;
+    const dp = allocator.alloc(usize, (n + 1) * cols) catch return countLinesFallback(original, modified);
+    defer allocator.free(dp);
+    @memset(dp, 0);
+    var i: usize = 1;
+    while (i <= n) : (i += 1) {
+        var j: usize = 1;
+        while (j <= m) : (j += 1) {
+            if (std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
+                dp[i * cols + j] = dp[(i - 1) * cols + (j - 1)] + 1;
+            } else {
+                dp[i * cols + j] = @max(dp[(i - 1) * cols + j], dp[i * cols + (j - 1)]);
+            }
+        }
+    }
+    // Trace back counting adds/removes.
+    var added: u64 = 0;
+    var removed: u64 = 0;
+    i = n;
+    var j: usize = m;
+    while (i > 0 or j > 0) {
+        if (i > 0 and j > 0 and std.mem.eql(u8, orig_lines[i - 1], mod_lines[j - 1])) {
+            i -= 1;
+            j -= 1;
+        } else if (j > 0 and (i == 0 or dp[i * cols + (j - 1)] >= dp[(i - 1) * cols + j])) {
+            added += 1;
+            j -= 1;
+        } else if (i > 0) {
+            removed += 1;
+            i -= 1;
+        }
+    }
+    return .{ .added = added, .removed = removed };
+}
+
+fn countLinesFallback(original: []const u8, modified: []const u8) LineCounts {
+    const orig_lines = countLines(original);
+    const mod_lines = countLines(modified);
+    if (mod_lines > orig_lines) {
+        return .{ .added = mod_lines - orig_lines, .removed = 0 };
+    } else {
+        return .{ .added = 0, .removed = orig_lines - mod_lines };
+    }
+}
+
+fn countLines(s: []const u8) u64 {
+    if (s.len == 0) return 0;
+    var n: u64 = 1;
+    for (s) |c| {
+        if (c == '\n') n += 1;
+    }
+    if (s[s.len - 1] == '\n') n -= 1; // trailing newline → no extra empty line
+    return n;
 }
 
 const DiffOpKind = enum { keep, remove, add };

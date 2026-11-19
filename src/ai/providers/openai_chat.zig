@@ -446,12 +446,20 @@ const Driver = struct {
             // by OpenRouter; maps to Usage.cache_write.
             var cache_read: u64 = 0;
             var cache_write: u64 = 0;
+            // v1.32.0 — reasoning/thinking tokens. OpenAI, OpenRouter,
+            // and MLX-serve expose `completion_tokens_details.reasoning_tokens`.
+            var thinking: u64 = 0;
             if (uv.object.get("prompt_tokens_details")) |ptd| if (ptd == .object) {
                 if (ptd.object.get("cached_tokens")) |v| if (v == .integer) {
                     cache_read = @intCast(v.integer);
                 };
                 if (ptd.object.get("cache_write_tokens")) |v| if (v == .integer) {
                     cache_write = @intCast(v.integer);
+                };
+            };
+            if (uv.object.get("completion_tokens_details")) |ctd| if (ctd == .object) {
+                if (ctd.object.get("reasoning_tokens")) |v| if (v == .integer) {
+                    thinking = @intCast(v.integer);
                 };
             };
 
@@ -497,6 +505,7 @@ const Driver = struct {
                 .output = out,
                 .cache_read = cache_read,
                 .cache_write = cache_write,
+                .thinking_tokens = thinking,
                 .cost_input = cost_input,
                 .cost_output = cost_output,
             } });

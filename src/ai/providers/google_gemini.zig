@@ -415,6 +415,9 @@ const Driver = struct {
                 .input = inp,
                 .output = out,
                 .cache_read = cache_read,
+                // v1.32.0 — mirror thoughtsTokenCount into Usage so
+                // the cost-state aggregator can sum thinking tokens.
+                .thinking_tokens = self.thoughts_tokens orelse 0,
             } });
         };
     }

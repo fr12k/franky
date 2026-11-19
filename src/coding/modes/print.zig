@@ -419,6 +419,7 @@ fn runPrint(
         .nudge_on_autocontinue = cfg.autocontinue,
         .max_full_tool_results = resolved.max_full_tool_results,
         .offload_dir = offload_dir_path,
+        .cost_state = &session_state.cost_state,
         .hook_userdata = @ptrCast(resolved.session_gates),
         .role_denied = permissions_mod.SessionGates.roleDenied,
         .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
