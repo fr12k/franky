@@ -37,6 +37,16 @@ const Channel = channel_mod.Channel(stream_mod.StreamEvent);
 
 pub const default_endpoint: []const u8 = "https://api.openai.com/v1/chat/completions";
 
+/// Extract an f64 from a JSON value that may be either `.float`
+/// or `.integer` (whole-number costs like `0` are tagged `.integer`).
+fn jsonF64(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .float => v.float,
+        .integer => @floatFromInt(v.integer),
+        else => null,
+    };
+}
+
 // ─── request serialization ────────────────────────────────────────
 
 pub fn buildRequestJson(
@@ -412,7 +422,10 @@ const Driver = struct {
         if (parsed.value != .object) return;
         const root = parsed.value.object;
 
-        // Usage-only chunk (final chunk with empty `choices`).
+        // Usage chunk — typically the final SSE event, either with
+        // an empty `choices` array (OpenAI / Ollama Cloud) or alongside
+        // the `finish_reason` delta (MLX-serve, vLLM). We parse it
+        // wherever it appears.
         if (root.get("usage")) |uv| if (uv == .object) {
             const inp: u64 = if (uv.object.get("prompt_tokens")) |v|
                 (if (v == .integer) @intCast(v.integer) else 0)
@@ -423,7 +436,70 @@ const Driver = struct {
             else
                 0;
             self.candidates_tokens = out;
-            try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
+
+            // v1.31.0 — cache + cost enrichment.
+            //
+            // `prompt_tokens_details.cached_tokens` is emitted by
+            // Ollama (local + cloud), MLX-serve, and OpenRouter. It
+            // maps to Usage.cache_read.
+            // `prompt_tokens_details.cache_write_tokens` is emitted
+            // by OpenRouter; maps to Usage.cache_write.
+            var cache_read: u64 = 0;
+            var cache_write: u64 = 0;
+            if (uv.object.get("prompt_tokens_details")) |ptd| if (ptd == .object) {
+                if (ptd.object.get("cached_tokens")) |v| if (v == .integer) {
+                    cache_read = @intCast(v.integer);
+                };
+                if (ptd.object.get("cache_write_tokens")) |v| if (v == .integer) {
+                    cache_write = @intCast(v.integer);
+                };
+            };
+
+            // OpenRouter puts a top-level `cost` (total USD) plus a
+            // `cost_details` sub-object with per-category breakdown.
+            // We extract the granular fields when present, falling
+            // back to the top-level `cost` for any category that
+            // `cost_details` did not cover.
+            var cost_input: ?f64 = null;
+            var cost_output: ?f64 = null;
+            if (uv.object.get("cost_details")) |cd| if (cd == .object) {
+                if (cd.object.get("upstream_inference_prompt_cost")) |v| {
+                    cost_input = jsonF64(v);
+                }
+                if (cd.object.get("upstream_inference_completions_cost")) |v| {
+                    cost_output = jsonF64(v);
+                }
+            };
+            // Top-level `cost` (total USD). Used as a fallback for
+            // any category that cost_details did not fill.
+            const top_cost: ?f64 = blk: {
+                if (uv.object.get("cost")) |v| break :blk jsonF64(v);
+                break :blk null;
+            };
+            if (top_cost) |tc| {
+                if (cost_input == null or cost_output == null) {
+                    const total_tok = inp + out;
+                    if (total_tok > 0) {
+                        const ratio_in = @as(f64, @floatFromInt(inp)) / @as(f64, @floatFromInt(total_tok));
+                        if (cost_input == null) cost_input = tc * ratio_in;
+                        if (cost_output == null) cost_output = tc * (1.0 - ratio_in);
+                    } else {
+                        // No tokens to split by; assign full cost
+                        // to both so the total is recoverable.
+                        if (cost_input == null) cost_input = tc;
+                        if (cost_output == null) cost_output = 0.0;
+                    }
+                }
+            }
+
+            try self.out.push(self.io, .{ .usage = .{
+                .input = inp,
+                .output = out,
+                .cache_read = cache_read,
+                .cache_write = cache_write,
+                .cost_input = cost_input,
+                .cost_output = cost_output,
+            } });
         };
 
         const choices_val = root.get("choices") orelse return;

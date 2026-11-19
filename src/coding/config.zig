@@ -1174,14 +1174,20 @@ pub fn filterMcpToolsForAutoMode(
             try out.append(allocator, t);
             continue;
         }
-        // Check autoMode.allow (exact + wildcard) first — overrides
-        // soft_deny and the classifier, but NOT hard_deny.
-        if (permissions_mod.Store.autoSetMatches(&store.auto_allow, t.name, "{}")) {
+        // Check --allow-tools CLI flag and autoMode.allow (exact +
+        // wildcard) first — overrides soft_deny and the classifier,
+        // but NOT hard_deny.
+        if (permissions_mod.Store.autoSetMatches(&store.auto_allow, t.name, "{}") or
+            permissions_mod.Store.autoSetMatches(&store.allow_tools, t.name, "{}"))
+        {
             try out.append(allocator, t);
             continue;
         }
-        // Check autoMode.hardDeny — always blocked, no override.
-        if (permissions_mod.Store.autoSetMatches(&store.auto_hard_deny, t.name, "{}")) {
+        // Check autoMode.hardDeny and --deny-tools CLI flag — always
+        // blocked, no override.
+        if (permissions_mod.Store.autoSetMatches(&store.auto_hard_deny, t.name, "{}") or
+            permissions_mod.Store.autoSetMatches(&store.deny_tools, t.name, "{}"))
+        {
             continue; // skip — hard denied
         }
         // Check autoMode.softDeny — blocked unless allow matched.

@@ -499,16 +499,22 @@ fn mcpAllowlistRule(input: ClassifierInput) ?Result {
 pub fn mcpToolWouldPass(full_name: []const u8) bool {
     if (!std.mem.startsWith(u8, full_name, "mcp__")) return true;
     const tool_name = mcpRemoteToolName(full_name) orelse return true;
-    var lbuf: [256]u8 = undefined;
-    if (tool_name.len > lbuf.len) return false; // conservative
-    for (tool_name, 0..) |c, i| lbuf[i] = std.ascii.toLower(c);
-    const lower = lbuf[0..tool_name.len];
+    if (tool_name.len > 256) return false; // conservative
     for (mcp_safe_verbs) |verb| {
-        if (std.mem.startsWith(u8, lower, verb)) {
-            if (lower.len == verb.len) return true;
-            const next = lower[verb.len];
-            if (next == '_' or next == '-' or !std.ascii.isAlphanumeric(next)) return true;
+        if (tool_name.len < verb.len) continue;
+        // Case-insensitive prefix match (verb is already lowercase).
+        var match = true;
+        for (verb, 0..) |vc, i| {
+            if (std.ascii.toLower(tool_name[i]) != vc) { match = false; break; }
         }
+        if (!match) continue;
+        if (tool_name.len == verb.len) return true;
+        // Word-boundary check on the ORIGINAL character so camelCase
+        // is recognized as a boundary (e.g. `getJiraIssue` -> `get` +
+        // `J`, uppercase = boundary). Also accepts `_` and `-`.
+        const next = tool_name[verb.len];
+        if (next == '_' or next == '-' or !std.ascii.isAlphanumeric(next)) return true;
+        if (std.ascii.isUpper(next)) return true; // camelCase boundary
     }
     return false;
 }
@@ -1167,6 +1173,17 @@ test "mcpToolWouldPass: safe verbs" {
     try testing.expect(mcpToolWouldPass("mcp__x__get"));
     try testing.expect(!mcpToolWouldPass("mcp__atlassian__delete_ticket"));
     try testing.expect(!mcpToolWouldPass("mcp__x__getter"));
+    // camelCase boundaries must be recognized (the bug that motivated
+    // this fix: getJiraIssue was lowercased to getjiraissue, destroying
+    // the word boundary so 'get' didn't match).
+    try testing.expect(mcpToolWouldPass("mcp__atlassian__getJiraIssue"));
+    try testing.expect(mcpToolWouldPass("mcp__atlassian__searchConfluence"));
+    try testing.expect(mcpToolWouldPass("mcp__atlassian__listJiraIssueComments"));
+    try testing.expect(mcpToolWouldPass("mcp__atlassian__getConfluenceContent"));
+    // camelCase with a write verb still blocked.
+    try testing.expect(!mcpToolWouldPass("mcp__atlassian__createJiraIssue"));
+    try testing.expect(!mcpToolWouldPass("mcp__atlassian__editJiraIssue"));
+    try testing.expect(!mcpToolWouldPass("mcp__atlassian__updateConfluenceContent"));
     // Non-MCP tools always pass.
     try testing.expect(mcpToolWouldPass("read"));
     try testing.expect(mcpToolWouldPass("bash"));

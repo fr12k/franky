@@ -2799,7 +2799,10 @@ fn respondRole(
 ) void {
     const sandboxed = role_mod.detectSandboxFromMap(session.environ_map);
     // Collect extension tool names so the web UI tooltip shows
-    // them alongside the built-in core tools.
+    // them alongside the built-in core tools. This reflects exactly
+    // what the model sees — in --auto mode, filtered-out MCP tools
+    // are absent from session.tools and therefore absent from the
+    // tooltip.
     var ext_tool_names: std.ArrayList([]const u8) = .empty;
     defer ext_tool_names.deinit(allocator);
     for (session.tools) |t| {
@@ -2807,6 +2810,12 @@ fn respondRole(
         if (session.role_gate.set.isKnownButDisabled(t.name)) continue;
         ext_tool_names.append(allocator, t.name) catch {};
     }
+    // Sort alphabetically so the tooltip displays tools in a stable order.
+    std.mem.sort([]const u8, ext_tool_names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
     const body = role_mod.renderRoleStatusJson(
         allocator,
         session.role_gate.role,

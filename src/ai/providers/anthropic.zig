@@ -503,7 +503,21 @@ const Driver = struct {
                 const inp: u64 = if (uv.object.get("input_tokens")) |v| @intCast(v.integer) else 0;
                 const out: u64 = if (uv.object.get("output_tokens")) |v| @intCast(v.integer) else 0;
                 self.candidates_tokens = out;
-                try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
+                // v1.31.0 — Anthropic cache tokens.
+                var cache_read: u64 = 0;
+                var cache_write: u64 = 0;
+                if (uv.object.get("cache_read_input_tokens")) |v| if (v == .integer) {
+                    cache_read = @intCast(v.integer);
+                };
+                if (uv.object.get("cache_creation_input_tokens")) |v| if (v == .integer) {
+                    cache_write = @intCast(v.integer);
+                };
+                try self.out.push(self.io, .{ .usage = .{
+                    .input = inp,
+                    .output = out,
+                    .cache_read = cache_read,
+                    .cache_write = cache_write,
+                } });
             };
             return;
         }

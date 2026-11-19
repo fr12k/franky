@@ -145,6 +145,34 @@ test "session round-trips through disk" {
             .provider = try gpa.dupe(u8, "faux"),
             .model = try gpa.dupe(u8, "faux-1"),
             .api = try gpa.dupe(u8, "faux"),
+            .usage = .{
+                .input = 120,
+                .output = 34,
+                .cache_read = 10,
+                .cache_write = 5,
+                .cost_input = 0.0012,
+                .cost_output = 0.0008,
+                .cost_cache_read = 0.0001,
+                .cost_cache_write = 0.0002,
+            },
+        });
+    }
+    // Second assistant message with whole-number costs to verify
+    // that {d} -> .integer -> jsonF64 round-trip works.
+    {
+        const content = try gpa.alloc(ai.types.ContentBlock, 1);
+        content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "ok") } };
+        try transcript.append(.{
+            .role = .assistant,
+            .content = content,
+            .timestamp = 1600,
+            .stop_reason = .stop,
+            .usage = .{
+                .input = 50,
+                .output = 10,
+                .cost_input = 1.0,
+                .cost_output = 0.0,
+            },
         });
     }
 
@@ -166,7 +194,7 @@ test "session round-trips through disk" {
 
     try testing.expectEqualStrings("test session", loaded.header.title);
     try testing.expectEqualStrings("faux", loaded.header.provider);
-    try testing.expectEqual(@as(usize, 2), loaded.transcript.messages.items.len);
+    try testing.expectEqual(@as(usize, 3), loaded.transcript.messages.items.len);
 
     const m0 = loaded.transcript.messages.items[0];
     try testing.expectEqual(ai.types.Role.user, m0.role);
@@ -178,6 +206,30 @@ test "session round-trips through disk" {
     try testing.expectEqualStrings("let me help", m1.content[0].text.text);
     try testing.expectEqualStrings("echo", m1.content[1].tool_call.name);
     try testing.expectEqual(ai.types.StopReason.tool_use, m1.stop_reason.?);
+    // v1.31.0 — usage round-trips through disk.
+    const u = m1.usage orelse return error.UsageMissing;
+    try testing.expectEqual(@as(u64, 120), u.input);
+    try testing.expectEqual(@as(u64, 34), u.output);
+    try testing.expectEqual(@as(u64, 10), u.cache_read);
+    try testing.expectEqual(@as(u64, 5), u.cache_write);
+    try testing.expectEqual(@as(f64, 0.0012), u.cost_input.?);
+    try testing.expectEqual(@as(f64, 0.0008), u.cost_output.?);
+    try testing.expectEqual(@as(f64, 0.0001), u.cost_cache_read.?);
+    try testing.expectEqual(@as(f64, 0.0002), u.cost_cache_write.?);
+    // user message should have no usage.
+    try testing.expect(m0.usage == null);
+    // Second assistant message — whole-number cost round-trip.
+    const m2 = loaded.transcript.messages.items[2];
+    try testing.expectEqual(ai.types.Role.assistant, m2.role);
+    const usage2 = m2.usage orelse return error.Usage2Missing;
+    try testing.expectEqual(@as(u64, 50), usage2.input);
+    try testing.expectEqual(@as(u64, 10), usage2.output);
+    // 1.0 serializes as "1.0" and 0.0 as "0.0" — must survive round-trip.
+    try testing.expectEqual(@as(f64, 1.0), usage2.cost_input.?);
+    try testing.expectEqual(@as(f64, 0.0), usage2.cost_output.?);
+    // No cache fields set — should be null/0.
+    try testing.expectEqual(@as(u64, 0), usage2.cache_read);
+    try testing.expect(usage2.cost_cache_read == null);
 }
 
 test "migrateSessionIfNeeded: v1 → current backs up + rewrites" {

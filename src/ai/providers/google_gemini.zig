@@ -406,7 +406,16 @@ const Driver = struct {
             if (um.object.get("thoughtsTokenCount")) |v| if (v == .integer) {
                 self.thoughts_tokens = @intCast(v.integer);
             };
-            try self.out.push(self.io, .{ .usage = .{ .input = inp, .output = out } });
+            // v1.31.0 — Gemini cached content tokens.
+            var cache_read: u64 = 0;
+            if (um.object.get("cachedContentTokenCount")) |v| if (v == .integer) {
+                cache_read = @intCast(v.integer);
+            };
+            try self.out.push(self.io, .{ .usage = .{
+                .input = inp,
+                .output = out,
+                .cache_read = cache_read,
+            } });
         };
     }
 };
