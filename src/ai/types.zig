@@ -230,6 +230,9 @@ pub const StopReason = enum {
         if (std.mem.eql(u8, s, "refusal")) return .refusal;
         if (std.mem.eql(u8, s, "error")) return .err;
         if (std.mem.eql(u8, s, "aborted")) return .aborted;
+        // Claude-Code-compatible aliases (transcript.jsonl v5).
+        if (std.mem.eql(u8, s, "end_turn")) return .stop;
+        if (std.mem.eql(u8, s, "max_tokens")) return .length;
         return null;
     }
 
@@ -238,6 +241,22 @@ pub const StopReason = enum {
             .stop => "stop",
             .length => "length",
             .tool_use => "toolUse",
+            .refusal => "refusal",
+            .err => "error",
+            .aborted => "aborted",
+        };
+    }
+
+    /// Claude-Code-compatible `stop_reason` string for the transcript.jsonl
+    /// v5 format. Claude Code uses `end_turn` / `tool_use` / `max_tokens`
+    /// rather than franky's internal `stop` / `toolUse` / `length`.
+    /// `toString()` is unchanged because stream.zig snapshots and the
+    /// proxy UI use the internal names in their own (separate) formats.
+    pub fn toClaudeCodeString(self: StopReason) []const u8 {
+        return switch (self) {
+            .stop => "end_turn",
+            .length => "max_tokens",
+            .tool_use => "tool_use",
             .refusal => "refusal",
             .err => "error",
             .aborted => "aborted",

@@ -3394,17 +3394,32 @@ fn countTranscriptMessages(
         defer allocator.free(bytes);
         const n = try f.readPositionalAll(io, bytes, 0);
         // Count non-empty lines, subtracting bookkeeping lines (meta
-        // header, cost-state aggregate). Bookkeeping lines start with
-        // `{"type":"` (a top-level `type` field); conversation
-        // messages start with `{"role":"` and have no top-level
-        // `type`. Content blocks nest a `"type":"` field but it is
-        // never at the start of the line. This is cheaper than parsing
-        // each line as JSON.
+        // header, cost-state aggregate). v1.33.0 — message lines now
+        // ALSO carry a top-level `type` field (`"user"`/`"assistant"`),
+        // so we only count lines whose `type` is `user`/`assistant`
+        // OR lines with no top-level `type` (legacy v4 messages).
+        // Unknown future `type` values are skipped (forward-compat,
+        // matching `parseTranscriptJsonl`).
+        // Content blocks nest a `"type":"` field but it is never at
+        // the start of the line. This is cheaper than parsing each
+        // line as JSON.
         var count: u32 = 0;
         var it = std.mem.splitScalar(u8, bytes[0..n], '\n');
         while (it.next()) |line| {
             if (line.len == 0) continue;
-            if (line.len >= 9 and std.mem.eql(u8, line[0..9], "{\"type\":\"")) continue;
+            if (line.len >= 9 and std.mem.eql(u8, line[0..9], "{\"type\":\"")) {
+                if (std.mem.startsWith(u8, line, "{\"type\":\"user\"")) {
+                    count += 1;
+                    continue;
+                }
+                if (std.mem.startsWith(u8, line, "{\"type\":\"assistant\"")) {
+                    count += 1;
+                    continue;
+                }
+                // meta, cost-state, or any other bookkeeping type → skip.
+                continue;
+            }
+            // No top-level `type` → legacy v4 message line.
             count += 1;
         }
         return count;

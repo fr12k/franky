@@ -888,7 +888,10 @@ test "v1.32: cost-state line is appended and round-trips" {
         .model = try gpa.dupe(u8, "claude-sonnet-5"),
         .api = try gpa.dupe(u8, "anthropic"),
         .usage = .{
-            .input = 2,
+            // input = total prompt tokens (30175 cached + 18 uncached = 30193).
+            // Claude Code reports only the uncached portion (18) in
+            // `input_tokens`; franky keeps the total here.
+            .input = 30193,
             .output = 1069,
             .cache_read = 0,
             .cache_write = 30175,
@@ -935,7 +938,7 @@ test "v1.32: cost-state line is appended and round-trips" {
     try testing.expect(std.mem.indexOf(u8, t_bytes, "\"totalAPIDurationWithoutRetries\":13069") != null);
     try testing.expect(std.mem.indexOf(u8, t_bytes, "\"startTime\":1793834435445") != null);
     try testing.expect(std.mem.indexOf(u8, t_bytes, "\"anthropic/claude-sonnet-5\":{") != null);
-    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"inputTokens\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"inputTokens\":18") != null);
     try testing.expect(std.mem.indexOf(u8, t_bytes, "\"outputTokens\":1069") != null);
     try testing.expect(std.mem.indexOf(u8, t_bytes, "\"thinkingTokens\":824") != null);
     try testing.expect(std.mem.indexOf(u8, t_bytes, "\"cacheCreationInputTokens\":30175") != null);
@@ -947,7 +950,7 @@ test "v1.32: cost-state line is appended and round-trips" {
     var loaded = try load(gpa, io, base, "01JCOST");
     defer loaded.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), loaded.transcript.messages.items.len);
-    try testing.expectEqual(@as(u64, 2), loaded.transcript.messages.items[0].usage.?.input);
+    try testing.expectEqual(@as(u64, 30193), loaded.transcript.messages.items[0].usage.?.input);
     try testing.expectEqual(@as(u64, 824), loaded.transcript.messages.items[0].usage.?.thinking_tokens);
     try testing.expectEqual(@as(u64, 30175), loaded.transcript.messages.items[0].usage.?.cache_creation_ephemeral_5m);
     // v1.32.0 — CostState restored from the cost-state line.
@@ -957,4 +960,199 @@ test "v1.32: cost-state line is appended and round-trips" {
     try testing.expectEqual(@as(u64, 13069), rcs.total_api_duration_without_retries_ms);
     try testing.expectEqual(@as(u64, 1793834435445), @as(u64, @intCast(rcs.start_time_ms)));
     try testing.expect(rcs.started);
+}
+
+test "v1.33: Claude-Code-compatible transcript v5 format" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_v5_compat";
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+
+    var transcript = agent_mod.loop.Transcript.init(gpa);
+    defer transcript.deinit();
+
+    // User message.
+    {
+        const c = try gpa.alloc(ai.types.ContentBlock, 1);
+        c[0] = .{ .text = .{ .text = try gpa.dupe(u8, "hello") } };
+        try transcript.append(.{ .role = .user, .content = c, .timestamp = 1795098929987 });
+    }
+    // Assistant message with a tool_use block + usage.
+    {
+        const c = try gpa.alloc(ai.types.ContentBlock, 2);
+        c[0] = .{ .text = .{ .text = try gpa.dupe(u8, "Let me check.") } };
+        c[1] = .{ .tool_call = .{
+            .id = try gpa.dupe(u8, "call_jJb4"),
+            .name = try gpa.dupe(u8, "read"),
+            .arguments_json = try gpa.dupe(u8, "{\"path\":\"/tmp\"}"),
+        } };
+        try transcript.append(.{
+            .role = .assistant,
+            .content = c,
+            .timestamp = 1795098932185,
+            .stop_reason = .tool_use,
+            .provider = try gpa.dupe(u8, "openrouter"),
+            .model = try gpa.dupe(u8, "openrouter/auto"),
+            .api = try gpa.dupe(u8, "openai-chat"),
+            .usage = .{
+                .input = 93824, // total (77516 cache_read + 16290 cache_write + 18 uncached)
+                .output = 25,
+                .cache_read = 77516,
+                .cache_write = 16290,
+            },
+        });
+    }
+    // Tool result message.
+    {
+        const c = try gpa.alloc(ai.types.ContentBlock, 1);
+        c[0] = .{ .text = .{ .text = try gpa.dupe(u8, "file contents") } };
+        try transcript.append(.{
+            .role = .tool_result,
+            .content = c,
+            .timestamp = 1795098932999,
+            .tool_call_id = try gpa.dupe(u8, "call_jJb4"),
+        });
+    }
+
+    var cost_state: ai.types.CostState = .{ .start_time_ms = 1795098929987, .started = true };
+    const header: SessionHeader = .{
+        .id = "01M7T3QT",
+        .created_at_ms = 1795098929987,
+        .updated_at_ms = 1795098932999,
+        .title = "v5test",
+        .provider = "openrouter",
+        .model = "openrouter/auto",
+        .api = "openai-chat",
+        .thinking_level = "off",
+    };
+    try save(gpa, io, base, header, &transcript, &cost_state);
+
+    // Read the raw file and assert the Claude-Code-compatible shape.
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/01M7T3QT/transcript.jsonl", .{base});
+    defer gpa.free(t_path);
+    const t_bytes = try readWholeFile(gpa, io, t_path);
+    defer gpa.free(t_bytes);
+
+    // Header: meta with version 5.
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "{\"type\":\"meta\",\"version\":5") != null);
+
+    // User record: type:user, message wrapper with role:user.
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "{\"type\":\"user\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"message\":{\"role\":\"user\"") != null);
+
+    // ISO-8601 timestamp (not epoch ms).
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"timestamp\":\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "2026-11-19T") != null);
+
+    // Assistant record: type:assistant, stop_reason:tool_use (not toolUse).
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "{\"type\":\"assistant\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"stop_reason\":\"tool_use\"") != null);
+
+    // Tool call block: type:tool_use (not toolCall), input (not arguments).
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"type\":\"tool_use\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"input\":{\"path\":\"/tmp\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"name\":\"read\"") != null);
+
+    // Usage: Claude key names, input_tokens = uncached (18, not 93824).
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"input_tokens\":18") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"output_tokens\":25") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"cache_read_input_tokens\":77516") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"cache_creation_input_tokens\":16290") != null);
+
+    // Tool result: serialized as a user record with tool_result block.
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"type\":\"tool_result\"") != null);
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"tool_use_id\":\"call_jJb4\"") != null);
+
+    // sessionId on every record.
+    try testing.expect(std.mem.indexOf(u8, t_bytes, "\"sessionId\":\"01M7T3QT\"") != null);
+
+    // Round-trip: read back and verify internal model is restored.
+    var loaded = try load(gpa, io, base, "01M7T3QT");
+    defer loaded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), loaded.transcript.messages.items.len);
+
+    // User message.
+    try testing.expectEqual(ai.types.Role.user, loaded.transcript.messages.items[0].role);
+    try testing.expectEqualStrings("hello", loaded.transcript.messages.items[0].content[0].text.text);
+    // Timestamp round-trips (ISO → epoch ms).
+    try testing.expectEqual(@as(i64, 1795098929987), loaded.transcript.messages.items[0].timestamp);
+
+    // Assistant message: usage.input restored to total (93824).
+    const m1 = loaded.transcript.messages.items[1];
+    try testing.expectEqual(ai.types.Role.assistant, m1.role);
+    try testing.expectEqual(ai.types.StopReason.tool_use, m1.stop_reason.?);
+    try testing.expectEqual(@as(u64, 93824), m1.usage.?.input);
+    try testing.expectEqual(@as(u64, 77516), m1.usage.?.cache_read);
+    try testing.expectEqual(@as(u64, 16290), m1.usage.?.cache_write);
+    // Tool call block round-trips.
+    try testing.expectEqualStrings("read", m1.content[1].tool_call.name);
+    try testing.expectEqualStrings("call_jJb4", m1.content[1].tool_call.id);
+    // v1.33.0 — provider and api are emitted inside the message wrapper
+    // and survive round-trip (franky-specific extensions).
+    try testing.expectEqualStrings("openrouter", m1.provider.?);
+    try testing.expectEqualStrings("openai-chat", m1.api.?);
+
+    // Tool result message: restored as .tool_result with tool_call_id.
+    const m2 = loaded.transcript.messages.items[2];
+    try testing.expectEqual(ai.types.Role.tool_result, m2.role);
+    try testing.expectEqualStrings("call_jJb4", m2.tool_call_id.?);
+    try testing.expectEqualStrings("file contents", m2.content[0].text.text);
+}
+
+test "v1.33: legacy v4 transcript still readable" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    const base = "/tmp/franky_v4_legacy";
+    std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, base) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, base);
+
+    const session_dir = try std.fmt.allocPrint(gpa, "{s}/01LEGACY", .{base});
+    defer gpa.free(session_dir);
+    try std.Io.Dir.cwd().createDirPath(io, session_dir);
+
+    // Write a v4-format transcript (no type field, top-level role,
+    // epoch-ms timestamp, toolCall/arguments block).
+    const v4_jsonl =
+        "{\"type\":\"meta\",\"version\":4,\"branch\":\"main\"}\n" ++
+        "{\"role\":\"user\",\"timestamp\":1000,\"content\":[{\"type\":\"text\",\"text\":\"old\"}]}\n" ++
+        "{\"role\":\"assistant\",\"timestamp\":2000,\"stopReason\":\"toolUse\",\"content\":[{\"type\":\"toolCall\",\"id\":\"c1\",\"name\":\"read\",\"arguments\":{\"path\":\"/x\"}}]}\n" ++
+        "{\"role\":\"toolResult\",\"timestamp\":3000,\"toolCallId\":\"c1\",\"content\":[{\"type\":\"text\",\"text\":\"result\"}]}\n";
+    const t_path = try std.fmt.allocPrint(gpa, "{s}/transcript.jsonl", .{session_dir});
+    defer gpa.free(t_path);
+    try atomicWrite(io, t_path, v4_jsonl);
+
+    // Write a minimal session.json so load() can read the header.
+    const s_path = try std.fmt.allocPrint(gpa, "{s}/session.json", .{session_dir});
+    defer gpa.free(s_path);
+    try atomicWrite(io, s_path, "{\"version\":3,\"id\":\"01LEGACY\",\"createdAtMs\":0,\"updatedAtMs\":0,\"title\":\"\",\"provider\":\"\",\"model\":\"\",\"api\":\"\",\"thinkingLevel\":\"off\",\"activeBranch\":\"main\",\"systemPromptHash\":\"\"}\n");
+
+    var loaded = try load(gpa, io, base, "01LEGACY");
+    defer loaded.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), loaded.transcript.messages.items.len);
+
+    // User message.
+    try testing.expectEqual(ai.types.Role.user, loaded.transcript.messages.items[0].role);
+    try testing.expectEqualStrings("old", loaded.transcript.messages.items[0].content[0].text.text);
+    try testing.expectEqual(@as(i64, 1000), loaded.transcript.messages.items[0].timestamp);
+
+    // Assistant message with toolCall block (v4 name).
+    const m1 = loaded.transcript.messages.items[1];
+    try testing.expectEqual(ai.types.Role.assistant, m1.role);
+    try testing.expectEqual(ai.types.StopReason.tool_use, m1.stop_reason.?);
+    try testing.expectEqualStrings("read", m1.content[0].tool_call.name);
+    try testing.expectEqualStrings("c1", m1.content[0].tool_call.id);
+
+    // Tool result message (v4 role:toolResult).
+    const m2 = loaded.transcript.messages.items[2];
+    try testing.expectEqual(ai.types.Role.tool_result, m2.role);
+    try testing.expectEqualStrings("c1", m2.tool_call_id.?);
+    try testing.expectEqualStrings("result", m2.content[0].text.text);
 }
