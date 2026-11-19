@@ -1183,8 +1183,11 @@ pub fn filterMcpToolsForAutoMode(
             try out.append(allocator, t);
             continue;
         }
-        // Check autoMode.hardDeny — always blocked, no override.
-        if (permissions_mod.Store.autoSetMatches(&store.auto_hard_deny, t.name, "{}")) {
+        // Check autoMode.hardDeny and --deny-tools CLI flag — always
+        // blocked, no override.
+        if (permissions_mod.Store.autoSetMatches(&store.auto_hard_deny, t.name, "{}") or
+            permissions_mod.Store.autoSetMatches(&store.deny_tools, t.name, "{}"))
+        {
             continue; // skip — hard denied
         }
         // Check autoMode.softDeny — blocked unless allow matched.
