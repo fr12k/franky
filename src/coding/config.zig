@@ -88,7 +88,15 @@ pub const ResolvedConfig = struct {
     session_gates: *permissions_mod.SessionGates,
 
     // ── Preset registry ──────────────────────────────────────────
-    preset_registry: tools_mod.subagent.PresetRegistry,
+    // Heap-allocated on the resolver arena so its address is stable
+    // for the lifetime of the `subagent.Ctx.presets` pointer. A by-value
+    // field would copy the `StringArrayHashMapUnmanaged` header
+    // (bytes/len/capacity) but `Ctx.presets` would point at a `resolve()`
+    // stack local that dangles after `resolve()` returns — the subagent
+    // tool then reads freed stack memory and panics inside
+    // `MultiArrayList.slice().items()` (`@alignCast` on a garbage
+    // `bytes` pointer, "incorrect alignment"). Mirrors proxy/rpc.
+    preset_registry: *tools_mod.subagent.PresetRegistry,
 
     // ── Extension manager ────────────────────────────────────────
     ext_manager: extensions_mod.Manager,
@@ -192,7 +200,10 @@ pub const ResolvedConfig = struct {
         if (self.memory_guardrail) |mg| a.destroy(mg);
         // Extension manager deinits its extensions.
         self.ext_manager.deinit();
-        // Preset registry deinits its presets.
+        // Preset registry: the wrapper struct is arena-allocated
+        // (freed by `arena.deinit` below), but the map's internal
+        // allocation used the PARENT allocator, so `deinit` frees it
+        // correctly. Do NOT `a.destroy` — the struct is arena-owned.
         self.preset_registry.deinit();
         // Permission store deinits its internal maps.
         self.permission_store.deinit();
@@ -1504,12 +1515,17 @@ pub fn resolve(
     };
 
     // ── Step 10: Preset registry + extensions ────────────────────
-    var preset_registry = tools_mod.subagent.PresetRegistry.init(allocator);
-    errdefer preset_registry.deinit();
-    try tools_mod.subagent.registerBuiltinPresets(&preset_registry);
+    const preset_registry = try a.create(tools_mod.subagent.PresetRegistry);
+    // The wrapper struct lives on the resolver arena (stable address
+    // for `Ctx.presets`), but the map's internal allocation uses the
+    // PARENT allocator so `PresetRegistry.deinit` frees it correctly
+    // in `ResolvedConfig.deinit` — the arena's `free` is a no-op for
+    // non-tail allocations and would leak the map backing store.
+    preset_registry.* = tools_mod.subagent.PresetRegistry.init(allocator);
+    try tools_mod.subagent.registerBuiltinPresets(preset_registry);
 
     var ext_manager = extensions_mod.Manager.init(allocator);
-    ext_manager.presets = &preset_registry;
+    ext_manager.presets = preset_registry;
     errdefer ext_manager.deinit();
     try ext_manager.loadFromConfig(io, cfg.extensions, ext_catalog.lookup);
 
@@ -1562,7 +1578,7 @@ pub fn resolve(
     // ── Step 13: Subagent context ────────────────────────────────
     // Build the Ctx first, then wire in the tools that reference it.
     // `parent_session_dir` is late-bound by the mode after session init.
-    const subagent_params_json = try tools_mod.subagent.buildParametersJson(a, &preset_registry);
+    const subagent_params_json = try tools_mod.subagent.buildParametersJson(a, preset_registry);
 
     const subagent_ctx = try a.create(tools_mod.subagent.Ctx);
     errdefer a.destroy(subagent_ctx);
@@ -1573,7 +1589,7 @@ pub fn resolve(
         .parent_tools = final_tools,
         .parent_role = active_role,
         .parent_profile = cfg.profile orelse "",
-        .presets = &preset_registry,
+        .presets = preset_registry,
         .parameters_json_owned = subagent_params_json,
         .permission_store = if (prompts_enabled) permission_store else null,
         .permission_prompter_slot = null,
@@ -1586,7 +1602,7 @@ pub fn resolve(
         .base_tools = role_filtered_tools,
         .ext_tools = ext_tools,
         .subagent_ctx = subagent_ctx,
-        .preset_registry = &preset_registry,
+        .preset_registry = preset_registry,
         .guardrail_state = guardrail_state,
         .ccr_ctx = null, // patched by the mode driver after session creation
         .memory_state = memory_state,
