@@ -100,10 +100,16 @@ pub fn build(b: *std.Build) void {
     // to link the system libsqlite3 here. This enables cross-compilation
     // (goreleaser builds for 5 targets including aarch64-linux and macOS).
 
+    // v0.62.3 — keep frame pointers in all optimize modes so the
+    // custom panic handler (src/bin/main.zig `panic` namespace) can
+    // walk the stack via frame-pointer chaining even under gvisor,
+    // where the default DWARF-based stack trace fails to load debug
+    // info from the ELF binary.
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/bin/main.zig"),
         .target = target,
         .optimize = optimize,
+        .omit_frame_pointer = false,
     });
     exe_module.addImport("franky", franky_module);
     exe_module.addImport("zompress", zompress_module);
