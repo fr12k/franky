@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const json_meta = @import("json_meta.zig");
+const json_meta_mod = json_meta; // unshadowed alias for use inside structs that declare their own `json_meta`
 
 /// TextContent — `TextContent` in spec.
 pub const TextContent = struct {
@@ -384,6 +385,95 @@ pub const CostState = struct {
     start_time_ms: i64 = 0,
     /// True once `start_time_ms` has been latched.
     started: bool = false,
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    //
+    // `CostState` opts into `std.json.Stringify` / `std.json.parseFromValue`
+    // via the `jsonStringify` and `jsonParseFromValue` hooks. The
+    // `json_meta` map below renames Zig snake_case fields to the
+    // Claude-Code-compatible camelCase wire keys used in the
+    // transcript.jsonl `cost-state` aggregate line. `started` is an
+    // internal latch — it is skipped on the wire (its truth is inferred
+    // from the presence of `startTime` on parse).
+
+    pub const json_meta = .{
+        .total_api_duration_ms = .{ .rename = "totalAPIDuration" },
+        .total_api_duration_without_retries_ms = .{ .rename = "totalAPIDurationWithoutRetries" },
+        .total_tool_duration_ms = .{ .rename = "totalToolDuration" },
+        .total_lines_added = .{ .rename = "totalLinesAdded" },
+        .total_lines_removed = .{ .rename = "totalLinesRemoved" },
+        .start_time_ms = .{ .rename = "startTime" },
+        .started = .{ .skip = true },
+    };
+
+    /// Serialize the stored fields to a `std.json.Stringify` writer.
+    /// Emits the six Claude-Code-compatible camelCase fields; `started`
+    /// is skipped (internal latch). The caller (`renderCostStateLine`)
+    /// emits the computed wrapper fields (`type`, `sessionId`,
+    /// `totalCostUSD`, `totalDuration`, `modelUsage`,
+    /// `hasUnknownModelCost`) around this object's fields — see
+    /// `persistence.renderCostStateLine` for the full wire shape.
+    pub fn jsonStringify(self: CostState, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
+
+    /// Parse a `std.json.Value` (object) into a `CostState`. Accepts
+    /// the camelCase wire keys; `started` is inferred from the presence
+    /// of a non-null `startTime`. Unknown keys are ignored.
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !CostState {
+        _ = allocator;
+        _ = options;
+        const o = switch (source) {
+            .object => |obj| obj,
+            .null => return .{},
+            else => return error.UnexpectedToken,
+        };
+        var cs: CostState = .{};
+        if (o.get("totalAPIDuration")) |v| if (jsonIntU64(v)) |n| {
+            cs.total_api_duration_ms = n;
+        };
+        if (o.get("totalAPIDurationWithoutRetries")) |v| if (jsonIntU64(v)) |n| {
+            cs.total_api_duration_without_retries_ms = n;
+        };
+        if (o.get("totalToolDuration")) |v| if (jsonIntU64(v)) |n| {
+            cs.total_tool_duration_ms = n;
+        };
+        if (o.get("totalLinesAdded")) |v| if (jsonIntU64(v)) |n| {
+            cs.total_lines_added = n;
+        };
+        if (o.get("totalLinesRemoved")) |v| if (jsonIntU64(v)) |n| {
+            cs.total_lines_removed = n;
+        };
+        if (o.get("startTime")) |v| if (jsonIntI64(v)) |n| {
+            cs.start_time_ms = n;
+            cs.started = true;
+        };
+        return cs;
+    }
+
+    /// Extract a u64 from a `std.json.Value` (integer/float/number_string).
+    fn jsonIntU64(v: std.json.Value) ?u64 {
+        return switch (v) {
+            .integer => |i| if (i >= 0) @intCast(i) else null,
+            .float => |f| if (f >= 0 and f <= @as(f64, @floatFromInt(std.math.maxInt(u64)))) @intFromFloat(f) else null,
+            .number_string => |s| std.fmt.parseInt(u64, s, 10) catch null,
+            else => null,
+        };
+    }
+
+    /// Extract an i64 from a `std.json.Value` (integer/float/number_string).
+    fn jsonIntI64(v: std.json.Value) ?i64 {
+        return switch (v) {
+            .integer => |i| i,
+            .float => |f| if (f >= @as(f64, @floatFromInt(std.math.minInt(i64))) and f <= @as(f64, @floatFromInt(std.math.maxInt(i64)))) @intFromFloat(f) else null,
+            .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+            else => null,
+        };
+    }
 };
 
 pub const StopReason = enum {
@@ -1078,3 +1168,81 @@ test "Diagnostics.jsonParseFromValue handles empty object" {
     const d = try std.json.parseFromValueLeaky(Diagnostics, std.testing.allocator, value_parsed.value, .{});
     try std.testing.expect(d.isEmpty());
 }
+
+// ─── CostState json_meta hook tests ──────────────────────────────────
+
+test "CostState.jsonStringify emits camelCase wire keys" {
+    const cs = CostState{
+        .total_api_duration_ms = 1234,
+        .total_api_duration_without_retries_ms = 1000,
+        .total_tool_duration_ms = 5678,
+        .total_lines_added = 42,
+        .total_lines_removed = 10,
+        .start_time_ms = 1700000000000,
+        .started = true,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, cs, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // `started` is skipped; the six stored fields use camelCase keys.
+    try std.testing.expectEqualStrings(
+        "{\"totalAPIDuration\":1234,\"totalAPIDurationWithoutRetries\":1000,\"totalToolDuration\":5678,\"totalLinesAdded\":42,\"totalLinesRemoved\":10,\"startTime\":1700000000000}",
+        json_str,
+    );
+}
+
+test "CostState round-trip: stringify then parseFromValue restores original" {
+    const cs = CostState{
+        .total_api_duration_ms = 9999,
+        .total_api_duration_without_retries_ms = 8888,
+        .total_tool_duration_ms = 7777,
+        .total_lines_added = 100,
+        .total_lines_removed = 50,
+        .start_time_ms = -12345, // negative start time (pre-epoch edge)
+        .started = true,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, cs, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    const restored = try std.json.parseFromValueLeaky(CostState, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expectEqual(cs.total_api_duration_ms, restored.total_api_duration_ms);
+    try std.testing.expectEqual(cs.total_api_duration_without_retries_ms, restored.total_api_duration_without_retries_ms);
+    try std.testing.expectEqual(cs.total_tool_duration_ms, restored.total_tool_duration_ms);
+    try std.testing.expectEqual(cs.total_lines_added, restored.total_lines_added);
+    try std.testing.expectEqual(cs.total_lines_removed, restored.total_lines_removed);
+    try std.testing.expectEqual(cs.start_time_ms, restored.start_time_ms);
+    try std.testing.expect(restored.started); // inferred from startTime presence
+}
+
+test "CostState.jsonParseFromValue handles empty object" {
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer value_parsed.deinit();
+
+    const cs = try std.json.parseFromValueLeaky(CostState, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expectEqual(@as(u64, 0), cs.total_api_duration_ms);
+    try std.testing.expectEqual(@as(u64, 0), cs.total_tool_duration_ms);
+    try std.testing.expect(!cs.started);
+}
+
+test "CostState.jsonParseFromValue ignores unknown keys (cost-state wrapper fields)" {
+    // The cost-state line wrapper carries computed fields the hook
+    // must ignore: totalCostUSD, totalDuration, modelUsage,
+    // hasUnknownModelCost, type, sessionId.
+    const json_str =
+        "{\"type\":\"cost-state\",\"sessionId\":\"abc\",\"totalCostUSD\":0.0,\"totalAPIDuration\":100,\"totalDuration\":200,\"modelUsage\":{},\"hasUnknownModelCost\":false,\"startTime\":1700000000000}";
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    const cs = try std.json.parseFromValueLeaky(CostState, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expectEqual(@as(u64, 100), cs.total_api_duration_ms);
+    try std.testing.expectEqual(@as(i64, 1700000000000), cs.start_time_ms);
+    try std.testing.expect(cs.started);
+}
+

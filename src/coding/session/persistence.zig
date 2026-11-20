@@ -47,6 +47,8 @@ const ai = struct {
 };
 const agent_mod = @import("../../agent/mod.zig");
 const object_store = @import("object_store.zig");
+const json_meta = @import("../../ai/json_meta.zig");
+const json_meta_mod = json_meta; // unshadowed alias for use inside structs that declare their own `json_meta`
 
 pub const current_session_version: u32 = 3;
 /// v1.30.0 — transcript schema bumped to 4 for the JSON Lines
@@ -573,28 +575,18 @@ fn parseTranscriptLegacyJson(
 /// per-message usage are restored; `modelUsage` / `totalCostUSD` /
 /// `hasUnknownModelCost` are always recomputed from the transcript
 /// at write time, so they are not stored here.
+///
+/// v1.34.0 — delegates to `CostState.jsonParseFromValue` (std.json
+/// hook). The wrapper's computed fields (`totalCostUSD`,
+/// `totalDuration`, `modelUsage`, `hasUnknownModelCost`) are ignored
+/// by the hook; only the six stored camelCase fields are restored.
 fn parseCostState(o: std.json.ObjectMap) ai.types.CostState {
-    var cs: ai.types.CostState = .{};
-    if (o.get("totalAPIDuration")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_api_duration_ms = @intCast(v.integer);
-    };
-    if (o.get("totalAPIDurationWithoutRetries")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_api_duration_without_retries_ms = @intCast(v.integer);
-    };
-    if (o.get("totalToolDuration")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_tool_duration_ms = @intCast(v.integer);
-    };
-    if (o.get("totalLinesAdded")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_lines_added = @intCast(v.integer);
-    };
-    if (o.get("totalLinesRemoved")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_lines_removed = @intCast(v.integer);
-    };
-    if (o.get("startTime")) |v| if (v == .integer) {
-        cs.start_time_ms = v.integer;
-        cs.started = true;
-    };
-    return cs;
+    // `parseFromValueLeaky` with `allocator: undefined` is safe because
+    // `CostState` owns no allocated fields (all integers/bools) — the
+    // `jsonParseFromValue` hook never allocates. The leaky variant
+    // returns the value directly (no `Parsed` wrapper to deinit).
+    return std.json.parseFromValueLeaky(ai.types.CostState, undefined, .{ .object = o }, .{}) catch
+        ai.types.CostState{};
 }
 
 /// Compute the SHA-256 of a canonical UTF-8 string. Used for
@@ -791,7 +783,71 @@ const ModelUsageAccum = struct {
     web_search_requests: u64 = 0,
     cost_usd: f64 = 0,
     /// True when at least one turn for this model reported no cost data.
+    /// NOT emitted per-model — aggregated into the top-level
+    /// `hasUnknownModelCost` field by `renderCostStateLine`.
     has_unknown_cost: bool = false,
+
+    // ─── JSON serialization via std.json hook ────────────────────
+    // `json_meta` renames Zig snake_case fields to the camelCase wire
+    // keys used in the `cost-state` line's `modelUsage` map values.
+    // `has_unknown_cost` is skipped (it's aggregated, not per-model).
+    pub const json_meta = .{
+        .input_tokens = .{ .rename = "inputTokens" },
+        .output_tokens = .{ .rename = "outputTokens" },
+        .thinking_tokens = .{ .rename = "thinkingTokens" },
+        .cache_read_input_tokens = .{ .rename = "cacheReadInputTokens" },
+        .cache_creation_input_tokens = .{ .rename = "cacheCreationInputTokens" },
+        .cache_creation_ephemeral_5m_input_tokens = .{ .rename = "cacheCreationEphemeral5mInputTokens" },
+        .cache_creation_ephemeral_1h_input_tokens = .{ .rename = "cacheCreationEphemeral1hInputTokens" },
+        .web_search_requests = .{ .rename = "webSearchRequests" },
+        // `cost_usd` is emitted manually by `renderCostStateLine`
+        // with a forced decimal point (`0.0`, `1.5`) to preserve the
+        // prior wire format — std.json emits `0` for whole-number f64.
+        .cost_usd = .{ .skip = true },
+        .has_unknown_cost = .{ .skip = true },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer. Emits the eight
+    /// integer wire fields with camelCase keys via `json_meta`.
+    /// `cost_usd` and `has_unknown_cost` are skipped — `costUSD` is
+    /// emitted manually by `renderCostStateLine` with a forced decimal
+    /// point to preserve the prior wire format.
+    pub fn jsonStringify(self: ModelUsageAccum, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
+};
+
+/// v1.34.0 — wire-shape struct for the flat numeric fields of the
+/// `cost-state` line. `renderCostStateLine` stringifies this via the
+/// `jsonStringify` hook (std.json) and splices the fields (minus the
+/// outer braces) into the wrapper object, preserving the exact field
+/// order and camelCase key names of the prior hand-rolled emitter.
+/// `totalDuration` (computed) is emitted after the stored `CostState`
+/// fields. `totalCostUSD` (computed f64) is emitted manually by
+/// `renderCostStateLine` with a forced decimal point to preserve the
+/// prior wire format — std.json emits `0` for whole-number f64.
+const CostStateLine = struct {
+    total_api_duration_ms: u64 = 0,
+    total_api_duration_without_retries_ms: u64 = 0,
+    total_tool_duration_ms: u64 = 0,
+    total_lines_added: u64 = 0,
+    total_lines_removed: u64 = 0,
+    total_duration: u64 = 0,
+    start_time: u64 = 0,
+
+    pub const json_meta = .{
+        .total_api_duration_ms = .{ .rename = "totalAPIDuration" },
+        .total_api_duration_without_retries_ms = .{ .rename = "totalAPIDurationWithoutRetries" },
+        .total_tool_duration_ms = .{ .rename = "totalToolDuration" },
+        .total_lines_added = .{ .rename = "totalLinesAdded" },
+        .total_lines_removed = .{ .rename = "totalLinesRemoved" },
+        .total_duration = .{ .rename = "totalDuration" },
+        .start_time = .{ .rename = "startTime" },
+    };
+
+    pub fn jsonStringify(self: CostStateLine, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
 };
 
 /// v1.32.0 — render the `cost-state` aggregate line.
@@ -879,16 +935,40 @@ fn renderCostStateLine(
         try out.appendSlice(allocator, ",\"sessionId\":");
         try appendJsonStr(out, allocator, sid);
     };
-    try appendJsonF64Field(out, allocator, ",\"totalCostUSD\":", total_cost_usd);
-    try appendJsonU64Field(out, allocator, ",\"totalAPIDuration\":", cs.total_api_duration_ms);
-    try appendJsonU64Field(out, allocator, ",\"totalAPIDurationWithoutRetries\":", cs.total_api_duration_without_retries_ms);
-    try appendJsonU64Field(out, allocator, ",\"totalToolDuration\":", cs.total_tool_duration_ms);
-    try appendJsonU64Field(out, allocator, ",\"totalLinesAdded\":", cs.total_lines_added);
-    try appendJsonU64Field(out, allocator, ",\"totalLinesRemoved\":", cs.total_lines_removed);
-    try appendJsonU64Field(out, allocator, ",\"totalDuration\":", total_duration);
-    try appendJsonU64Field(out, allocator, ",\"startTime\":", @as(u64, @intCast(cs.start_time_ms)));
+    // v1.34.0 — `totalCostUSD` is emitted with a forced decimal point
+    // (e.g. `0.0`, `1.5`) so downstream parsers tag it as `.float`;
+    // the six stored `CostState` fields + `totalDuration` go through
+    // the `CostStateLine` wire struct's `jsonStringify` hook (std.json),
+    // which renames snake_case → camelCase via `json_meta`. Non-finite
+    // `totalCostUSD` is clamped to 0 (not valid JSON).
+    const safe_total_cost = if (std.math.isFinite(total_cost_usd)) total_cost_usd else 0;
+    try appendJsonF64Field(out, allocator, ",\"totalCostUSD\":", safe_total_cost);
+    const line = CostStateLine{
+        .total_api_duration_ms = cs.total_api_duration_ms,
+        .total_api_duration_without_retries_ms = cs.total_api_duration_without_retries_ms,
+        .total_tool_duration_ms = cs.total_tool_duration_ms,
+        .total_lines_added = cs.total_lines_added,
+        .total_lines_removed = cs.total_lines_removed,
+        .total_duration = total_duration,
+        .start_time = @as(u64, @intCast(cs.start_time_ms)),
+    };
+    const line_json = try std.json.Stringify.valueAlloc(allocator, line, .{
+        .emit_null_optional_fields = false,
+    });
+    defer allocator.free(line_json);
+    // `CostStateLine.jsonStringify` emits a `{...}` object; strip the
+    // outer braces so the fields splice into the wrapper object.
+    if (line_json.len >= 2) {
+        try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, line_json[1 .. line_json.len - 1]);
+    }
 
-    // modelUsage map.
+    // modelUsage map — std.json cannot stringify a `StringHashMap`
+    // directly (it isn't an array), so iterate manually. Each value's
+    // eight integer fields are emitted via the `ModelUsageAccum.jsonStringify`
+    // hook (v1.34.0); `costUSD` is spliced in manually with a forced
+    // decimal point (the hook skips `cost_usd`) to preserve the prior
+    // wire format (`0.0` not `0`).
     try out.appendSlice(allocator, ",\"modelUsage\":{");
     var first = true;
     var mit = models.iterator();
@@ -896,17 +976,15 @@ fn renderCostStateLine(
         if (!first) try out.append(allocator, ',');
         first = false;
         try appendJsonStr(out, allocator, e.key_ptr.*);
-        try out.appendSlice(allocator, ":{\"inputTokens\":");
-        try appendJsonU64Field(out, allocator, "", e.value_ptr.*.input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"outputTokens\":", e.value_ptr.*.output_tokens);
-        try appendJsonU64Field(out, allocator, ",\"thinkingTokens\":", e.value_ptr.*.thinking_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheReadInputTokens\":", e.value_ptr.*.cache_read_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheCreationInputTokens\":", e.value_ptr.*.cache_creation_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheCreationEphemeral5mInputTokens\":", e.value_ptr.*.cache_creation_ephemeral_5m_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheCreationEphemeral1hInputTokens\":", e.value_ptr.*.cache_creation_ephemeral_1h_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"webSearchRequests\":", e.value_ptr.*.web_search_requests);
+        try out.appendSlice(allocator, ":");
+        const entry_json = try std.json.Stringify.valueAlloc(allocator, e.value_ptr.*, .{
+            .emit_null_optional_fields = false,
+        });
+        defer allocator.free(entry_json);
+        // Splice `,"costUSD":X.0` before the hook object's closing `}`.
+        try out.appendSlice(allocator, entry_json[0 .. entry_json.len - 1]);
         try appendJsonF64Field(out, allocator, ",\"costUSD\":", e.value_ptr.*.cost_usd);
-        try out.appendSlice(allocator, "}");
+        try out.append(allocator, '}');
     }
     try out.appendSlice(allocator, "}");
 
@@ -1287,37 +1365,16 @@ fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []con
     try buf.append(allocator, '"');
 }
 
-fn appendJsonNumField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    prefix: []const u8,
-    value: i64,
-) !void {
-    try buf.appendSlice(allocator, prefix);
-    const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
-    defer allocator.free(s);
-    try buf.appendSlice(allocator, s);
-}
-
-/// v1.29.0 — same shape but for unsigned 64-bit values used in
-/// the diagnostics serializer (token counts can exceed i64 range
-/// in pathological cases; cheap to keep them unsigned).
-fn appendJsonU64Field(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    prefix: []const u8,
-    value: u64,
-) !void {
-    try buf.appendSlice(allocator, prefix);
-    const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
-    defer allocator.free(s);
-    try buf.appendSlice(allocator, s);
-}
-
 /// Serialize an f64 cost field as a JSON number. Always emits a
 /// decimal point (even for whole numbers like `0` or `1`) so the
 /// JSON parser tags it as `.float` on round-trip. Guards against
 /// non-finite values (nan/inf are not valid JSON).
+///
+/// v1.34.0 — the integer field emitters (`appendJsonNumField`,
+/// `appendJsonU64Field`) were removed; the cost-state line now emits
+/// integers via the `CostStateLine`/`ModelUsageAccum` `jsonStringify`
+/// hooks (std.json). This f64 helper remains because std.json emits
+/// `0` for whole-number f64, and the prior wire format used `0.0`.
 fn appendJsonF64Field(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1502,3 +1559,75 @@ pub fn assertRefsInKeep(
         }
     }
 }
+
+// ─── tests ─────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "ModelUsageAccum.jsonStringify emits camelCase wire keys" {
+    const accum = ModelUsageAccum{
+        .input_tokens = 100,
+        .output_tokens = 200,
+        .thinking_tokens = 50,
+        .cache_read_input_tokens = 10,
+        .cache_creation_input_tokens = 5,
+        .cache_creation_ephemeral_5m_input_tokens = 3,
+        .cache_creation_ephemeral_1h_input_tokens = 2,
+        .web_search_requests = 1,
+        .cost_usd = 0.0072,
+        .has_unknown_cost = true, // must be skipped
+    };
+    const json_str = try std.json.Stringify.valueAlloc(testing.allocator, accum, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(json_str);
+
+    // `cost_usd` and `has_unknown_cost` are skipped — `costUSD` is
+    // emitted manually by `renderCostStateLine` with a forced decimal
+    // point. The eight integer wire fields use camelCase keys.
+    try testing.expectEqualStrings(
+        "{\"inputTokens\":100,\"outputTokens\":200,\"thinkingTokens\":50,\"cacheReadInputTokens\":10,\"cacheCreationInputTokens\":5,\"cacheCreationEphemeral5mInputTokens\":3,\"cacheCreationEphemeral1hInputTokens\":2,\"webSearchRequests\":1}",
+        json_str,
+    );
+}
+
+test "ModelUsageAccum.jsonStringify omits cost_usd (emitted manually)" {
+    // Non-finite `cost_usd` is irrelevant to the hook — it's skipped.
+    // `renderCostStateLine` guards non-finite values before emitting.
+    const accum = ModelUsageAccum{
+        .cost_usd = std.math.nan(f64),
+    };
+    const json_str = try std.json.Stringify.valueAlloc(testing.allocator, accum, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(json_str);
+
+    // No `costUSD` key; all integer fields zero.
+    try testing.expectEqualStrings(
+        "{\"inputTokens\":0,\"outputTokens\":0,\"thinkingTokens\":0,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":0,\"cacheCreationEphemeral5mInputTokens\":0,\"cacheCreationEphemeral1hInputTokens\":0,\"webSearchRequests\":0}",
+        json_str,
+    );
+}
+
+test "CostStateLine.jsonStringify emits the flat cost-state numeric fields" {
+    const line = CostStateLine{
+        .total_api_duration_ms = 100,
+        .total_api_duration_without_retries_ms = 90,
+        .total_tool_duration_ms = 200,
+        .total_lines_added = 5,
+        .total_lines_removed = 3,
+        .total_duration = 500,
+        .start_time = 1700000000000,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(testing.allocator, line, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(json_str);
+
+    // `totalCostUSD` is NOT here — emitted manually by renderCostStateLine.
+    try testing.expectEqualStrings(
+        "{\"totalAPIDuration\":100,\"totalAPIDurationWithoutRetries\":90,\"totalToolDuration\":200,\"totalLinesAdded\":5,\"totalLinesRemoved\":3,\"totalDuration\":500,\"startTime\":1700000000000}",
+        json_str,
+    );
+}
+
