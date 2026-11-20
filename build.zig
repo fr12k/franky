@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
         use_lld_opt;
 
     const regex_pathological = b.option(bool, "regex-pathological", "Run expensive regex pathological-pattern test (default: false)") orelse false;
+    const strip = b.option(bool, "strip", "Strip debug symbols from the binary (default: false)") orelse false;
 
     const embedded_settings_json = @embedFile("settings.json");
     const franky_options = b.addOptions();
@@ -110,6 +111,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .omit_frame_pointer = false,
+        .strip = strip,
     });
     exe_module.addImport("franky", franky_module);
     exe_module.addImport("zompress", zompress_module);
