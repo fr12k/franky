@@ -97,16 +97,6 @@ pub const Config = struct {
     /// profile system — collapses ten-flag commands into one.
     /// Resolved by `coding.profiles.applyProfile` after parse().
     profile: ?[]const u8 = null,
-    /// `--list-profiles` (v1.17.0 Phase 2). Print every available
-    /// profile (built-in + user) with provenance + description and
-    /// exit 0. Handled in `print.run` before mode dispatch.
-    list_profiles: bool = false,
-    /// `--save-profile <name>` (v1.17.0 Phase 2). Materialize the
-    /// named built-in preset into `$FRANKY_HOME/settings.json`
-    /// under `profiles.<name>` so the user can edit it freely, then
-    /// exit 0. Refuses if a user profile of the same name already
-    /// exists. Handled in `print.run` before mode dispatch.
-    save_profile: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     resume_id: ?[]const u8 = null,
@@ -510,10 +500,6 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
         cfg.text_tool_call_fallback = true;
         return true;
     }
-    if (std.mem.eql(u8, name, "--list-profiles")) {
-        cfg.list_profiles = true;
-        return true;
-    }
     if (std.mem.eql(u8, name, "--continue")) {
         cfg.continue_session = true;
         return true;
@@ -656,8 +642,6 @@ fn applyValuedFlag(cfg: *Config, name: []const u8, inline_value: ?[]const u8, i:
         cfg.http_trace_dir = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--profile")) {
         cfg.profile = try a.dupe(u8, try takeValue(argv, i, inline_value));
-    } else if (std.mem.eql(u8, name, "--save-profile")) {
-        cfg.save_profile = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--session")) {
         cfg.session_id = try a.dupe(u8, try takeValue(argv, i, inline_value));
     } else if (std.mem.eql(u8, name, "--session-dir")) {
@@ -807,13 +791,8 @@ pub const usage_text: []const u8 =
     \\  --profile NAME               Apply the named bundle of flag defaults from
     \\                               <settings.json>.profiles.NAME before the rest of the
     \\                               argv walk. CLI flags still win. See v2 spec §5.
-    \\                               Built-ins: cloudflare-gemma, cloudflare-llama,
-    \\                               cerebras, openrouter, ollama, lm-studio.
-    \\  --list-profiles              Print every available profile (built-in + user) and exit.
-    \\  --save-profile NAME          Materialize the named built-in preset into
-    \\                               $FRANKY_HOME/settings.json so you can edit it freely,
-    \\                               then exit. User profiles override built-ins.
-    \\  --session ID                 Use a specific session id
+    \\                               Profiles come from settings.json only.
+    \\      \\  --session ID                 Use a specific session id
     \\  --session-dir DIR            Parent dir (default: $FRANKY_HOME/sessions or ~/.franky/sessions)
     \\  --resume ID                  Resume a prior session (implies --session)
     \\  --no-session                 Do not persist this run

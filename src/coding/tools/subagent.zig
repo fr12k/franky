@@ -868,7 +868,7 @@ const ErrorKind = enum {
 
     fn hint(self: ErrorKind) []const u8 {
         return switch (self) {
-            .profile_not_found => "retry with one of the profile names listed in `available_profiles` (or run with --list-profiles to see the catalog)",
+            .profile_not_found => "retry with one of the profile names listed in `available_profiles`",
             .preset_not_found => "call list_subagent_presets to see available presets, then retry with a valid preset name",
             .role_promotion_denied => "the preset's default_role is higher than the parent's role; run franky with a higher --role or pick a preset with a lower default_role",
             .timeout => "summarize the task more or break into smaller steps; partial_text contains what was produced before the timer fired",

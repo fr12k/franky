@@ -1097,7 +1097,7 @@ pub fn initSession(
         session.tools = final_tools;
     }
 
-    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
+    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
 }
 
 // ─── §J + v1.7.3: server-side slash command registry ───────────

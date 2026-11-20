@@ -163,7 +163,7 @@ pub fn createSession(
     if (resolved.memory_state) |ms| {
         memory_context = ms.buildContextBlock(cfg.prompt) catch null;
     }
-    const system_prompt = try build_sysprompt(allocator, io, environ, cfg, memory_context);
+    const system_prompt = try build_sysprompt(allocator, io, environ, environ_map, cfg, memory_context);
     errdefer allocator.free(system_prompt);
     if (memory_context) |mc| allocator.free(mc);
     memory_context = null;

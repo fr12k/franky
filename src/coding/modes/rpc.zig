@@ -477,7 +477,7 @@ fn initSession(
     });
     session.tools = final_tools;
 
-    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
+    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
 }
 
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {

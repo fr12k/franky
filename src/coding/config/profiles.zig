@@ -7,9 +7,10 @@
 //! `env: {}` block. `${VAR}` interpolation in string values is
 //! supported.
 //!
-//! Phase 2 (planned): built-in preset catalog + `--save-profile` +
-//! `--list-profiles`. Phase 1 only reads from disk — if no settings.json
-//! exists or the named profile isn't there, applyProfile returns
+//! Profiles are read exclusively from `profiles.<name>` in
+//! settings.json (project, FRANKY_HOME, $HOME/.franky) and the
+//! settings.json embedded into the binary by build.zig. If no
+//! settings.json has the named profile, applyProfile returns
 //! `error.ProfileNotFound`.
 //!
 //! Precedence (per v2 §5.3):
@@ -183,10 +184,10 @@ pub fn applyProfile(
 }
 
 /// Walk all settings.json layers, return the first hit for
-/// `profiles.<name>`. Returns null if no layer has the name. Falls
-/// back to the built-in catalog (v1.17.0 Phase 2): user-defined
-/// profiles in settings.json override built-ins of the same name,
-/// but a name only present in the built-ins is still resolved.
+/// `profiles.<name>`. Returns null if no layer has the name.
+/// Profiles come exclusively from settings.json (project,
+/// FRANKY_HOME, $HOME/.franky) and the settings.json embedded
+/// into the binary by build.zig.
 pub fn loadFromSettings(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -215,58 +216,7 @@ pub fn loadFromSettings(
         return profile;
     }
 
-    // Fall back to the built-in catalog.
-    if (getBuiltinBody(name)) |body| {
-        log.log(.debug, "profile", "loaded", "name={s} source=builtin", .{name});
-        return try parseBuiltinBody(arena, environ_map, body);
-    }
-
-    // v3.1 — try parent/model expansion against the built-in catalog.
-    // If name is "parent/model", look up "parent" in built-ins, check
-    // if it has a "models" array, and synthesize a profile.
-    if (std.mem.indexOfScalar(u8, name, '/')) |slash| {
-        const parent_name = name[0..slash];
-        const model_name = name[slash + 1 ..];
-        if (model_name.len > 0) {
-            if (getBuiltinBody(parent_name)) |body| {
-                const parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch
-                    return error.MalformedProfile;
-                if (parsed.value == .object) {
-                    if (parsed.value.object.get("models")) |models_v| if (models_v == .array) {
-                        const found = for (models_v.array.items) |item| {
-                            if (item == .string and std.mem.eql(u8, item.string, model_name)) break true;
-                        } else false;
-                        if (found) {
-                            var profile = try parseProfileObject(arena, environ_map, parsed.value.object);
-                            // Set the selected model index to point at the matched model
-                            // without mutating the parent's models array.
-                            for (profile.models.?, 0..) |m, i| {
-                                if (std.mem.eql(u8, m, model_name)) {
-                                    profile.selected_model_idx = i;
-                                    break;
-                                }
-                            }
-                            log.log(.debug, "profile", "loaded", "name={s} source=builtin-expanded", .{name});
-                            return profile;
-                        }
-                    };
-                }
-            }
-        }
-    }
-
     return null;
-}
-
-fn parseBuiltinBody(
-    arena: std.mem.Allocator,
-    environ_map: *std.process.Environ.Map,
-    body: []const u8,
-) ProfileError!Profile {
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, body, .{}) catch
-        return error.MalformedProfile;
-    if (parsed.value != .object) return error.MalformedProfile;
-    return try parseProfileObject(arena, environ_map, parsed.value.object);
 }
 
 fn loadProfileFromFile(
@@ -669,150 +619,15 @@ fn parseMode(s: []const u8) !cli.Mode {
     return error.UnknownMode;
 }
 
-// ─── v1.17.0 Phase 2 — built-in preset catalog ────────────────
-
-/// One built-in preset. `body` is the JSON body that would go
-/// inside `profiles.<name>` of a user's settings.json — same shape
-/// as user profiles, runs through the same parser, can carry the
-/// same `${VAR}` references and `env` block.
-pub const Builtin = struct {
-    name: []const u8,
-    description: []const u8,
-    body: []const u8,
-};
-
-const builtin_cloudflare_gemma_body =
-    \\{
-    \\  "provider": "gateway",
-    \\  "models": ["@cf/google/gemma-4-26b-a4b-it"],
-    \\  "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions",
-    \\  "api_key_env": "CLOUDFLARE_API_TOKEN",
-    \\  "ask_tools": "all",
-    \\  "env": {
-    \\    "FRANKY_FIRST_BYTE_TIMEOUT_MS": "300000"
-    \\  }
-    \\}
-;
-
-const builtin_cloudflare_llama_body =
-    \\{
-    \\  "provider": "gateway",
-    \\  "models": ["@cf/meta/llama-3.3-70b-instruct-fp8-fast"],
-    \\  "base_url": "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions",
-    \\  "api_key_env": "CLOUDFLARE_API_TOKEN",
-    \\  "text_tool_call_fallback": true,
-    \\  "ask_tools": "all",
-    \\  "env": {
-    \\    "FRANKY_FIRST_BYTE_TIMEOUT_MS": "300000"
-    \\  }
-    \\}
-;
-
-const builtin_cerebras_body =
-    \\{
-    \\  "provider": "gateway",
-    \\  "base_url": "https://api.cerebras.ai/v1/chat/completions",
-    \\  "api_key_env": "CEREBRAS_API_KEY"
-    \\}
-;
-
-const builtin_openrouter_body =
-    \\{
-    \\  "provider": "gateway",
-    \\  "base_url": "https://openrouter.ai/api/v1/chat/completions",
-    \\  "api_key_env": "OPENROUTER_API_KEY",
-    \\  "openrouter_categories": "cli-agent"
-    \\}
-;
-
-const builtin_ollama_body =
-    \\{
-    \\  "provider": "gateway",
-    \\  "base_url": "http://localhost:11434/v1/chat/completions",
-    \\  "env": {
-    \\    "FRANKY_FIRST_BYTE_TIMEOUT_MS": "600000"
-    \\  }
-    \\}
-;
-
-const builtin_lm_studio_body =
-    \\{
-    \\  "provider": "gateway",
-    \\  "base_url": "http://localhost:1234/v1/chat/completions"
-    \\}
-;
-
-const builtin_gemini_body =
-    \\{
-    \\  "provider": "google-gemini",
-    \\  "models": ["gemini-2.5-pro"],
-    \\  "api_key_env": "GEMINI_API_KEY"
-    \\}
-;
-
-pub const builtin_catalog = [_]Builtin{
-    .{
-        .name = "cloudflare-gemma",
-        .description = "Cloudflare Workers AI — @cf/google/gemma-4-26b-a4b-it (env: CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN)",
-        .body = builtin_cloudflare_gemma_body,
-    },
-    .{
-        .name = "cloudflare-llama",
-        .description = "Cloudflare Workers AI — Llama-3.3-70b with --text-tool-call-fallback (env: CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN)",
-        .body = builtin_cloudflare_llama_body,
-    },
-    .{
-        .name = "cerebras",
-        .description = "Cerebras — inference cloud (env: CEREBRAS_API_KEY)",
-        .body = builtin_cerebras_body,
-    },
-    .{
-        .name = "openrouter",
-        .description = "OpenRouter — multi-provider gateway (env: OPENROUTER_API_KEY)",
-        .body = builtin_openrouter_body,
-    },
-    .{
-        .name = "ollama",
-        .description = "Local Ollama on http://localhost:11434 (no auth, generous first-byte timeout)",
-        .body = builtin_ollama_body,
-    },
-    .{
-        .name = "lm-studio",
-        .description = "Local LM Studio on http://localhost:1234 (no auth)",
-        .body = builtin_lm_studio_body,
-    },
-    .{
-        .name = "gemini",
-        .description = "Google AI Studio Gemini — gemini-2.5-pro via native provider (env: GEMINI_API_KEY; or --auth-token / auth.json bearer record)",
-        .body = builtin_gemini_body,
-    },
-};
-
-/// Return the embedded body for the named built-in, or null if no
-/// such built-in exists. The body is the JSON object literal that
-/// would go under `profiles.<name>` in a user's settings.json.
-pub fn getBuiltinBody(name: []const u8) ?[]const u8 {
-    for (builtin_catalog) |b| {
-        if (std.mem.eql(u8, b.name, name)) return b.body;
-    }
-    return null;
-}
-
-/// Render every available profile (built-in + user) as a printable
-/// string, one per line, with provenance and description.
-///
-/// User profiles take priority — if a name exists in both, the user
-/// version wins at apply time and the built-in is marked
-/// `[overridden]`. Owned slice; caller frees.
-/// v1.24.1 — comma-separated list of available profile names
-/// (user from settings.json layers + built-in catalog, deduped),
-/// for embedding in the system prompt's subagent guidance.
-/// Names only — no descriptions. Sorted alphabetically for
-/// determinism (the prompt cache benefits from a stable order).
+/// Comma-separated list of available profile names (user from
+/// settings.json layers), for embedding in the system prompt's
+/// subagent guidance. Names only — no descriptions. Sorted
+/// alphabetically for determinism (the prompt cache benefits from
+/// a stable order).
 pub fn listProfileNamesCSV(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environ_map: *std.process.Environ.Map,
+    environ_map: *const std.process.Environ.Map,
 ) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -824,22 +639,6 @@ pub fn listProfileNamesCSV(
     for (candidates) |maybe_path| {
         const path = maybe_path orelse continue;
         try collectUserProfileNames(a, io, path, &names);
-    }
-    for (builtin_catalog) |b| {
-        try names.put(try a.dupe(u8, b.name), {});
-        // v3.1 — also register expanded parent/model names for
-        // built-ins that have a "models" array.
-        const parsed = std.json.parseFromSlice(std.json.Value, a, b.body, .{}) catch continue;
-        if (parsed.value == .object) {
-            if (parsed.value.object.get("models")) |models_v| if (models_v == .array) {
-                for (models_v.array.items) |item| {
-                    if (item == .string and item.string.len > 0) {
-                        const expanded = try std.fmt.allocPrint(a, "{s}/{s}", .{ b.name, item.string });
-                        try names.put(expanded, {});
-                    }
-                }
-            };
-        }
     }
 
     var sorted: std.ArrayList([]const u8) = .empty;
@@ -863,7 +662,7 @@ pub fn listProfileNamesCSV(
 pub fn listProfiles(
     allocator: std.mem.Allocator,
     io: std.Io,
-    environ_map: *std.process.Environ.Map,
+    environ_map: *const std.process.Environ.Map,
 ) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -889,15 +688,6 @@ pub fn listProfiles(
             defer allocator.free(line);
             try out.appendSlice(allocator, line);
         }
-        try out.appendSlice(allocator, "\n");
-    }
-
-    try out.appendSlice(allocator, "Built-in profiles:\n");
-    for (builtin_catalog) |b| {
-        const marker = if (user_names.contains(b.name)) "  [overridden]" else "";
-        const line = try std.fmt.allocPrint(allocator, "  {s}{s}  {s}\n", .{ b.name, marker, b.description });
-        defer allocator.free(line);
-        try out.appendSlice(allocator, line);
     }
 
     return try out.toOwnedSlice(allocator);
@@ -939,163 +729,6 @@ fn collectUserProfileNames(
             };
         }
     }
-}
-
-/// Materialize a built-in preset into the user's settings.json so
-/// they can edit it. Writes to `$FRANKY_HOME/settings.json` if set,
-/// else `$HOME/.franky/settings.json`. Errors if no parent env is
-/// available, the named built-in doesn't exist, or a user profile
-/// of the same name already exists.
-///
-/// Implementation note: instead of mutating a parsed JSON Value
-/// tree (which fights std.json's ObjectMap surface), this builds
-/// the merged settings.json text directly. We parse only to detect
-/// whether an existing profile of the same name is present, then
-/// emit a fresh whole-file render. The resulting file always has
-/// our standard shape — top-level keys preserved as-is, profiles
-/// section always last — even if the user's original was
-/// differently formatted.
-pub fn saveBuiltin(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    environ_map: *std.process.Environ.Map,
-    name: []const u8,
-) !void {
-    const body = getBuiltinBody(name) orelse return error.UnknownBuiltin;
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Resolve target path: prefer $FRANKY_HOME, fall back to
-    // $HOME/.franky.
-    const target_dir: []u8 = if (environ_map.get("FRANKY_HOME")) |h| blk: {
-        if (h.len == 0) return error.NoHome;
-        break :blk try a.dupe(u8, h);
-    } else if (environ_map.get("HOME")) |h| blk: {
-        if (h.len == 0) return error.NoHome;
-        break :blk try std.fs.path.join(a, &.{ h, ".franky" });
-    } else return error.NoHome;
-
-    try std.Io.Dir.cwd().createDirPath(io, target_dir);
-    const settings_path = try std.fs.path.join(a, &.{ target_dir, "settings.json" });
-
-    // Read existing settings.json text (or empty `{}`).
-    const existing_text: []const u8 = blk: {
-        const f_or = std.Io.Dir.cwd().openFile(io, settings_path, .{});
-        if (f_or) |f_open| {
-            var f = f_open;
-            defer f.close(io);
-            const len = f.length(io) catch break :blk "{}";
-            if (len == 0) break :blk "{}";
-            const buf = try a.alloc(u8, @intCast(len));
-            const n = f.readPositionalAll(io, buf, 0) catch break :blk "{}";
-            break :blk buf[0..n];
-        } else |_| {
-            break :blk "{}";
-        }
-    };
-
-    // Parse to validate + collect existing top-level keys + check
-    // for duplicate profile name.
-    const existing_parsed = std.json.parseFromSlice(std.json.Value, a, existing_text, .{}) catch
-        return error.ExistingSettingsMalformed;
-    if (existing_parsed.value != .object) return error.ExistingSettingsMalformed;
-    const root_obj = existing_parsed.value.object;
-
-    // Refuse to overwrite an existing user profile of the same name.
-    if (root_obj.get("profiles")) |p| if (p == .object) {
-        if (p.object.contains(name)) return error.ProfileAlreadyExists;
-    };
-
-    // Build the merged settings.json by string concat. Preserves
-    // any non-`profiles` top-level fields verbatim by re-stringifying
-    // them; replaces the `profiles` block with a merged version.
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    try out.appendSlice(a, "{\n");
-
-    // Re-emit non-profiles top-level fields first. Keys are
-    // emitted via `appendQuoted` (simple `"..."` literal — profile
-    // and settings keys are alphanumeric / underscore in practice;
-    // if a key contains a control char or quote, we let std.json's
-    // Stringify on the Value handle the escape level later via the
-    // `keyValue` helper below).
-    var it = root_obj.iterator();
-    var first = true;
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "profiles")) continue;
-        if (!first) try out.appendSlice(a, ",\n");
-        first = false;
-        try out.appendSlice(a, "  ");
-        try appendKey(a, &out, entry.key_ptr.*);
-        try out.appendSlice(a, ": ");
-        const v_json = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
-        try out.appendSlice(a, v_json);
-    }
-
-    // Profiles block.
-    if (!first) try out.appendSlice(a, ",\n");
-    try out.appendSlice(a, "  \"profiles\": {\n");
-
-    var profile_first = true;
-    if (root_obj.get("profiles")) |p| if (p == .object) {
-        var pit = p.object.iterator();
-        while (pit.next()) |entry| {
-            if (!profile_first) try out.appendSlice(a, ",\n");
-            profile_first = false;
-            try out.appendSlice(a, "    ");
-            try appendKey(a, &out, entry.key_ptr.*);
-            try out.appendSlice(a, ": ");
-            const v_json = try std.json.Stringify.valueAlloc(a, entry.value_ptr.*, .{});
-            try out.appendSlice(a, v_json);
-        }
-    };
-
-    // Append the new built-in preset.
-    if (!profile_first) try out.appendSlice(a, ",\n");
-    try out.appendSlice(a, "    ");
-    try appendKey(a, &out, name);
-    try out.appendSlice(a, ": ");
-    try out.appendSlice(a, body);
-
-    try out.appendSlice(a, "\n  }\n}\n");
-
-    // Atomic tempfile + rename. The file may carry env-var hints
-    // (api_key_env, etc.) but no raw secrets, so 0600 is a
-    // belt-and-suspenders policy aligned with auth.json/permissions.json.
-    const tmp_path = try std.fmt.allocPrint(a, "{s}.tmp.{d}", .{ settings_path, stream.nowMillis() });
-    {
-        var f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
-        defer f.close(io);
-        var wbuf: [4096]u8 = undefined;
-        var w = f.writer(io, &wbuf);
-        try w.interface.writeAll(out.items);
-        try w.interface.flush();
-    }
-    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), settings_path, io);
-}
-
-/// Quote `key` as a JSON string literal into `out`. Escapes the
-/// minimum set required for JSON validity: `"`, `\`, and control
-/// characters. Other Unicode bytes pass through verbatim. Used for
-/// the merged-settings.json render in `saveBuiltin`.
-fn appendKey(allocator: std.mem.Allocator, out: *std.ArrayList(u8), key: []const u8) !void {
-    try out.append(allocator, '"');
-    for (key) |c| switch (c) {
-        '"' => try out.appendSlice(allocator, "\\\""),
-        '\\' => try out.appendSlice(allocator, "\\\\"),
-        '\n' => try out.appendSlice(allocator, "\\n"),
-        '\r' => try out.appendSlice(allocator, "\\r"),
-        '\t' => try out.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const written = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try out.appendSlice(allocator, written);
-        },
-        else => try out.append(allocator, c),
-    };
-    try out.append(allocator, '"');
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -1466,89 +1099,6 @@ test "parseMode: covers all variants" {
     try testing.expectError(error.UnknownMode, parseMode("bogus"));
 }
 
-// ─── v1.17.0 Phase 2 — built-in catalog tests ─────────────────
-
-test "getBuiltinBody: known names resolve, unknown returns null" {
-    try testing.expect(getBuiltinBody("cloudflare-gemma") != null);
-    try testing.expect(getBuiltinBody("cloudflare-llama") != null);
-    try testing.expect(getBuiltinBody("gemini") != null);
-    try testing.expect(getBuiltinBody("ollama") != null);
-    try testing.expect(getBuiltinBody("nonexistent") == null);
-}
-
-test "every built-in body parses as a valid profile object" {
-    const gpa = testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-
-    for (builtin_catalog) |b| {
-        const profile = parseBuiltinBody(arena.allocator(), &env, b.body) catch |e| {
-            std.debug.print("built-in '{s}' failed to parse: {s}\n", .{ b.name, @errorName(e) });
-            return e;
-        };
-        // Every preset must at least set provider.
-        try testing.expect(profile.provider != null);
-    }
-}
-
-test "applyProfile: built-in catalog works without settings.json" {
-    const gpa = testing.allocator;
-
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    try env.put("CLOUDFLARE_ACCOUNT_ID", "acct-test");
-    try env.put("CLOUDFLARE_API_TOKEN", "tok-test");
-
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var cfg = try cli.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-
-    try applyProfile(&cfg, io, &env, "cloudflare-llama");
-
-    try testing.expectEqualStrings("gateway", cfg.provider.?);
-    try testing.expectEqualStrings("@cf/meta/llama-3.3-70b-instruct-fp8-fast", cfg.model.?);
-    try testing.expect(std.mem.indexOf(u8, cfg.base_url.?, "acct-test") != null);
-    try testing.expectEqualStrings("tok-test", cfg.api_key.?);
-    try testing.expect(cfg.text_tool_call_fallback);
-}
-
-test "applyProfile: openrouter profile sets attribution fields" {
-    // The built-in `openrouter` profile now ships `openrouter_categories`
-    // ("cli-agent"); applying it must populate `cfg.openrouter_categories`
-    // and leave the referer/title overrides null (so the built-in franky
-    // identity is used). `cfg.base_url` must be the OpenRouter endpoint.
-    const gpa = testing.allocator;
-
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    try env.put("OPENROUTER_API_KEY", "or-test-key");
-
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var cfg = try cli.parse(gpa, &.{"franky"});
-    defer cfg.deinit();
-
-    try applyProfile(&cfg, io, &env, "openrouter");
-
-    try testing.expectEqualStrings("gateway", cfg.provider.?);
-    try testing.expectEqualStrings(
-        "https://openrouter.ai/api/v1/chat/completions",
-        cfg.base_url.?,
-    );
-    try testing.expectEqualStrings("or-test-key", cfg.api_key.?);
-    try testing.expectEqualStrings("cli-agent", cfg.openrouter_categories.?);
-    // referer/title not set in the builtin profile → fall back to defaults.
-    try testing.expect(cfg.http_referer == null);
-    try testing.expect(cfg.openrouter_title == null);
-}
-
 test "applyProfile: explicit attribution overrides round-trip" {
     // A profile that explicitly sets all three attribution fields must
     // overlay them onto `cfg` verbatim.
@@ -1603,88 +1153,3 @@ test "applyProfile: explicit attribution overrides round-trip" {
     try testing.expectEqualStrings("cli-agent,cloud-agent", cfg.openrouter_categories.?);
 }
 
-test "saveBuiltin: writes preset to fresh settings.json" {
-    const gpa = testing.allocator;
-
-    const ts = stream.nowMillis();
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/franky-save-test-{d}", .{ts});
-    defer gpa.free(dir_path);
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
-
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    try env.put("FRANKY_HOME", dir_path);
-
-    try saveBuiltin(gpa, io, &env, "gemini");
-
-    // Read it back and verify.
-    const settings_path = try std.fs.path.join(gpa, &.{ dir_path, "settings.json" });
-    defer gpa.free(settings_path);
-    var f = try std.Io.Dir.cwd().openFile(io, settings_path, .{});
-    defer f.close(io);
-    const len = try f.length(io);
-    const buf = try gpa.alloc(u8, @intCast(len));
-    defer gpa.free(buf);
-    _ = try f.readPositionalAll(io, buf, 0);
-
-    try testing.expect(std.mem.indexOf(u8, buf, "\"gemini\"") != null);
-    try testing.expect(std.mem.indexOf(u8, buf, "GEMINI_API_KEY") != null);
-}
-
-test "saveBuiltin: refuses to overwrite an existing profile of the same name" {
-    const gpa = testing.allocator;
-
-    const ts = stream.nowMillis();
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/franky-save-conflict-{d}", .{ts});
-    defer gpa.free(dir_path);
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
-
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    try env.put("FRANKY_HOME", dir_path);
-
-    // Save once → success.
-    try saveBuiltin(gpa, io, &env, "gemini");
-    // Save again → ProfileAlreadyExists.
-    try testing.expectError(error.ProfileAlreadyExists, saveBuiltin(gpa, io, &env, "gemini"));
-}
-
-test "saveBuiltin: unknown built-in returns UnknownBuiltin" {
-    const gpa = testing.allocator;
-
-    const ts = stream.nowMillis();
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/franky-save-unknown-{d}", .{ts});
-    defer gpa.free(dir_path);
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
-
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    try env.put("FRANKY_HOME", dir_path);
-
-    try testing.expectError(error.UnknownBuiltin, saveBuiltin(gpa, io, &env, "nonexistent"));
-}
-
-test "listProfiles: prints every built-in" {
-    const gpa = testing.allocator;
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    var threaded = test_h.threadedIo();
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const text = try listProfiles(gpa, io, &env);
-    defer gpa.free(text);
-
-    for (builtin_catalog) |b| {
-        try testing.expect(std.mem.indexOf(u8, text, b.name) != null);
-    }
-}

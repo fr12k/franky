@@ -118,37 +118,6 @@ pub fn run(
         return writeOut(io, msg);
     }
 
-    // v1.17.0 Phase 2 — short-circuits for the profile catalog tools.
-    if (cfg.list_profiles) {
-        const text = try profiles_mod.listProfiles(allocator, io, environ_map);
-        defer allocator.free(text);
-        return writeOut(io, text);
-    }
-    if (cfg.save_profile) |save_name| {
-        profiles_mod.saveBuiltin(allocator, io, environ_map, save_name) catch |e| switch (e) {
-            error.UnknownBuiltin => {
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "no built-in profile named '{s}' (try --list-profiles)\n",
-                    .{save_name},
-                );
-                defer allocator.free(msg);
-                return exitWithMessage(io, msg, 2);
-            },
-            error.ProfileAlreadyExists => return exitWithMessage(io, "user profile already exists; remove it from settings.json first\n", 2),
-            error.NoHome => return exitWithMessage(io, "FRANKY_HOME or HOME must be set to save a profile\n", 2),
-            error.ExistingSettingsMalformed => return exitWithMessage(io, "existing settings.json is malformed; cannot merge\n", 2),
-            else => |err| return err,
-        };
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            "✓ wrote built-in profile '{s}' to your settings.json — edit it freely.\n",
-            .{save_name},
-        );
-        defer allocator.free(msg);
-        return writeOut(io, msg);
-    }
-
     // v1.7.5 — initialize the logger BEFORE mode dispatch so
     // every mode (rpc / proxy / interactive / print) honors
     // `--log-level` / `FRANKY_LOG`. Pre-1.7.5 the init lived
@@ -382,7 +351,7 @@ fn runPrint(
     } else if (cfg.memory_enabled) {
         cfg.memory_enabled = false;
     }
-    const system_prompt = try buildSystemPromptIo(allocator, io, environ, cfg, memory_context);
+    const system_prompt = try buildSystemPromptIo(allocator, io, environ, environ_map, cfg, memory_context);
     defer allocator.free(system_prompt);
 
     const model: ai.types.Model = .{
@@ -1568,6 +1537,7 @@ pub fn buildSystemPromptIo(
     allocator: std.mem.Allocator,
     io: ?std.Io,
     environ: std.process.Environ,
+    environ_map: *const std.process.Environ.Map,
     cfg: *const cli_mod.Config,
     memory_context: ?[]const u8,
 ) ![]u8 {
@@ -1613,7 +1583,7 @@ pub fn buildSystemPromptIo(
     var with_hint: []u8 = base;
     var hint_owned = false;
     if (!loaded_from_disk) {
-        const hint = try buildSubagentHint(allocator, io, cfg);
+        const hint = try buildSubagentHint(allocator, io, environ_map, cfg);
         defer allocator.free(hint);
         if (hint.len > 0) {
             const trimmed = std.mem.trimEnd(u8, base, &std.ascii.whitespace);
@@ -1876,18 +1846,12 @@ pub fn buildSystemPromptIo(
 fn buildSubagentHint(
     allocator: std.mem.Allocator,
     io: ?std.Io,
+    environ_map: *const std.process.Environ.Map,
     cfg: *const cli_mod.Config,
 ) ![]u8 {
     _ = cfg;
     const ioref = io orelse return try allocator.dupe(u8, "");
-    // Build a borrowed environ_map view for the profiles helper.
-    // The helper needs a *Map; we don't have a stable one here, so
-    // synthesize a transient one from the standard env. Empty map
-    // is fine — it just means no `${VAR}` interpolation in profile
-    // bodies, which is irrelevant for name-listing.
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    const profile_list = profiles_mod.listProfileNamesCSV(allocator, ioref, &env_map) catch return try allocator.dupe(u8, "");
+    const profile_list = profiles_mod.listProfileNamesCSV(allocator, ioref, environ_map) catch return try allocator.dupe(u8, "");
     defer allocator.free(profile_list);
     if (profile_list.len == 0) return try allocator.dupe(u8, "");
     return try std.fmt.allocPrint(allocator,
@@ -2606,7 +2570,9 @@ test "buildSystemPromptIo: --system-prompt flag beats disk + default" {
     cfg.system_prompt = explicit;
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, null, env, &cfg, null);
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const out = try buildSystemPromptIo(gpa, null, env, &env_map, &cfg, null);
     defer gpa.free(out);
     try testing.expectEqualStrings("you are a test", out);
 }
@@ -2620,16 +2586,48 @@ test "buildSystemPromptIo: missing system.md falls back to default + appends sub
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Env with no FRANKY_HOME/HOME → no disk lookup attempted.
+    // Set up a temp $FRANKY_HOME with a settings.json containing a
+    // profile so the subagent hint has something to list. Profiles
+    // come exclusively from settings.json (no built-in catalog).
+    const ts = ai.stream.nowMillis();
+    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/franky-sysprompt-test-{d}", .{ts});
+    defer gpa.free(dir_path);
+    defer std.Io.Dir.cwd().deleteTree(io, dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, dir_path);
+    const settings_path = try std.fs.path.join(gpa, &.{ dir_path, "settings.json" });
+    defer gpa.free(settings_path);
+    const settings_body =
+        \\{
+        \\  "profiles": {
+        \\    "gemini": {
+        \\      "provider": "google-gemini",
+        \\      "models": ["gemini-2.5-pro"],
+        \\      "api_key_env": "GEMINI_API_KEY"
+        \\    }
+        \\  }
+        \\}
+    ;
+    var f = try std.Io.Dir.cwd().createFile(io, settings_path, .{});
+    {
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(settings_body);
+        try w.interface.flush();
+    }
+    f.close(io);
+
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    try env_map.put("FRANKY_HOME", dir_path);
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg, null);
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null);
     defer gpa.free(out);
     // Default prompt body is preserved verbatim at the start.
     try testing.expect(std.mem.startsWith(u8, out, default_system_prompt));
     // v1.24.1 — subagent hint is appended with the profile catalog.
     try testing.expect(std.mem.indexOf(u8, out, "subagent") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Profiles:") != null);
-    // At least one built-in profile name should appear.
+    // The user-defined profile name should appear.
     try testing.expect(std.mem.indexOf(u8, out, "gemini") != null);
     // v1.26.5 — trust-the-subagent nudge. The prompt instructs the
     // model not to re-verify successful sub-agent runs, since real
@@ -2674,7 +2672,9 @@ test "buildSystemPromptIo: --skill NAME injects body under Active skills (§6.1)
     cfg.skills_select_csv = try cfg.arena.allocator().dupe(u8, "demo");
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg, null);
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "## Active skills") != null);
@@ -2716,7 +2716,9 @@ test "buildSystemPromptIo: skill stays out when not selected and no auto_apply (
     // No skills_select_csv, no auto_apply on the skill → inactive.
 
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &cfg, null);
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "Active skills") == null);
