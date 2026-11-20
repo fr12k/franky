@@ -1439,7 +1439,7 @@ fn editHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.allocator);
     try buf.appendSlice(ctx.allocator, "{\"text\":");
-    try appendUiJsonStr(&buf, ctx.allocator, text_owned);
+    try ai.utils.appendJsonStr(&buf, ctx.allocator, text_owned);
     try buf.append(ctx.allocator, '}');
     px.data_json = try buf.toOwnedSlice(ctx.allocator);
 
@@ -2647,7 +2647,7 @@ fn writeMessageForUi(
 ) !void {
     try buf.append(allocator, '{');
     try buf.appendSlice(allocator, "\"role\":");
-    try appendUiJsonStr(buf, allocator, m.role.toString());
+    try ai.utils.appendJsonStr(buf, allocator, m.role.toString());
     // vN — surface the per-message timestamp (Unix millis) so the
     // web UI can render a clock time on each bubble. 0 means unknown
     // (e.g. a legacy/compacted message); the UI treats 0 as absent.
@@ -2664,14 +2664,14 @@ fn writeMessageForUi(
         tool_result_seq.* += 1;
         const suffix = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ tcid, seq });
         defer allocator.free(suffix);
-        try appendUiJsonStr(buf, allocator, suffix);
+        try ai.utils.appendJsonStr(buf, allocator, suffix);
     }
     if (m.is_error) {
         try buf.appendSlice(allocator, ",\"isError\":true");
     }
     if (m.custom_role) |cr| {
         try buf.appendSlice(allocator, ",\"customRole\":");
-        try appendUiJsonStr(buf, allocator, cr);
+        try ai.utils.appendJsonStr(buf, allocator, cr);
     }
     // v1.7.7 — surface per-message usage so the web UI can render
     // a "live status line" (elapsed + tokens) after each turn ends.
@@ -2695,14 +2695,14 @@ fn writeMessageForUi(
                 if (!first) try buf.append(allocator, ',');
                 first = false;
                 try buf.appendSlice(allocator, "{\"kind\":\"text\",\"text\":");
-                try appendUiJsonStr(buf, allocator, t.text);
+                try ai.utils.appendJsonStr(buf, allocator, t.text);
                 try buf.append(allocator, '}');
             },
             .thinking => |th| {
                 if (!first) try buf.append(allocator, ',');
                 first = false;
                 try buf.appendSlice(allocator, "{\"kind\":\"thinking\",\"text\":");
-                try appendUiJsonStr(buf, allocator, th.thinking);
+                try ai.utils.appendJsonStr(buf, allocator, th.thinking);
                 try buf.append(allocator, '}');
             },
             .tool_call => |tc| {
@@ -2713,11 +2713,11 @@ fn writeMessageForUi(
                 tool_call_seq.* += 1;
                 const suffix = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ tc.id, seq });
                 defer allocator.free(suffix);
-                try appendUiJsonStr(buf, allocator, suffix);
+                try ai.utils.appendJsonStr(buf, allocator, suffix);
                 try buf.appendSlice(allocator, ",\"name\":");
-                try appendUiJsonStr(buf, allocator, tc.name);
+                try ai.utils.appendJsonStr(buf, allocator, tc.name);
                 try buf.appendSlice(allocator, ",\"args\":");
-                try appendUiJsonStr(buf, allocator, tc.arguments_json);
+                try ai.utils.appendJsonStr(buf, allocator, tc.arguments_json);
                 try buf.append(allocator, '}');
             },
             // v3.x — emit a lightweight image descriptor (mime + byte
@@ -2728,7 +2728,7 @@ fn writeMessageForUi(
                 if (!first) try buf.append(allocator, ',');
                 first = false;
                 try buf.appendSlice(allocator, "{\"kind\":\"image\",\"mimeType\":");
-                try appendUiJsonStr(buf, allocator, img.mime_type);
+                try ai.utils.appendJsonStr(buf, allocator, img.mime_type);
                 var sz_buf: [32]u8 = undefined;
                 const sz = std.fmt.bufPrint(&sz_buf, ",\"bytes\":{d}}}", .{img.data.len}) catch unreachable;
                 try buf.appendSlice(allocator, sz);
@@ -2739,27 +2739,6 @@ fn writeMessageForUi(
     try buf.append(allocator, '}');
 }
 
-fn appendUiJsonStr(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    s: []const u8,
-) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
 
 // ─── §H.4 + v1.7.0: session-management routes ───────────────────
 
@@ -3236,9 +3215,9 @@ fn renderDesignDocsJson(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
         if (!first) try buf.append(allocator, ',');
         first = false;
         try buf.appendSlice(allocator, "{\"path\":");
-        try appendUiJsonStr(&buf, allocator, doc.path);
+        try ai.utils.appendJsonStr(&buf, allocator, doc.path);
         try buf.appendSlice(allocator, ",\"name\":");
-        try appendUiJsonStr(&buf, allocator, doc.name);
+        try ai.utils.appendJsonStr(&buf, allocator, doc.name);
         try buf.appendSlice(allocator, ",\"category\":\"");
         try buf.appendSlice(allocator, doc.category);
         try buf.appendSlice(allocator, "\",\"status\":\"");
@@ -3355,9 +3334,9 @@ fn renderSessionListJson(
         if (i > 0) try buf.append(allocator, ',');
         try buf.append(allocator, '{');
         try buf.appendSlice(allocator, "\"id\":");
-        try appendUiJsonStr(&buf, allocator, e.id);
+        try ai.utils.appendJsonStr(&buf, allocator, e.id);
         try buf.appendSlice(allocator, ",\"title\":");
-        try appendUiJsonStr(&buf, allocator, e.title);
+        try ai.utils.appendJsonStr(&buf, allocator, e.title);
         var num: [32]u8 = undefined;
         try buf.appendSlice(allocator, ",\"updatedAtMs\":");
         try buf.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{e.updated_at_ms}) catch unreachable);
@@ -3368,7 +3347,7 @@ fn renderSessionListJson(
         try buf.append(allocator, '}');
     }
     try buf.appendSlice(allocator, "],\"active\":");
-    try appendUiJsonStr(&buf, allocator, active_id);
+    try ai.utils.appendJsonStr(&buf, allocator, active_id);
     try buf.appendSlice(allocator, ",\"persisted\":true}");
     return try buf.toOwnedSlice(allocator);
 }
@@ -3636,7 +3615,7 @@ fn respondSlashCommand(
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
-    appendUiJsonStr(&resp, allocator, output.items) catch {
+    ai.utils.appendJsonStr(&resp, allocator, output.items) catch {
         sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
         return;
     };
