@@ -3,7 +3,8 @@ version: 2
 project_name: franky
 
 builds:
-  - builder: zig
+  - id: release
+    builder: zig
     command: build
     targets:
       - x86_64-linux-gnu
@@ -16,9 +17,29 @@ builds:
       - -Dversion={{ .Version }}
       - -Dcommit={{ .ShortCommit }}
       - -Ddate={{ .CommitDate }}
+  - id: debug
+    builder: zig
+    command: build
+    targets:
+      - x86_64-linux-gnu
+      - aarch64-linux-gnu
+      - x86-linux-gnu
+      - x86_64-macos
+      - aarch64-macos
+    flags:
+      - -Doptimize=Debug
+      - -Dversion={{ .Version }}
+      - -Dcommit={{ .ShortCommit }}
+      - -Ddate={{ .CommitDate }}
 archives:
-  - formats: [binary]
+  - id: release
+    ids: [release]
+    formats: [binary]
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ if eq .Arch \"x86\" }}386{{ else }}{{ .Arch }}{{ end }}"
+  - id: debug
+    ids: [debug]
+    formats: [binary]
+    name_template: "{{ .ProjectName }}-debug_{{ .Os }}_{{ if eq .Arch \"x86\" }}386{{ else }}{{ .Arch }}{{ end }}"
 
 checksum:
   name_template: checksums.txt
