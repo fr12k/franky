@@ -1503,32 +1503,32 @@ fn parseArgs(allocator: std.mem.Allocator, args_json: []const u8) ParseError!Par
     };
     errdefer out.deinit(allocator);
 
-    if (obj.get("profile")) |v| if (v == .string) {
-        out.profile = try allocator.dupe(u8, v.string);
-    };
-    if (obj.get("timeout_ms")) |v| if (v == .integer) {
-        const t = v.integer;
+    if (ai.utils.jsonStr(obj, "profile")) |s| {
+        out.profile = try allocator.dupe(u8, s);
+    }
+    if (ai.utils.jsonInt(obj, "timeout_ms")) |v| {
+        const t: i64 = @intCast(v);
         if (t < @as(i64, @intCast(min_timeout_ms)) or t > @as(i64, @intCast(max_timeout_ms))) return error.TimeoutOutOfRange;
         out.timeout_ms = @intCast(t);
-    };
-    if (obj.get("max_turns")) |v| if (v == .integer) {
-        if (v.integer < 1) return error.MaxTurnsOutOfRange;
-        out.max_turns = @intCast(v.integer);
-    };
-    if (obj.get("role")) |v| if (v == .string) {
-        out.role = role_mod.Role.fromString(v.string) catch return error.InvalidRole;
-    };
-    if (obj.get("system_prompt")) |v| if (v == .string) {
-        out.system_prompt = try allocator.dupe(u8, v.string);
-    };
+    }
+    if (ai.utils.jsonInt(obj, "max_turns")) |v| {
+        if (v < 1) return error.MaxTurnsOutOfRange;
+        out.max_turns = @intCast(v);
+    }
+    if (ai.utils.jsonStr(obj, "role")) |s| {
+        out.role = role_mod.Role.fromString(s) catch return error.InvalidRole;
+    }
+    if (ai.utils.jsonStr(obj, "system_prompt")) |s| {
+        out.system_prompt = try allocator.dupe(u8, s);
+    }
     // v1.31.0 — optional context_file path. Read server-side so the
     // parent doesn't have to inline large content into the JSON prompt
     // string (the failure mode that prompted this field).
-    if (obj.get("context_file")) |v| if (v == .string) {
-        if (v.string.len > 0) {
-            out.context_file = try allocator.dupe(u8, v.string);
+    if (ai.utils.jsonStr(obj, "context_file")) |s| {
+        if (s.len > 0) {
+            out.context_file = try allocator.dupe(u8, s);
         }
-    };
+    }
 
     return out;
 }

@@ -403,14 +403,14 @@ const Driver = struct {
             // tell the empty-response signature ("thoughts > 0,
             // candidates == 0") from a normal turn.
             self.candidates_tokens = out;
-            if (um.object.get("thoughtsTokenCount")) |v| if (v == .integer) {
-                self.thoughts_tokens = @intCast(v.integer);
-            };
+            if (utils.jsonInt(um.object, "thoughtsTokenCount")) |v| {
+                self.thoughts_tokens = v;
+            }
             // v1.31.0 — Gemini cached content tokens.
             var cache_read: u64 = 0;
-            if (um.object.get("cachedContentTokenCount")) |v| if (v == .integer) {
-                cache_read = @intCast(v.integer);
-            };
+            if (utils.jsonInt(um.object, "cachedContentTokenCount")) |v| {
+                cache_read = v;
+            }
             try self.out.push(self.io, .{ .usage = .{
                 .input = inp,
                 .output = out,

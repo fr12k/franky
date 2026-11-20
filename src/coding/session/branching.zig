@@ -19,6 +19,7 @@
 //! span rule.
 
 const std = @import("std");
+const utils = @import("../../ai/utils.zig");
 
 pub const Branch = struct {
     /// Unique branch name — `"main"` for the initial line.
@@ -226,15 +227,15 @@ pub fn parseTreeJson(allocator: std.mem.Allocator, body: []const u8) TreeIoError
             .null => {},
             else => {},
         };
-        if (e.get("forkIndex")) |v| if (v == .integer) {
-            b.fork_index = @intCast(v.integer);
-        };
-        if (e.get("messageCount")) |v| if (v == .integer) {
-            b.message_count = @intCast(v.integer);
-        };
-        if (e.get("headHash")) |v| if (v == .string) {
-            b.head_hash = try allocator.dupe(u8, v.string);
-        };
+        if (utils.jsonInt(e, "forkIndex")) |v| {
+            b.fork_index = @intCast(v);
+        }
+        if (utils.jsonInt(e, "messageCount")) |v| {
+            b.message_count = @intCast(v);
+        }
+        if (utils.jsonStr(e, "headHash")) |s| {
+            b.head_hash = try allocator.dupe(u8, s);
+        }
         try tree.branches.put(owned_name, b);
     }
 

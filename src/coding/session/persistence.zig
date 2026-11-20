@@ -18,17 +18,32 @@
 //!     different branch's history.
 //!   - **v1.30.0**: transcript on-disk format switched from a single
 //!     JSON object (`{"version":…,"messages":[…]}`) to JSON Lines.
-//!     The first line is a header `{"type":"meta","version":4,
+//!     The first line is a header `{"type":"meta","version":5,
 //!     "branch":"<name>"}`; each subsequent line is one message.
 //!     `readTranscript`/`readBranchTranscript` transparently read
 //!     legacy `.json` files (v ≤ 3) so existing sessions resume
 //!     without a migration step.
+//!   - **v1.33.0**: transcript record shape changed to match Claude
+//!     Code's format for downstream-tooling compatibility. Each
+//!     message line is now `{"type":"user"|"assistant","sessionId":…,
+//!     "timestamp":"<ISO-8601>","message":{"role":…,"model":…,
+//!     "content":[…],"stop_reason":…,"usage":{…}}}`. Tool-call
+//!     blocks use `"type":"tool_use"` with `"input"`; tool results
+//!     are `"user"` records whose content is a `"tool_result"`
+//!     block with `"tool_use_id"`. Usage keys are snake_case
+//!     (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
+//!     `cache_creation_input_tokens`); `input_tokens` is the
+//!     uncached portion (total minus cache_read + cache_write).
+//!     Legacy v4 lines (no `type`, top-level `role`, `toolCall`/
+//!     `arguments`, epoch-ms `timestamp`) are still read transparently.
+//!     Schema version bumped to 5.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const ai = struct {
     pub const types = @import("../../ai/types.zig");
     pub const log = @import("../../ai/log.zig");
+    pub const utils = @import("../../ai/utils.zig");
 };
 const agent_mod = @import("../../agent/mod.zig");
 const object_store = @import("object_store.zig");
@@ -37,7 +52,15 @@ pub const current_session_version: u32 = 3;
 /// v1.30.0 — transcript schema bumped to 4 for the JSON Lines
 /// on-disk format. Legacy `.json` transcripts at version ≤ 3 are
 /// still readable (`readTranscript` detects the old shape).
-pub const current_transcript_version: u32 = 4;
+/// v1.33.0 — schema bumped to 5 for Claude-Code-compatible record
+/// shape: each message line gains `"type":"user"|"assistant"`,
+/// a `"message":{role,model,content,usage,stop_reason}` wrapper,
+/// `sessionId`, ISO-8601 `timestamp`, `tool_use`/`tool_result`/
+/// `input`/`tool_use_id` block names, and Claude `usage` keys
+/// (`input_tokens` etc.). Legacy v4 lines (no `type`, top-level
+/// `role`, `toolCall`/`arguments`, epoch-ms timestamp) are still
+/// read transparently.
+pub const current_transcript_version: u32 = 5;
 /// Highest version accepted when reading a *legacy* single-JSON
 /// transcript (the pre-v1.30.0 `{"version":…,"messages":[…]}` shape).
 pub const legacy_transcript_version: u32 = 3;
@@ -190,7 +213,9 @@ fn renderTranscriptJsonl(
 
     // Line 1 — header / meta line. Compact (not pretty-printed) like
     // every subsequent line; Claude Code transcripts use the same
-    // one-JSON-object-per-line convention.
+    // one-JSON-object-per-line convention. The meta line is a
+    // franky-specific bookkeeping record (Claude Code has no header);
+    // downstream tooling ignores unknown `type` values.
     try out.appendSlice(allocator, "{\"type\":\"meta\",\"version\":");
     const ver = try std.fmt.allocPrint(allocator, "{d}", .{current_transcript_version});
     defer allocator.free(ver);
@@ -200,9 +225,9 @@ fn renderTranscriptJsonl(
     try out.appendSlice(allocator, "}");
     try out.append(allocator, '\n');
 
-    // One message per line.
+    // One message per line — v1.33.0 Claude-Code-compatible shape.
     for (transcript.messages.items) |m| {
-        try appendMessageJson(out, allocator, io, store_dir, m);
+        try appendMessageJson(out, allocator, io, store_dir, m, session_id);
         try out.append(allocator, '\n');
     }
 
@@ -417,10 +442,13 @@ fn parseTranscriptJsonl(
 
         // v1.32.0 — typed non-message lines. The meta header carries
         // `type:"meta"`; the cost-state aggregate carries
-        // `type:"cost-state"`. Messages have NO `type` field, so any
-        // line with a recognized non-message `type` is skipped here.
+        // `type:"cost-state"`. v1.33.0 — message lines now ALSO carry a
+        // `type` field (`"user"` or `"assistant"`), so we only skip
+        // lines whose `type` is a recognized bookkeeping kind.
         // Unknown `type` values are also skipped (forward-compat) rather
-        // than mis-parsed as empty user messages.
+        // than mis-parsed as empty user messages — UNLESS the type is
+        // `"user"` or `"assistant"`, which are the v5 message record
+        // types.
         const type_str = strOpt(obj, "type") orelse "";
         if (type_str.len > 0) {
             // Validate the schema version whenever we see a meta line,
@@ -436,9 +464,15 @@ fn parseTranscriptJsonl(
                 transcript.cost_state = parseCostState(obj);
             }
             first_line = false;
-            // All typed lines (meta, cost-state, …) are bookkeeping —
-            // they are not conversation messages, so skip them.
-            continue;
+            // v1.33.0 — `user`/`assistant` are message record types,
+            // not bookkeeping. Fall through to the message parser.
+            if (std.mem.eql(u8, type_str, "user") or std.mem.eql(u8, type_str, "assistant")) {
+                // handled below
+            } else {
+                // All other typed lines (meta, cost-state, …) are
+                // bookkeeping — they are not conversation messages.
+                continue;
+            }
         }
         first_line = false;
 
@@ -523,21 +557,40 @@ pub fn sha256Hex(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 
 // ─── JSON helpers ─────────────────────────────────────────────────
 
+// v1.33.0 — JSON field extraction helpers (jsonInt, jsonFloat, jsonStr,
+// jsonBool, jsonObj, jsonArr, jsonF64Value) are now shared from
+// `ai/utils.zig`. The local `strOpt` is kept for backward compat with
+// existing call sites that use it; new code should prefer `ai.utils.jsonStr`.
 fn strOpt(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    if (o.get(key)) |v| if (v == .string) return v.string;
-    return null;
+    return ai.utils.jsonStr(o, key);
 }
 
-/// Extract an f64 from a JSON value that may be either `.float`
-/// or `.integer` (whole-number costs serialized as `0` or `1` are
-/// tagged `.integer` by the JSON parser). Returns `null` for any
-/// other variant.
-fn jsonF64(v: std.json.Value) ?f64 {
-    return switch (v) {
-        .float => v.float,
-        .integer => @floatFromInt(v.integer),
-        else => null,
-    };
+/// Format an epoch-millisecond timestamp as a Claude-Code-compatible
+/// ISO-8601 string: `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC, millisecond
+/// precision, trailing `Z`). Uses `std.time.epoch` for the
+/// epoch-seconds → year/month/day/hour/minute/second conversion.
+fn formatIso8601(ts_ms: i64, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    const ms: u64 = if (ts_ms < 0) 0 else @intCast(ts_ms);
+    const total_sec: u64 = ms / 1000;
+    const millis: u64 = ms % 1000;
+
+    const ep = std.time.epoch.EpochSeconds{ .secs = total_sec };
+    const ed = ep.getEpochDay();
+    const ds = ep.getDaySeconds();
+    const yd = ed.calculateYearDay();
+    const md = yd.calculateMonthDay();
+
+    const s = try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        @as(u32, yd.year),
+        @as(u32, @intFromEnum(md.month)),
+        @as(u32, md.day_index) + 1,
+        @as(u32, ds.getHoursIntoDay()),
+        @as(u32, ds.getMinutesIntoHour()),
+        @as(u32, ds.getSecondsIntoMinute()),
+        millis,
+    });
+    defer allocator.free(s);
+    try buf.appendSlice(allocator, s);
 }
 
 fn appendMessageJson(
@@ -546,41 +599,86 @@ fn appendMessageJson(
     io: std.Io,
     store_dir: []const u8,
     m: ai.types.Message,
+    session_id: ?[]const u8,
 ) !void {
-    try buf.appendSlice(allocator, "{");
+    // v1.33.0 — Claude-Code-compatible record shape:
+    //   {"type":"user"|"assistant","sessionId":…,"timestamp":"ISO","message":{…}}
+    // tool_result messages are emitted as `type:"user"` records whose
+    // content is a `tool_result` block, matching Claude Code exactly.
+    const record_type: []const u8 = switch (m.role) {
+        .user, .tool_result => "user",
+        .assistant => "assistant",
+        .custom => "user",
+    };
+    try buf.appendSlice(allocator, "{\"type\":");
+    try appendJsonStr(buf, allocator, record_type);
+    if (session_id) |sid| if (sid.len > 0) {
+        try buf.appendSlice(allocator, ",\"sessionId\":");
+        try appendJsonStr(buf, allocator, sid);
+    };
+    try buf.appendSlice(allocator, ",\"timestamp\":");
+    try buf.append(allocator, '"');
+    try formatIso8601(m.timestamp, buf, allocator);
+    try buf.append(allocator, '"');
+
+    // `message` wrapper.
+    try buf.appendSlice(allocator, ",\"message\":{");
     const role_name = switch (m.role) {
         .user => "user",
         .assistant => "assistant",
-        .tool_result => "toolResult",
+        .tool_result => "user",
         .custom => m.custom_role orelse "custom",
     };
     try buf.appendSlice(allocator, "\"role\":");
     try appendJsonStr(buf, allocator, role_name);
-    try appendJsonNumField(buf, allocator, ",\"timestamp\":", m.timestamp);
 
-    if (m.tool_call_id) |tid| {
-        try buf.appendSlice(allocator, ",\"toolCallId\":");
-        try appendJsonStr(buf, allocator, tid);
-    }
-    if (m.is_error) try buf.appendSlice(allocator, ",\"isError\":true");
+    // v1.33.0 — `isError` at the message-wrapper level is only emitted
+    // for non-tool_result rows. For tool_result, the `is_error` flag is
+    // placed inside the `tool_result` content block below (matching
+    // Claude Code's shape) to avoid duplicate/conflicting keys.
+    if (m.is_error and m.role != .tool_result) try buf.appendSlice(allocator, ",\"isError\":true");
 
     try buf.appendSlice(allocator, ",\"content\":[");
-    for (m.content, 0..) |cb, i| {
-        if (i > 0) try buf.appendSlice(allocator, ",");
-        try appendContentBlockJsonMaybeExtern(buf, allocator, io, store_dir, cb);
+    if (m.role == .tool_result) {
+        // Claude Code serializes a tool result as a `tool_result` content
+        // block inside a `user` message: {"type":"tool_result",
+        // "tool_use_id":"…","content":[{"type":"text","text":"…"}]}
+        // The franky Message carries `tool_call_id` at the message level
+        // and the result text as content blocks; we wrap them here.
+        try buf.appendSlice(allocator, "{\"type\":\"tool_result\"");
+        if (m.tool_call_id) |tid| {
+            try buf.appendSlice(allocator, ",\"tool_use_id\":");
+            try appendJsonStr(buf, allocator, tid);
+        }
+        if (m.is_error) try buf.appendSlice(allocator, ",\"is_error\":true");
+        try buf.appendSlice(allocator, ",\"content\":[");
+        for (m.content, 0..) |cb, i| {
+            if (i > 0) try buf.appendSlice(allocator, ",");
+            try appendContentBlockJsonMaybeExtern(buf, allocator, io, store_dir, cb);
+        }
+        try buf.appendSlice(allocator, "]}");
+    } else {
+        for (m.content, 0..) |cb, i| {
+            if (i > 0) try buf.appendSlice(allocator, ",");
+            try appendContentBlockJsonMaybeExtern(buf, allocator, io, store_dir, cb);
+        }
     }
     try buf.appendSlice(allocator, "]");
 
     if (m.stop_reason) |sr| {
-        try buf.appendSlice(allocator, ",\"stopReason\":");
-        try appendJsonStr(buf, allocator, sr.toString());
-    }
-    if (m.provider) |p| {
-        try buf.appendSlice(allocator, ",\"provider\":");
-        try appendJsonStr(buf, allocator, p);
+        try buf.appendSlice(allocator, ",\"stop_reason\":");
+        try appendJsonStr(buf, allocator, sr.toClaudeCodeString());
     }
     if (m.model) |p| {
         try buf.appendSlice(allocator, ",\"model\":");
+        try appendJsonStr(buf, allocator, p);
+    }
+    // v1.33.0 — `provider` and `api` are franky-specific extensions
+    // emitted inside the `message` wrapper. Claude Code doesn't write
+    // them, but downstream tooling ignores unknown keys and franky's
+    // own read path restores them.
+    if (m.provider) |p| {
+        try buf.appendSlice(allocator, ",\"provider\":");
         try appendJsonStr(buf, allocator, p);
     }
     if (m.api) |p| {
@@ -588,75 +686,87 @@ fn appendMessageJson(
         try appendJsonStr(buf, allocator, p);
     }
     // v1.31.0 — Message.Usage (per-turn token counts + USD costs).
+    // v1.33.0 — Claude-Code-compatible key names inside `message.usage`.
     // Only emit when at least one field is non-default; pre-v1.31
     // transcripts (and user/tool_result rows that never carry usage)
     // round-trip unchanged.
     if (m.usage) |u| if (!u.isEmpty()) {
         try buf.appendSlice(allocator, ",\"usage\":{");
         var first = true;
-        if (u.input != 0) {
-            try appendJsonU64Field(buf, allocator, "\"input\":", u.input);
+        // Claude Code reports only the uncached portion in
+        // `input_tokens`. Franky's `Usage.input` includes cached
+        // tokens (the provider's total `prompt_tokens`), so subtract
+        // cache_read + cache_write (clamped ≥ 0). Saturating add guards
+        // against u64 overflow on adversarial inputs.
+        const cached = u.cache_read +| u.cache_write;
+        const uncached_input: u64 = if (u.input > cached) u.input - cached else 0;
+        if (uncached_input != 0) {
+            try appendJsonU64Field(buf, allocator, "\"input_tokens\":", uncached_input);
             first = false;
         }
         if (u.output != 0) {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"output\":", u.output);
+            try appendJsonU64Field(buf, allocator, "\"output_tokens\":", u.output);
             first = false;
         }
         if (u.cache_read != 0) {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cacheRead\":", u.cache_read);
+            try appendJsonU64Field(buf, allocator, "\"cache_read_input_tokens\":", u.cache_read);
             first = false;
         }
         if (u.cache_write != 0) {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cacheWrite\":", u.cache_write);
+            try appendJsonU64Field(buf, allocator, "\"cache_creation_input_tokens\":", u.cache_write);
             first = false;
         }
+        // Franky-specific extensions (not in Claude Code's usage) —
+        // emitted with snake_case names for consistency. Downstream
+        // readers that only know Claude's keys ignore these.
         if (u.thinking_tokens != 0) {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"thinkingTokens\":", u.thinking_tokens);
+            try appendJsonU64Field(buf, allocator, "\"thinking_tokens\":", u.thinking_tokens);
             first = false;
         }
         if (u.cache_creation_ephemeral_5m != 0) {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cacheCreationEphemeral5m\":", u.cache_creation_ephemeral_5m);
+            try appendJsonU64Field(buf, allocator, "\"cache_creation_5m_input_tokens\":", u.cache_creation_ephemeral_5m);
             first = false;
         }
         if (u.cache_creation_ephemeral_1h != 0) {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cacheCreationEphemeral1h\":", u.cache_creation_ephemeral_1h);
+            try appendJsonU64Field(buf, allocator, "\"cache_creation_1h_input_tokens\":", u.cache_creation_ephemeral_1h);
             first = false;
         }
         if (u.web_search_requests != 0) {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"webSearchRequests\":", u.web_search_requests);
+            try appendJsonU64Field(buf, allocator, "\"web_search_requests\":", u.web_search_requests);
             first = false;
         }
         if (u.cost_input) |ci| {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"costInput\":", ci);
+            try appendJsonF64Field(buf, allocator, "\"cost_input\":", ci);
             first = false;
         }
         if (u.cost_output) |co| {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"costOutput\":", co);
+            try appendJsonF64Field(buf, allocator, "\"cost_output\":", co);
             first = false;
         }
         if (u.cost_cache_read) |cr| {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"costCacheRead\":", cr);
+            try appendJsonF64Field(buf, allocator, "\"cost_cache_read\":", cr);
             first = false;
         }
         if (u.cost_cache_write) |cw| {
             if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"costCacheWrite\":", cw);
+            try appendJsonF64Field(buf, allocator, "\"cost_cache_write\":", cw);
             first = false;
         }
         try buf.append(allocator, '}');
     };
-    // v1.29.0 — Message.Diagnostics. Only emit when at least one
-    // field is non-default; pre-v1.29 transcripts round-trip
+    // v1.29.0 — Message.Diagnostics. Franky-specific; emitted inside
+    // the `message` wrapper under `diagnostics`. Only emit when at
+    // least one field is non-default; pre-v1.29 transcripts round-trip
     // unchanged.
     if (m.diagnostics) |d| if (!d.isEmpty()) {
         try buf.appendSlice(allocator, ",\"diagnostics\":{");
@@ -708,6 +818,9 @@ fn appendMessageJson(
         }
         try buf.append(allocator, '}');
     };
+    // Close `message` wrapper.
+    try buf.appendSlice(allocator, "}");
+    // Close record.
     try buf.appendSlice(allocator, "}");
 }
 
@@ -777,7 +890,13 @@ fn renderCostStateLine(
             gop.value_ptr.* = acc;
         }
         const acc = gop.value_ptr.*;
-        acc.input_tokens += u.input;
+        // v1.33.0 — Claude Code reports only the uncached portion in
+        // `inputTokens`. Franky's `Usage.input` includes cached tokens,
+        // so subtract cache_read + cache_write (clamped ≥ 0) per turn.
+        // Saturating add guards against u64 overflow.
+        const cached = u.cache_read +| u.cache_write;
+        const uncached_input: u64 = if (u.input > cached) u.input - cached else 0;
+        acc.input_tokens += uncached_input;
         acc.output_tokens += u.output;
         acc.thinking_tokens += u.thinking_tokens;
         acc.cache_read_input_tokens += u.cache_read;
@@ -843,6 +962,12 @@ fn renderCostStateLine(
 }
 
 /// Render a content block's canonical JSON inline. Pure — no IO.
+/// v1.33.0 — block `type` names match Claude Code (`tool_use` rather
+/// than `toolCall`; the tool-call arguments field is `input` rather
+/// than `arguments`). Text/thinking/image blocks are unchanged.
+/// `appendContentBlockJson` is also called from non-transcript paths
+/// (e.g. proxy snapshot tests); those callers have been updated to
+/// expect the new names where they assert on them.
 pub fn appendContentBlockJson(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -877,15 +1002,16 @@ pub fn appendContentBlockJson(
             try appendJsonStr(buf, allocator, t.mime_type);
         },
         .tool_call => |t| {
-            try appendJsonStr(buf, allocator, "toolCall");
+            try appendJsonStr(buf, allocator, "tool_use");
             try buf.appendSlice(allocator, ",\"id\":");
             try appendJsonStr(buf, allocator, t.id);
             try buf.appendSlice(allocator, ",\"name\":");
             try appendJsonStr(buf, allocator, t.name);
-            // arguments is emitted as a raw JSON value (we trust it to be
+            // `input` is emitted as a raw JSON value (we trust it to be
             // valid JSON — it came from the model via the partial-json
             // parser or, on round-trip, from a prior serialization).
-            try buf.appendSlice(allocator, ",\"arguments\":");
+            // Claude Code uses `input`; franky v4 used `arguments`.
+            try buf.appendSlice(allocator, ",\"input\":");
             if (t.arguments_json.len == 0) {
                 try buf.appendSlice(allocator, "{}");
             } else {
@@ -925,21 +1051,68 @@ fn appendContentBlockJsonMaybeExtern(
     try buf.appendSlice(allocator, "\"}");
 }
 
+/// Parse an ISO-8601 timestamp (`YYYY-MM-DDTHH:MM:SS.mmmZ`) into
+/// epoch milliseconds. Returns null for malformed input. Accepts
+/// timestamps without milliseconds (`.mmm` omitted) for robustness.
+fn parseIso8601(s: []const u8) ?i64 {
+    // Minimal calendar-days → epoch-days (Howard Hinnant).
+    if (s.len < 19) return null;
+    const year = std.fmt.parseInt(i64, s[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u64, s[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u64, s[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(u64, s[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(u64, s[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(u64, s[17..19], 10) catch return null;
+
+    // days_from_civil — https://howardhinnant.github.io/date_algorithms.html
+    const y: i64 = if (month <= 2) year - 1 else year;
+    const m: u64 = if (month <= 2) month + 9 else month - 3;
+    const era: i64 = @divFloor(y, 400);
+    const yoe: u64 = @intCast(y - era * 400); // [0, 399]
+    const doy: u64 = (153 * m + 2) / 5 + day - 1; // [0, 365]
+    const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    const days: i64 = era * 146097 + @as(i64, @intCast(doe)) - 719468;
+
+    var millis: u64 = 0;
+    if (s.len > 20 and s[19] == '.') {
+        // Parse up to 3 fractional digits (milliseconds).
+        var i: usize = 20;
+        var digits: u64 = 0;
+        while (i < s.len and digits < 3) : (i += 1) {
+            if (s[i] < '0' or s[i] > '9') break;
+            millis = millis * 10 + @as(u64, s[i] - '0');
+            digits += 1;
+        }
+        // If fewer than 3 digits, scale up (e.g. `.5` → 500ms).
+        while (digits < 3) : (digits += 1) millis *|= 10;
+    }
+
+    return days * 86_400_000 +
+        @as(i64, @intCast(hour)) * 3_600_000 +
+        @as(i64, @intCast(minute)) * 60_000 +
+        @as(i64, @intCast(second)) * 1_000 +
+        @as(i64, @intCast(millis));
+}
+
 fn parseMessage(
     allocator: std.mem.Allocator,
     io: std.Io,
     store_dir: []const u8,
     o: std.json.ObjectMap,
 ) !ai.types.Message {
-    const role_str = strOpt(o, "role") orelse "user";
-    const role: ai.types.Role = if (std.mem.eql(u8, role_str, "user"))
-        .user
-    else if (std.mem.eql(u8, role_str, "assistant"))
-        .assistant
-    else if (std.mem.eql(u8, role_str, "toolResult"))
-        .tool_result
-    else
-        .custom;
+    // v1.33.0 — v5 records wrap the message inside `"message":{…}` and
+    // carry `type`/`sessionId`/`timestamp` at the record level. Legacy
+    // v4 records have role/content/usage at the top level. Detect the
+    // wrapper and parse from the right place.
+    const msg_obj: std.json.ObjectMap = blk: {
+        if (o.get("message")) |mv| if (mv == .object) break :blk mv.object;
+        break :blk o; // legacy v4 — fields are top-level
+    };
+
+    // Role: v5 uses `message.role`; v4 uses top-level `role`. For v5
+    // `user` records that contain a `tool_result` content block, the
+    // franky-internal role is `.tool_result`.
+    const role_src = strOpt(msg_obj, "role") orelse strOpt(o, "role") orelse "user";
 
     var content: std.ArrayList(ai.types.ContentBlock) = .empty;
     errdefer {
@@ -947,18 +1120,56 @@ fn parseMessage(
         content.deinit(allocator);
     }
 
-    if (o.get("content")) |cv| if (cv == .array) {
+    // Extracted from a tool_result content block (v5 shape).
+    var tool_call_id_opt: ?[]const u8 = null;
+    errdefer if (tool_call_id_opt) |t| allocator.free(t);
+    var is_error_from_block = false;
+
+    if (msg_obj.get("content")) |cv| if (cv == .array) {
         for (cv.array.items) |v| {
             if (v != .object) continue;
-            const cb = try parseContentBlockMaybeDeref(allocator, io, store_dir, v.object);
-            try content.append(allocator, cb);
+            const block_obj = v.object;
+            const block_type = strOpt(block_obj, "type") orelse "text";
+            if (std.mem.eql(u8, block_type, "tool_result")) {
+                // v5 tool_result: extract tool_use_id → message-level,
+                // and inline the nested `content` array as the message's
+                // content blocks.
+                if (strOpt(block_obj, "tool_use_id")) |tid| {
+                    tool_call_id_opt = try allocator.dupe(u8, tid);
+                }
+                if (block_obj.get("is_error")) |ie| if (ie == .bool) {
+                    is_error_from_block = ie.bool;
+                } else if (block_obj.get("isError")) |ie2| if (ie2 == .bool) {
+                    is_error_from_block = ie2.bool;
+                };
+                if (block_obj.get("content")) |inner| if (inner == .array) {
+                    for (inner.array.items) |iv| {
+                        if (iv != .object) continue;
+                        const cb = try parseContentBlockMaybeDeref(allocator, io, store_dir, iv.object);
+                        try content.append(allocator, cb);
+                    }
+                };
+            } else {
+                const cb = try parseContentBlockMaybeDeref(allocator, io, store_dir, block_obj);
+                try content.append(allocator, cb);
+            }
         }
+    };
+
+    // Determine the internal role. A v5 `user` record with a tool_result
+    // block becomes `.tool_result`; a legacy `toolResult` stays as-is.
+    const role: ai.types.Role = blk: {
+        if (tool_call_id_opt != null) break :blk .tool_result;
+        if (std.mem.eql(u8, role_src, "user")) break :blk .user;
+        if (std.mem.eql(u8, role_src, "assistant")) break :blk .assistant;
+        if (std.mem.eql(u8, role_src, "toolResult")) break :blk .tool_result;
+        break :blk .custom;
     };
 
     // v1.29.0 — Diagnostics round-trip. Old transcripts without
     // the field decode as null and round-trip cleanly.
     var diag_opt: ?ai.types.Diagnostics = null;
-    if (o.get("diagnostics")) |dv| if (dv == .object) {
+    if (msg_obj.get("diagnostics")) |dv| if (dv == .object) {
         const dobj = dv.object;
         var diag: ai.types.Diagnostics = .{};
         if (dobj.get("traceId")) |v| if (v == .string) {
@@ -991,63 +1202,84 @@ fn parseMessage(
         diag_opt = diag;
     };
 
-    // v1.31.0 — Usage round-trip. Old transcripts without the
-    // field decode as null and round-trip cleanly. Token counts
-    // arrive as JSON integers; cost fields as JSON floats.
+    // v1.31.0 — Usage round-trip. v1.33.0 — accept Claude-Code key
+    // names (`input_tokens` etc.) in addition to franky v4 names
+    // (`input` etc.). Token counts arrive as JSON integers; cost
+    // fields as JSON floats.
     var usage_opt: ?ai.types.Usage = null;
-    if (o.get("usage")) |uv| if (uv == .object) {
+    if (msg_obj.get("usage")) |uv| if (uv == .object) {
         const uobj = uv.object;
         var usage: ai.types.Usage = .{};
-        if (uobj.get("input")) |v| if (v == .integer) {
-            usage.input = @intCast(v.integer);
-        };
-        if (uobj.get("output")) |v| if (v == .integer) {
-            usage.output = @intCast(v.integer);
-        };
-        if (uobj.get("cacheRead")) |v| if (v == .integer) {
-            usage.cache_read = @intCast(v.integer);
-        };
-        if (uobj.get("cacheWrite")) |v| if (v == .integer) {
-            usage.cache_write = @intCast(v.integer);
-        };
-        if (uobj.get("thinkingTokens")) |v| if (v == .integer) {
-            usage.thinking_tokens = @intCast(v.integer);
-        };
-        if (uobj.get("cacheCreationEphemeral5m")) |v| if (v == .integer) {
-            usage.cache_creation_ephemeral_5m = @intCast(v.integer);
-        };
-        if (uobj.get("cacheCreationEphemeral1h")) |v| if (v == .integer) {
-            usage.cache_creation_ephemeral_1h = @intCast(v.integer);
-        };
-        if (uobj.get("webSearchRequests")) |v| if (v == .integer) {
-            usage.web_search_requests = @intCast(v.integer);
-        };
-        if (uobj.get("costInput")) |v| {
-            usage.cost_input = jsonF64(v);
-        }
-        if (uobj.get("costOutput")) |v| {
-            usage.cost_output = jsonF64(v);
-        }
-        if (uobj.get("costCacheRead")) |v| {
-            usage.cost_cache_read = jsonF64(v);
-        }
-        if (uobj.get("costCacheWrite")) |v| {
-            usage.cost_cache_write = jsonF64(v);
-        }
+        // v5 `input_tokens` is the uncached portion; v4 `input` is the
+        // total (incl. cached). We restore the TOTAL into `Usage.input`
+        // so the internal model sees the provider-reported total.
+        const input_from_v4 = ai.utils.jsonInt(uobj, "input");
+        const input_from_v5 = ai.utils.jsonInt(uobj, "input_tokens");
+        usage.output = ai.utils.jsonInt(uobj, "output") orelse ai.utils.jsonInt(uobj, "output_tokens") orelse 0;
+        usage.cache_read = ai.utils.jsonInt(uobj, "cacheRead") orelse ai.utils.jsonInt(uobj, "cache_read_input_tokens") orelse 0;
+        usage.cache_write = ai.utils.jsonInt(uobj, "cacheWrite") orelse ai.utils.jsonInt(uobj, "cache_creation_input_tokens") orelse 0;
+        usage.thinking_tokens = ai.utils.jsonInt(uobj, "thinkingTokens") orelse ai.utils.jsonInt(uobj, "thinking_tokens") orelse 0;
+        usage.cache_creation_ephemeral_5m = ai.utils.jsonInt(uobj, "cacheCreationEphemeral5m") orelse ai.utils.jsonInt(uobj, "cache_creation_5m_input_tokens") orelse 0;
+        usage.cache_creation_ephemeral_1h = ai.utils.jsonInt(uobj, "cacheCreationEphemeral1h") orelse ai.utils.jsonInt(uobj, "cache_creation_1h_input_tokens") orelse 0;
+        usage.web_search_requests = ai.utils.jsonInt(uobj, "webSearchRequests") orelse ai.utils.jsonInt(uobj, "web_search_requests") orelse 0;
+        usage.cost_input = ai.utils.jsonFloat(uobj, "costInput") orelse ai.utils.jsonFloat(uobj, "cost_input");
+        usage.cost_output = ai.utils.jsonFloat(uobj, "costOutput") orelse ai.utils.jsonFloat(uobj, "cost_output");
+        usage.cost_cache_read = ai.utils.jsonFloat(uobj, "costCacheRead") orelse ai.utils.jsonFloat(uobj, "cost_cache_read");
+        usage.cost_cache_write = ai.utils.jsonFloat(uobj, "costCacheWrite") orelse ai.utils.jsonFloat(uobj, "cost_cache_write");
+        // Fix up: if we only had v5 `input_tokens` (uncached), add back
+        // the cached tokens to restore the provider-reported total.
+        usage.input = input_from_v4 orelse (input_from_v5 orelse 0) + usage.cache_read + usage.cache_write;
         usage_opt = usage;
+    };
+
+    // Timestamp: v5 is ISO-8601 string at record level; v4 is epoch-ms
+    // integer at message level (which is `o` when no wrapper).
+    const timestamp: i64 = blk: {
+        const ts_src = if (o.get("timestamp")) |v| v else msg_obj.get("timestamp") orelse break :blk 0;
+        if (ts_src == .string) break :blk parseIso8601(ts_src.string) orelse 0;
+        if (ts_src == .integer) break :blk ts_src.integer;
+        break :blk 0;
+    };
+
+    // stop_reason: v5 uses `stop_reason`; v4 uses `stopReason`.
+    const stop_reason: ?ai.types.StopReason = blk: {
+        if (msg_obj.get("stop_reason")) |v| if (v == .string) {
+            break :blk ai.types.StopReason.fromString(v.string);
+        };
+        if (msg_obj.get("stopReason")) |v| if (v == .string) {
+            break :blk ai.types.StopReason.fromString(v.string);
+        };
+        break :blk null;
+    };
+
+    // tool_call_id: v5 extracts from the tool_result content block
+    // (already done above); v4 carries it at the message top level.
+    const tool_call_id: ?[]const u8 = blk: {
+        if (tool_call_id_opt) |t| break :blk t;
+        if (o.get("toolCallId")) |v| if (v == .string) {
+            break :blk try allocator.dupe(u8, v.string);
+        };
+        break :blk null;
+    };
+
+    const is_error: bool = blk: {
+        if (is_error_from_block) break :blk true;
+        if (o.get("isError")) |v| if (v == .bool) break :blk v.bool;
+        if (msg_obj.get("isError")) |v| if (v == .bool) break :blk v.bool;
+        break :blk false;
     };
 
     return .{
         .role = role,
         .content = try content.toOwnedSlice(allocator),
-        .timestamp = if (o.get("timestamp")) |v| v.integer else 0,
-        .stop_reason = if (o.get("stopReason")) |v| ai.types.StopReason.fromString(v.string) else null,
-        .tool_call_id = if (o.get("toolCallId")) |v| try allocator.dupe(u8, v.string) else null,
-        .is_error = if (o.get("isError")) |v| (v == .bool and v.bool) else false,
-        .provider = if (o.get("provider")) |v| try allocator.dupe(u8, v.string) else null,
-        .model = if (o.get("model")) |v| try allocator.dupe(u8, v.string) else null,
-        .api = if (o.get("api")) |v| try allocator.dupe(u8, v.string) else null,
-        .custom_role = if (role == .custom) try allocator.dupe(u8, role_str) else null,
+        .timestamp = timestamp,
+        .stop_reason = stop_reason,
+        .tool_call_id = tool_call_id,
+        .is_error = is_error,
+        .provider = if (ai.utils.jsonStr(msg_obj, "provider")) |s| try allocator.dupe(u8, s) else if (ai.utils.jsonStr(o, "provider")) |s| try allocator.dupe(u8, s) else null,
+        .model = if (ai.utils.jsonStr(msg_obj, "model")) |s| try allocator.dupe(u8, s) else if (ai.utils.jsonStr(o, "model")) |s| try allocator.dupe(u8, s) else null,
+        .api = if (ai.utils.jsonStr(msg_obj, "api")) |s| try allocator.dupe(u8, s) else if (ai.utils.jsonStr(o, "api")) |s| try allocator.dupe(u8, s) else null,
+        .custom_role = if (role == .custom) try allocator.dupe(u8, role_src) else null,
         .usage = usage_opt,
         .diagnostics = diag_opt,
     };
@@ -1106,8 +1338,12 @@ fn parseContentBlock(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.ty
             .mime_type = try allocator.dupe(u8, strOpt(o, "mimeType") orelse "application/octet-stream"),
         } };
     }
-    if (std.mem.eql(u8, type_str, "toolCall")) {
-        const args_str: []u8 = if (o.get("arguments")) |av|
+    if (std.mem.eql(u8, type_str, "toolCall") or std.mem.eql(u8, type_str, "tool_use")) {
+        // v1.33.0 — Claude Code uses `tool_use` with an `input` field;
+        // franky v4 used `toolCall` with `arguments`. Accept both.
+        const args_str: []u8 = if (o.get("input")) |av|
+            try std.json.Stringify.valueAlloc(allocator, av, .{})
+        else if (o.get("arguments")) |av|
             try std.json.Stringify.valueAlloc(allocator, av, .{})
         else
             try allocator.dupe(u8, "{}");

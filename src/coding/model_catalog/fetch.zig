@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const models = @import("models.zig");
+const utils = @import("../../ai/utils.zig");
 
 pub const FetchError = error{
     MalformedJson,
@@ -49,8 +50,8 @@ pub fn parseAnthropic(allocator: std.mem.Allocator, bytes: []const u8) FetchErro
     for (data.array.items) |item| {
         if (item != .object) continue;
         const o = item.object;
-        const id = stringField(o, "id") orelse continue;
-        const display_name = stringField(o, "display_name") orelse id;
+        const id = utils.jsonStr(o, "id") orelse continue;
+        const display_name = utils.jsonStr(o, "display_name") orelse id;
         try out.append(allocator, .{
             .id = try allocator.dupe(u8, id),
             .provider = try allocator.dupe(u8, "anthropic"),
@@ -84,7 +85,7 @@ pub fn parseOpenAI(allocator: std.mem.Allocator, bytes: []const u8) FetchError![
 
     for (data.array.items) |item| {
         if (item != .object) continue;
-        const id = stringField(item.object, "id") orelse continue;
+        const id = utils.jsonStr(item.object, "id") orelse continue;
         try out.append(allocator, .{
             .id = try allocator.dupe(u8, id),
             .provider = try allocator.dupe(u8, "openai"),
@@ -188,14 +189,14 @@ pub fn parseOllama(allocator: std.mem.Allocator, bytes: []const u8) FetchError![
     for (data.array.items) |item| {
         if (item != .object) continue;
         const o = item.object;
-        const name = stringField(o, "name") orelse continue;
+        const name = utils.jsonStr(o, "name") orelse continue;
 
         // Display name: include the parameter size when reported,
         // e.g. "llama3.2:1b (1.2B)".
         const param_size: ?[]const u8 = blk: {
             const details = o.get("details") orelse break :blk null;
             if (details != .object) break :blk null;
-            break :blk stringField(details.object, "parameter_size");
+            break :blk utils.jsonStr(details.object, "parameter_size");
         };
         const display_name = if (param_size) |p|
             try std.fmt.allocPrint(allocator, "{s} ({s})", .{ name, p })
@@ -274,7 +275,7 @@ pub fn parseOllamaShow(allocator: std.mem.Allocator, bytes: []const u8) FetchErr
     // model_info.<arch>.context_length + general.parameter_count
     if (root.get("model_info")) |mi| if (mi == .object) {
         const info = mi.object;
-        if (stringField(info, "general.architecture")) |arch| {
+        if (utils.jsonStr(info, "general.architecture")) |arch| {
             const ctx_key = try std.fmt.allocPrint(scratch.allocator(), "{s}.context_length", .{arch});
             if (info.get(ctx_key)) |v| switch (v) {
                 .integer => |i| {
@@ -359,10 +360,10 @@ pub fn parseGoogleGemini(allocator: std.mem.Allocator, bytes: []const u8) FetchE
     for (data.array.items) |item| {
         if (item != .object) continue;
         const o = item.object;
-        const raw_name = stringField(o, "name") orelse continue;
+        const raw_name = utils.jsonStr(o, "name") orelse continue;
         const id = stripPrefix(raw_name, "models/");
         if (id.len == 0) continue;
-        const display_name = stringField(o, "displayName") orelse id;
+        const display_name = utils.jsonStr(o, "displayName") orelse id;
         const ctx_window = u32Field(o, "inputTokenLimit");
         const max_out = u32Field(o, "outputTokenLimit");
         const supports_generate = arrayContainsString(o, "supportedGenerationMethods", "generateContent");
@@ -478,13 +479,7 @@ fn freeAndDeinit(allocator: std.mem.Allocator, list: *std.ArrayList(models.Entry
     list.deinit(allocator);
 }
 
-fn stringField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    if (o.get(key)) |v| {
-        if (v == .string) return v.string;
-    }
-    return null;
-}
-
+// v1.33.0 — `stringField` moved to `ai/utils.zig` as `jsonStr`.
 fn u32Field(o: std.json.ObjectMap, key: []const u8) u32 {
     if (o.get(key)) |v| switch (v) {
         .integer => |i| if (i >= 0) return @intCast(i),

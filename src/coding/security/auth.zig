@@ -29,6 +29,7 @@
 //! round-tripping such externally-minted records.
 
 const std = @import("std");
+const utils = @import("../../ai/utils.zig");
 
 pub const AuthError = error{
     InvalidMode,
@@ -122,9 +123,9 @@ pub fn load(
     if (parsed.value != .object) return AuthError.MalformedJson;
     const root = parsed.value.object;
 
-    if (root.get("version")) |v| if (v == .integer) {
-        auth.version = @intCast(v.integer);
-    };
+    if (utils.jsonInt(root, "version")) |v| {
+        auth.version = @intCast(v);
+    }
 
     if (root.get("providers")) |providers_v| if (providers_v == .object) {
         var pit = providers_v.object.iterator();
@@ -138,21 +139,21 @@ pub fn load(
             const atype: ProviderAuthType = if (std.mem.eql(u8, type_val.string, "oauth")) .oauth else .api_key;
 
             var pa = ProviderAuth{ .type = atype };
-            if (obj.object.get("apiKey")) |v| if (v == .string) {
-                pa.api_key = try allocator.dupe(u8, v.string);
-            };
-            if (obj.object.get("accessToken")) |v| if (v == .string) {
-                pa.access_token = try allocator.dupe(u8, v.string);
-            };
-            if (obj.object.get("refreshToken")) |v| if (v == .string) {
-                pa.refresh_token = try allocator.dupe(u8, v.string);
-            };
-            if (obj.object.get("expiresAt")) |v| if (v == .string) {
-                pa.expires_at = try allocator.dupe(u8, v.string);
-            };
-            if (obj.object.get("scope")) |v| if (v == .string) {
-                pa.scope = try allocator.dupe(u8, v.string);
-            };
+            if (utils.jsonStr(obj.object, "apiKey")) |s| {
+                pa.api_key = try allocator.dupe(u8, s);
+            }
+            if (utils.jsonStr(obj.object, "accessToken")) |s| {
+                pa.access_token = try allocator.dupe(u8, s);
+            }
+            if (utils.jsonStr(obj.object, "refreshToken")) |s| {
+                pa.refresh_token = try allocator.dupe(u8, s);
+            }
+            if (utils.jsonStr(obj.object, "expiresAt")) |s| {
+                pa.expires_at = try allocator.dupe(u8, s);
+            }
+            if (utils.jsonStr(obj.object, "scope")) |s| {
+                pa.scope = try allocator.dupe(u8, s);
+            }
 
             const owned_name = try allocator.dupe(u8, name);
             try auth.providers.put(owned_name, pa);
