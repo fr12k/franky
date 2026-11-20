@@ -162,6 +162,10 @@ const Session = struct {
     /// v0.30.0 — MCP client state for externally-proxied tools.
     /// null when --mcp-configs is not set. Owned by role_arena.
     mcp_client: ?*franky.coding.mcp.McpClient = null,
+    /// v3.x — shared HTTP client for the agent loop and subagents.
+    /// Pointer allocated on role_arena so the Session struct's
+    /// alignment is unaffected by Certificate.Bundle's alignment.
+    http_client: ?*ai.http.Client = null,
 
     fn deinit(self: *Session) void {
         self.transcript.deinit();
@@ -172,6 +176,8 @@ const Session = struct {
         // v3.2 — memory state (allocated on role_arena).
         if (self.memory_state) |ms| ms.deinit();
         if (self.mcp_client) |mc| mc.deinit();
+        // http_client is arena-allocated; role_arena.deinit() frees it.
+        if (self.http_client) |hc| hc.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -275,6 +281,16 @@ fn initSession(
     session.compression_ctx.ccr_store = &session.ccr_store;
     session.compression_ctx.stats = &session.compression_stats;
     session.web_search_ctx = .{ .environ_map = session.environ_map };
+    // v3.x — allocate shared HTTP client on the role arena.
+    {
+        const ra = session.role_arena.allocator();
+        const hc = try ra.create(ai.http.Client);
+        hc.* = .{ .allocator = allocator, .io = io };
+        _ = ai.http.setupClientFromEnv(hc, allocator, environ_map) catch |e| {
+            ai.log.log(.warn, "rpc", "proxy_setup_failed", "err={s}", .{@errorName(e)});
+        };
+        session.http_client = hc;
+    }
     session.session_gates = .{
         .role = &session.role_gate,
         .permissions = if (session.prompts_enabled) &session.permission_store else null,
@@ -466,6 +482,7 @@ fn initSession(
         // §6.6 — forward sub-agent events as JSON-RPC `event` notifications.
         .progress_fn = subagentProgressForward,
         .progress_userdata = session,
+        .http_client = session.http_client.?,
     };
     const final_tools = try config_mod.finalizeToolSet(ra, .{
         .base_tools = session.tools,
@@ -831,6 +848,7 @@ fn runPrompt(
                     .headers = session.attribution_headers,
                     .session_id = session.session_id,
                 },
+                .http_client = session.http_client.?,
             };
             // v3.x — bypass the vision capability gate when --force-image is set.
             lc.force_image = session.cfg.force_image;

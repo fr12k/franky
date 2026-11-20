@@ -377,6 +377,25 @@ fn runPrint(
     // rather than as a use-after-free mid-loop.
     try resolved.validate();
 
+    // v3.x — shared HTTP client for the parent agent loop AND subagents.
+    // Creating one client here (instead of inside `agentLoop`) lets us
+    // pass the same warm TLS connection pool to subagents, avoiding a
+    // new TLS handshake from a deeply nested thread (which can stall
+    // under gvisor's userspace netstack).
+    var shared_http_client = ai.http.Client{ .allocator = allocator, .io = io };
+    var shared_proxy_arena: ?std.heap.ArenaAllocator = null;
+    defer {
+        shared_http_client.deinit();
+        if (shared_proxy_arena) |*a| a.deinit();
+    }
+    shared_proxy_arena = ai.http.setupClientFromEnv(&shared_http_client, allocator, environ_map) catch |e| blk: {
+        ai.log.log(.warn, "print", "proxy_setup_failed", "err={s}", .{@errorName(e)});
+        break :blk null;
+    };
+    // Wire the shared client into the subagent Ctx so spawned subagents
+    // reuse it instead of creating their own.
+    resolved.subagent_ctx.http_client = &shared_http_client;
+
     var loop_cfg: agent.loop.Config = .{
         .model = model,
         .system_prompt = system_prompt,
@@ -408,6 +427,7 @@ fn runPrint(
             .headers = resolved.attribution_headers,
             .session_id = session_state.id(),
         },
+        .http_client = &shared_http_client,
     };
     // v3.x — bypass the vision capability gate when --force-image is set.
     loop_cfg.force_image = cfg.force_image;
