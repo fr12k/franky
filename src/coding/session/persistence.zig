@@ -279,7 +279,7 @@ fn renderTranscriptJsonl(
     defer allocator.free(ver);
     try out.appendSlice(allocator, ver);
     try out.appendSlice(allocator, ",\"branch\":");
-    try appendJsonStr(out, allocator, branch);
+    try ai.utils.appendJsonStr(out, allocator, branch);
     try out.appendSlice(allocator, "}");
     try out.append(allocator, '\n');
 
@@ -659,10 +659,10 @@ fn appendMessageJson(
         .custom => "user",
     };
     try buf.appendSlice(allocator, "{\"type\":");
-    try appendJsonStr(buf, allocator, record_type);
+    try ai.utils.appendJsonStr(buf, allocator, record_type);
     if (session_id) |sid| if (sid.len > 0) {
         try buf.appendSlice(allocator, ",\"sessionId\":");
-        try appendJsonStr(buf, allocator, sid);
+        try ai.utils.appendJsonStr(buf, allocator, sid);
     };
     try buf.appendSlice(allocator, ",\"timestamp\":");
     try buf.append(allocator, '"');
@@ -678,7 +678,7 @@ fn appendMessageJson(
         .custom => m.custom_role orelse "custom",
     };
     try buf.appendSlice(allocator, "\"role\":");
-    try appendJsonStr(buf, allocator, role_name);
+    try ai.utils.appendJsonStr(buf, allocator, role_name);
 
     // v1.33.0 — `isError` at the message-wrapper level is only emitted
     // for non-tool_result rows. For tool_result, the `is_error` flag is
@@ -696,7 +696,7 @@ fn appendMessageJson(
         try buf.appendSlice(allocator, "{\"type\":\"tool_result\"");
         if (m.tool_call_id) |tid| {
             try buf.appendSlice(allocator, ",\"tool_use_id\":");
-            try appendJsonStr(buf, allocator, tid);
+            try ai.utils.appendJsonStr(buf, allocator, tid);
         }
         if (m.is_error) try buf.appendSlice(allocator, ",\"is_error\":true");
         try buf.appendSlice(allocator, ",\"content\":[");
@@ -715,11 +715,11 @@ fn appendMessageJson(
 
     if (m.stop_reason) |sr| {
         try buf.appendSlice(allocator, ",\"stop_reason\":");
-        try appendJsonStr(buf, allocator, sr.toClaudeCodeString());
+        try ai.utils.appendJsonStr(buf, allocator, sr.toClaudeCodeString());
     }
     if (m.model) |p| {
         try buf.appendSlice(allocator, ",\"model\":");
-        try appendJsonStr(buf, allocator, p);
+        try ai.utils.appendJsonStr(buf, allocator, p);
     }
     // v1.33.0 — `provider` and `api` are franky-specific extensions
     // emitted inside the `message` wrapper. Claude Code doesn't write
@@ -727,11 +727,11 @@ fn appendMessageJson(
     // own read path restores them.
     if (m.provider) |p| {
         try buf.appendSlice(allocator, ",\"provider\":");
-        try appendJsonStr(buf, allocator, p);
+        try ai.utils.appendJsonStr(buf, allocator, p);
     }
     if (m.api) |p| {
         try buf.appendSlice(allocator, ",\"api\":");
-        try appendJsonStr(buf, allocator, p);
+        try ai.utils.appendJsonStr(buf, allocator, p);
     }
     // v1.31.0 — Message.Usage (per-turn token counts + USD costs).
     // v1.33.0 — Claude-Code-compatible key names inside `message.usage`.
@@ -933,7 +933,7 @@ fn renderCostStateLine(
     try out.appendSlice(allocator, "{\"type\":\"cost-state\"");
     if (session_id) |sid| if (sid.len > 0) {
         try out.appendSlice(allocator, ",\"sessionId\":");
-        try appendJsonStr(out, allocator, sid);
+        try ai.utils.appendJsonStr(out, allocator, sid);
     };
     // v1.34.0 — `totalCostUSD` is emitted with a forced decimal point
     // (e.g. `0.0`, `1.5`) so downstream parsers tag it as `.float`;
@@ -975,7 +975,7 @@ fn renderCostStateLine(
     while (mit.next()) |e| {
         if (!first) try out.append(allocator, ',');
         first = false;
-        try appendJsonStr(out, allocator, e.key_ptr.*);
+        try ai.utils.appendJsonStr(out, allocator, e.key_ptr.*);
         try out.appendSlice(allocator, ":");
         const entry_json = try std.json.Stringify.valueAlloc(allocator, e.value_ptr.*, .{
             .emit_null_optional_fields = false,
@@ -1008,37 +1008,37 @@ pub fn appendContentBlockJson(
     try buf.appendSlice(allocator, "{\"type\":");
     switch (cb) {
         .text => |t| {
-            try appendJsonStr(buf, allocator, "text");
+            try ai.utils.appendJsonStr(buf, allocator, "text");
             try buf.appendSlice(allocator, ",\"text\":");
-            try appendJsonStr(buf, allocator, t.text);
+            try ai.utils.appendJsonStr(buf, allocator, t.text);
             if (t.text_signature) |sig| {
                 try buf.appendSlice(allocator, ",\"textSignature\":");
-                try appendJsonStr(buf, allocator, sig);
+                try ai.utils.appendJsonStr(buf, allocator, sig);
             }
         },
         .thinking => |t| {
-            try appendJsonStr(buf, allocator, "thinking");
+            try ai.utils.appendJsonStr(buf, allocator, "thinking");
             try buf.appendSlice(allocator, ",\"thinking\":");
-            try appendJsonStr(buf, allocator, t.thinking);
+            try ai.utils.appendJsonStr(buf, allocator, t.thinking);
             if (t.thinking_signature) |sig| {
                 try buf.appendSlice(allocator, ",\"thinkingSignature\":");
-                try appendJsonStr(buf, allocator, sig);
+                try ai.utils.appendJsonStr(buf, allocator, sig);
             }
             if (t.redacted) try buf.appendSlice(allocator, ",\"redacted\":true");
         },
         .image => |t| {
-            try appendJsonStr(buf, allocator, "image");
+            try ai.utils.appendJsonStr(buf, allocator, "image");
             try buf.appendSlice(allocator, ",\"data\":");
-            try appendJsonStr(buf, allocator, t.data);
+            try ai.utils.appendJsonStr(buf, allocator, t.data);
             try buf.appendSlice(allocator, ",\"mimeType\":");
-            try appendJsonStr(buf, allocator, t.mime_type);
+            try ai.utils.appendJsonStr(buf, allocator, t.mime_type);
         },
         .tool_call => |t| {
-            try appendJsonStr(buf, allocator, "tool_use");
+            try ai.utils.appendJsonStr(buf, allocator, "tool_use");
             try buf.appendSlice(allocator, ",\"id\":");
-            try appendJsonStr(buf, allocator, t.id);
+            try ai.utils.appendJsonStr(buf, allocator, t.id);
             try buf.appendSlice(allocator, ",\"name\":");
-            try appendJsonStr(buf, allocator, t.name);
+            try ai.utils.appendJsonStr(buf, allocator, t.name);
             // `input` is emitted as a raw JSON value (we trust it to be
             // valid JSON — it came from the model via the partial-json
             // parser or, on round-trip, from a prior serialization).
@@ -1345,24 +1345,6 @@ fn parseContentBlock(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.ty
     }
     // Unknown type → text fallback.
     return .{ .text = .{ .text = try allocator.dupe(u8, "") } };
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            const hex = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
-            defer allocator.free(hex);
-            try buf.appendSlice(allocator, hex);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
 }
 
 /// Serialize an f64 cost field as a JSON number. Always emits a

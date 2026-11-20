@@ -7,27 +7,10 @@
 //! without duplicating ~70 lines of code.
 
 const std = @import("std");
+const ai_utils = @import("../../ai/utils.zig");
 
 /// JSON-encode a string into `buf`, escaping control chars.
-pub fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        // 0x00-0x08 (incl backspace), 0x0b, 0x0c (form feed),
-        // 0x0e-0x1f: control chars not already handled above.
-        0...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
+pub const appendJsonStr = ai_utils.appendJsonStr;
 
 /// Re-serialize a `std.json.Value` to a string. Mirrors rpc.zig's
 /// private `renderJson` but `pub` and with `number_string` emitted

@@ -16,6 +16,7 @@ const std = @import("std");
 const at = @import("types.zig");
 const ai_types = @import("../ai/types.zig");
 const ai_errors = @import("../ai/errors.zig");
+const ai_utils = @import("../ai/utils.zig");
 
 /// Encode `ev` as a JSON payload — no SSE framing. Caller-owned.
 pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
@@ -28,10 +29,10 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
         .turn_end => try buf.appendSlice(allocator, "\"kind\":\"turn_end\""),
         .message_start => |s| {
             try buf.appendSlice(allocator, "\"kind\":\"message_start\",\"role\":");
-            try appendJsonStr(&buf, allocator, roleName(s.role));
+            try ai_utils.appendJsonStr(&buf, allocator, roleName(s.role));
             if (s.custom_role) |cr| {
                 try buf.appendSlice(allocator, ",\"customRole\":");
-                try appendJsonStr(&buf, allocator, cr);
+                try ai_utils.appendJsonStr(&buf, allocator, cr);
             }
         },
         .message_update => |m| switch (m) {
@@ -39,49 +40,49 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
                 try buf.appendSlice(allocator, "\"kind\":\"message_update\",\"deltaKind\":\"text\",\"blockIndex\":");
                 try appendJsonInt(&buf, allocator, @intCast(t.block_index));
                 try buf.appendSlice(allocator, ",\"delta\":");
-                try appendJsonStr(&buf, allocator, t.delta);
+                try ai_utils.appendJsonStr(&buf, allocator, t.delta);
             },
             .thinking => |t| {
                 try buf.appendSlice(allocator, "\"kind\":\"message_update\",\"deltaKind\":\"thinking\",\"blockIndex\":");
                 try appendJsonInt(&buf, allocator, @intCast(t.block_index));
                 try buf.appendSlice(allocator, ",\"delta\":");
-                try appendJsonStr(&buf, allocator, t.delta);
+                try ai_utils.appendJsonStr(&buf, allocator, t.delta);
             },
             .toolcall_args => |t| {
                 try buf.appendSlice(allocator, "\"kind\":\"message_update\",\"deltaKind\":\"toolcall_args\",\"blockIndex\":");
                 try appendJsonInt(&buf, allocator, @intCast(t.block_index));
                 try buf.appendSlice(allocator, ",\"delta\":");
-                try appendJsonStr(&buf, allocator, t.delta);
+                try ai_utils.appendJsonStr(&buf, allocator, t.delta);
             },
         },
         .message_end => |m| {
             try buf.appendSlice(allocator, "\"kind\":\"message_end\",\"role\":");
-            try appendJsonStr(&buf, allocator, roleName(m.role));
+            try ai_utils.appendJsonStr(&buf, allocator, roleName(m.role));
             try buf.appendSlice(allocator, ",\"contentBlocks\":");
             try appendJsonInt(&buf, allocator, @intCast(m.content.len));
         },
         .tool_execution_start => |s| {
             try buf.appendSlice(allocator, "\"kind\":\"tool_execution_start\",\"callId\":");
-            try appendJsonStr(&buf, allocator, s.call_id);
+            try ai_utils.appendJsonStr(&buf, allocator, s.call_id);
             try buf.appendSlice(allocator, ",\"name\":");
-            try appendJsonStr(&buf, allocator, s.name);
+            try ai_utils.appendJsonStr(&buf, allocator, s.name);
             try buf.appendSlice(allocator, ",\"argsJson\":");
-            try appendJsonStr(&buf, allocator, s.args_json);
+            try ai_utils.appendJsonStr(&buf, allocator, s.args_json);
         },
         .tool_execution_update => |u| {
             try buf.appendSlice(allocator, "\"kind\":\"tool_execution_update\",\"callId\":");
-            try appendJsonStr(&buf, allocator, u.call_id);
+            try ai_utils.appendJsonStr(&buf, allocator, u.call_id);
             try buf.appendSlice(allocator, ",\"update\":");
             try buf.appendSlice(allocator, u.update_json);
         },
         .tool_execution_end => |e| {
             try buf.appendSlice(allocator, "\"kind\":\"tool_execution_end\",\"callId\":");
-            try appendJsonStr(&buf, allocator, e.call_id);
+            try ai_utils.appendJsonStr(&buf, allocator, e.call_id);
             try buf.appendSlice(allocator, ",\"isError\":");
             try buf.appendSlice(allocator, if (e.result.is_error) "true" else "false");
             if (e.result.tool_code) |code| {
                 try buf.appendSlice(allocator, ",\"toolCode\":");
-                try appendJsonStr(&buf, allocator, code);
+                try ai_utils.appendJsonStr(&buf, allocator, code);
             }
             // Concatenate all text content blocks into resultText so the
             // web UI can display the tool output in a collapsible panel.
@@ -91,7 +92,7 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             for (e.result.content) |cb| {
                 if (cb == .text) try combined.appendSlice(allocator, cb.text.text);
             }
-            try appendJsonStr(&buf, allocator, combined.items);
+            try ai_utils.appendJsonStr(&buf, allocator, combined.items);
             // §6.8 — include details_json as opaque metadata for the front-end
             // (e.g. unified diff for the edit tool). The value is already valid
             // JSON, so we append it directly without re-encoding.
@@ -102,19 +103,19 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
         },
         .tool_permission_request => |r| {
             try buf.appendSlice(allocator, "\"kind\":\"tool_permission_request\",\"callId\":");
-            try appendJsonStr(&buf, allocator, r.call_id);
+            try ai_utils.appendJsonStr(&buf, allocator, r.call_id);
             try buf.appendSlice(allocator, ",\"toolName\":");
-            try appendJsonStr(&buf, allocator, r.tool_name);
+            try ai_utils.appendJsonStr(&buf, allocator, r.tool_name);
             try buf.appendSlice(allocator, ",\"argsJson\":");
-            try appendJsonStr(&buf, allocator, r.args_json);
+            try ai_utils.appendJsonStr(&buf, allocator, r.args_json);
             try buf.appendSlice(allocator, ",\"fingerprint\":");
-            try appendJsonStr(&buf, allocator, r.fingerprint);
+            try ai_utils.appendJsonStr(&buf, allocator, r.fingerprint);
         },
         .agent_error => |d| {
             try buf.appendSlice(allocator, "\"kind\":\"agent_error\",\"code\":");
-            try appendJsonStr(&buf, allocator, d.code.toString());
+            try ai_utils.appendJsonStr(&buf, allocator, d.code.toString());
             try buf.appendSlice(allocator, ",\"message\":");
-            try appendJsonStr(&buf, allocator, d.message);
+            try ai_utils.appendJsonStr(&buf, allocator, d.message);
             if (!d.is_fatal) {
                 try buf.appendSlice(allocator, ",\"isFatal\":false");
             }
@@ -134,18 +135,18 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             try buf.appendSlice(allocator, ",\"delay_ms\":");
             try appendJsonInt(&buf, allocator, @intCast(r.delay_ms));
             try buf.appendSlice(allocator, ",\"reason\":");
-            try appendJsonStr(&buf, allocator, @tagName(r.reason));
+            try ai_utils.appendJsonStr(&buf, allocator, @tagName(r.reason));
             if (r.http_status) |s| {
                 try buf.appendSlice(allocator, ",\"http_status\":");
                 try appendJsonInt(&buf, allocator, @intCast(s));
             }
             if (r.provider_code) |pc| {
                 try buf.appendSlice(allocator, ",\"provider_code\":");
-                try appendJsonStr(&buf, allocator, pc);
+                try ai_utils.appendJsonStr(&buf, allocator, pc);
             }
             if (r.provider_message) |pm| {
                 try buf.appendSlice(allocator, ",\"provider_message\":");
-                try appendJsonStr(&buf, allocator, pm);
+                try ai_utils.appendJsonStr(&buf, allocator, pm);
             }
         },
     }
@@ -263,24 +264,6 @@ fn roleName(r: ai_types.Role) []const u8 {
         .tool_result => "tool_result",
         .custom => "custom",
     };
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
 }
 
 fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
