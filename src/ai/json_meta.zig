@@ -165,25 +165,22 @@ test "stringifyWithMeta: rename + skip" {
     );
 }
 
-test "stringifyWithMeta: comptime typo in json_meta is caught" {
-    // This is a compile-time test — the following struct would fail to
-    // compile if uncommented:
-    //
-    //   const Bad = struct {
-    //       id: u32,
-    //       pub const json_meta = .{
-    //           .typo_field = .{ .skip = true },
-    //       };
-    //       pub fn jsonStringify(self: @This(), jw: anytype) !void {
-    //           try stringifyWithMeta(self, jw);
-    //       }
-    //   };
-    //
-    // The error message would be:
-    //   json_meta on '...' references non-existent field 'typo_field'
-    //
-    // We can't assert this at runtime, but the test documents the
-    // guarantee and ensures the happy path compiles.
-    const ok = TestUser{ .id = 1, .first_name = "x", .password_hash = "y", .tags = &.{} };
-    _ = ok;
+test "stringifyWithMeta: null optional omitted with emit_null_optional_fields=false" {
+    const user = TestUser{
+        .id = 99,
+        .first_name = "Bob",
+        .password_hash = "hash",
+        .tags = &.{},
+        .nickname = null,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(testing.allocator, user, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(json_str);
+
+    // nickname is null and omitted; password_hash is skipped.
+    try testing.expectEqualStrings(
+        "{\"id\":99,\"firstName\":\"Bob\",\"tags\":[]}",
+        json_str,
+    );
 }

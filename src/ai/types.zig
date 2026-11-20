@@ -520,6 +520,114 @@ pub const Diagnostics = struct {
             .was_degenerate = self.was_degenerate,
         };
     }
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    //
+    // Like `Usage`, `Diagnostics` opts into `std.json` via hooks.
+    // The wire format uses camelCase keys and omits zero/null/false
+    // fields (matching the transcript.jsonl v5 shape).
+
+    pub const json_meta = .{
+        .trace_id = .{ .rename = "traceId" },
+        .finish_reason_raw = .{ .rename = "finishReasonRaw" },
+        .parts_seen = .{ .rename = "partsSeen" },
+        .candidates_tokens = .{ .rename = "candidatesTokens" },
+        .thoughts_tokens = .{ .rename = "thoughtsTokens" },
+        .text_event_count = .{ .rename = "textEvents" },
+        .thinking_event_count = .{ .rename = "thinkingEvents" },
+        .tool_call_event_count = .{ .rename = "toolCallEvents" },
+        .was_degenerate = .{ .rename = "wasDegenerate" },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer. Emits camelCase
+    /// keys, omitting zero-valued integers, null optionals, and
+    /// `was_degenerate = false`.
+    pub fn jsonStringify(self: Diagnostics, jw: anytype) !void {
+        try jw.beginObject();
+
+        if (self.trace_id) |s| {
+            try jw.objectField("traceId");
+            try jw.write(s);
+        }
+        if (self.finish_reason_raw) |s| {
+            try jw.objectField("finishReasonRaw");
+            try jw.write(s);
+        }
+        if (self.parts_seen != 0) {
+            try jw.objectField("partsSeen");
+            try jw.write(self.parts_seen);
+        }
+        if (self.candidates_tokens) |n| {
+            try jw.objectField("candidatesTokens");
+            try jw.write(n);
+        }
+        if (self.thoughts_tokens) |n| {
+            try jw.objectField("thoughtsTokens");
+            try jw.write(n);
+        }
+        if (self.text_event_count != 0) {
+            try jw.objectField("textEvents");
+            try jw.write(self.text_event_count);
+        }
+        if (self.thinking_event_count != 0) {
+            try jw.objectField("thinkingEvents");
+            try jw.write(self.thinking_event_count);
+        }
+        if (self.tool_call_event_count != 0) {
+            try jw.objectField("toolCallEvents");
+            try jw.write(self.tool_call_event_count);
+        }
+        if (self.was_degenerate) {
+            try jw.objectField("wasDegenerate");
+            try jw.write(true);
+        }
+
+        try jw.endObject();
+    }
+
+    /// Deserialize from a `std.json.Value`. Expects camelCase keys.
+    /// String fields are duped into `allocator`.
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Diagnostics {
+        _ = options;
+        if (source != .object) return error.UnexpectedToken;
+        const o = source.object;
+
+        var d: Diagnostics = .{};
+
+        if (o.get("traceId")) |v| if (v == .string) {
+            d.trace_id = try allocator.dupe(u8, v.string);
+        };
+        if (o.get("finishReasonRaw")) |v| if (v == .string) {
+            d.finish_reason_raw = try allocator.dupe(u8, v.string);
+        };
+        if (o.get("partsSeen")) |v| if (v == .integer) {
+            d.parts_seen = @intCast(v.integer);
+        };
+        if (o.get("candidatesTokens")) |v| if (v == .integer) {
+            d.candidates_tokens = @intCast(v.integer);
+        };
+        if (o.get("thoughtsTokens")) |v| if (v == .integer) {
+            d.thoughts_tokens = @intCast(v.integer);
+        };
+        if (o.get("textEvents")) |v| if (v == .integer) {
+            d.text_event_count = @intCast(v.integer);
+        };
+        if (o.get("thinkingEvents")) |v| if (v == .integer) {
+            d.thinking_event_count = @intCast(v.integer);
+        };
+        if (o.get("toolCallEvents")) |v| if (v == .integer) {
+            d.tool_call_event_count = @intCast(v.integer);
+        };
+        if (o.get("wasDegenerate")) |v| if (v == .bool) {
+            d.was_degenerate = v.bool;
+        };
+
+        return d;
+    }
 };
 
 /// Message — tagged by role. Carries the content blocks plus role-specific
@@ -896,4 +1004,77 @@ test "Usage.jsonParseFromValue handles empty object" {
     const u = parsed.value;
 
     try std.testing.expect(u.isEmpty());
+}
+
+// ─── Diagnostics JSON (de)serialization tests ─────────────────────────
+
+test "Diagnostics.jsonStringify emits camelCase keys, omits defaults" {
+    const d: Diagnostics = .{
+        .trace_id = "trace_123",
+        .finish_reason_raw = "end_turn",
+        .parts_seen = 5,
+        .candidates_tokens = 100,
+        .was_degenerate = true,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, d, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Zero fields (text_event_count, etc.) and null optionals
+    // (thoughts_tokens) are omitted.
+    try std.testing.expectEqualStrings(
+        "{\"traceId\":\"trace_123\",\"finishReasonRaw\":\"end_turn\"," ++
+            "\"partsSeen\":5,\"candidatesTokens\":100,\"wasDegenerate\":true}",
+        json_str,
+    );
+}
+
+test "Diagnostics round-trip: stringify then parseFromValue restores original" {
+    const original: Diagnostics = .{
+        .trace_id = "trace_456",
+        .finish_reason_raw = "tool_calls",
+        .parts_seen = 3,
+        .candidates_tokens = 200,
+        .thoughts_tokens = 50,
+        .text_event_count = 10,
+        .thinking_event_count = 5,
+        .tool_call_event_count = 2,
+        .was_degenerate = false,
+    };
+
+    // Serialize
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, original, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Parse back via the jsonParseFromValue hook.
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    // Use parseFromValueLeaky with testing.allocator so we can free strings.
+    const d = try std.json.parseFromValueLeaky(Diagnostics, std.testing.allocator, value_parsed.value, .{});
+    defer {
+        if (d.trace_id) |s| std.testing.allocator.free(s);
+        if (d.finish_reason_raw) |s| std.testing.allocator.free(s);
+    }
+
+    try std.testing.expectEqualStrings("trace_456", d.trace_id.?);
+    try std.testing.expectEqualStrings("tool_calls", d.finish_reason_raw.?);
+    try std.testing.expectEqual(@as(u32, 3), d.parts_seen);
+    try std.testing.expectEqual(@as(?u64, 200), d.candidates_tokens);
+    try std.testing.expectEqual(@as(?u64, 50), d.thoughts_tokens);
+    try std.testing.expectEqual(@as(u32, 10), d.text_event_count);
+    try std.testing.expectEqual(@as(u32, 5), d.thinking_event_count);
+    try std.testing.expectEqual(@as(u32, 2), d.tool_call_event_count);
+    try std.testing.expectEqual(false, d.was_degenerate);
+}
+
+test "Diagnostics.jsonParseFromValue handles empty object" {
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer value_parsed.deinit();
+
+    const d = try std.json.parseFromValueLeaky(Diagnostics, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expect(d.isEmpty());
 }

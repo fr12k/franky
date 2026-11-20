@@ -687,136 +687,34 @@ fn appendMessageJson(
     }
     // v1.31.0 — Message.Usage (per-turn token counts + USD costs).
     // v1.33.0 — Claude-Code-compatible key names inside `message.usage`.
+    // v1.34.0 — serialized via `Usage.jsonStringify` hook (std.json).
     // Only emit when at least one field is non-default; pre-v1.31
     // transcripts (and user/tool_result rows that never carry usage)
     // round-trip unchanged.
     if (m.usage) |u| if (!u.isEmpty()) {
-        try buf.appendSlice(allocator, ",\"usage\":{");
-        var first = true;
-        // Claude Code reports only the uncached portion in
-        // `input_tokens`. Franky's `Usage.input` includes cached
-        // tokens (the provider's total `prompt_tokens`), so subtract
-        // cache_read + cache_write (clamped ≥ 0). Saturating add guards
-        // against u64 overflow on adversarial inputs.
-        const cached = u.cache_read +| u.cache_write;
-        const uncached_input: u64 = if (u.input > cached) u.input - cached else 0;
-        if (uncached_input != 0) {
-            try appendJsonU64Field(buf, allocator, "\"input_tokens\":", uncached_input);
-            first = false;
-        }
-        if (u.output != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"output_tokens\":", u.output);
-            first = false;
-        }
-        if (u.cache_read != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_read_input_tokens\":", u.cache_read);
-            first = false;
-        }
-        if (u.cache_write != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_creation_input_tokens\":", u.cache_write);
-            first = false;
-        }
-        // Franky-specific extensions (not in Claude Code's usage) —
-        // emitted with snake_case names for consistency. Downstream
-        // readers that only know Claude's keys ignore these.
-        if (u.thinking_tokens != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"thinking_tokens\":", u.thinking_tokens);
-            first = false;
-        }
-        if (u.cache_creation_ephemeral_5m != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_creation_5m_input_tokens\":", u.cache_creation_ephemeral_5m);
-            first = false;
-        }
-        if (u.cache_creation_ephemeral_1h != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_creation_1h_input_tokens\":", u.cache_creation_ephemeral_1h);
-            first = false;
-        }
-        if (u.web_search_requests != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"web_search_requests\":", u.web_search_requests);
-            first = false;
-        }
-        if (u.cost_input) |ci| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_input\":", ci);
-            first = false;
-        }
-        if (u.cost_output) |co| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_output\":", co);
-            first = false;
-        }
-        if (u.cost_cache_read) |cr| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_cache_read\":", cr);
-            first = false;
-        }
-        if (u.cost_cache_write) |cw| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_cache_write\":", cw);
-            first = false;
-        }
-        try buf.append(allocator, '}');
+        try buf.appendSlice(allocator, ",\"usage\":");
+        // `Usage.jsonStringify` emits the Claude-Code-compatible wire
+        // shape: `input_tokens` carries the uncached portion (total
+        // minus cache_read + cache_write), zero-valued fields are
+        // omitted, null cost fields are omitted.
+        const usage_json = try std.json.Stringify.valueAlloc(allocator, u, .{
+            .emit_null_optional_fields = false,
+        });
+        defer allocator.free(usage_json);
+        try buf.appendSlice(allocator, usage_json);
     };
     // v1.29.0 — Message.Diagnostics. Franky-specific; emitted inside
-    // the `message` wrapper under `diagnostics`. Only emit when at
-    // least one field is non-default; pre-v1.29 transcripts round-trip
+    // the `message` wrapper under `diagnostics`. v1.34.0 — serialized
+    // via `Diagnostics.jsonStringify` hook (std.json). Only emit when
+    // at least one field is non-default; pre-v1.29 transcripts round-trip
     // unchanged.
     if (m.diagnostics) |d| if (!d.isEmpty()) {
-        try buf.appendSlice(allocator, ",\"diagnostics\":{");
-        var first = true;
-        if (d.trace_id) |s| {
-            try buf.appendSlice(allocator, "\"traceId\":");
-            try appendJsonStr(buf, allocator, s);
-            first = false;
-        }
-        if (d.finish_reason_raw) |s| {
-            if (!first) try buf.append(allocator, ',');
-            try buf.appendSlice(allocator, "\"finishReasonRaw\":");
-            try appendJsonStr(buf, allocator, s);
-            first = false;
-        }
-        if (d.parts_seen != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"partsSeen\":", d.parts_seen);
-            first = false;
-        }
-        if (d.candidates_tokens) |n| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"candidatesTokens\":", n);
-            first = false;
-        }
-        if (d.thoughts_tokens) |n| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"thoughtsTokens\":", n);
-            first = false;
-        }
-        if (d.text_event_count != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"textEvents\":", d.text_event_count);
-            first = false;
-        }
-        if (d.thinking_event_count != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"thinkingEvents\":", d.thinking_event_count);
-            first = false;
-        }
-        if (d.tool_call_event_count != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"toolCallEvents\":", d.tool_call_event_count);
-            first = false;
-        }
-        if (d.was_degenerate) {
-            if (!first) try buf.append(allocator, ',');
-            try buf.appendSlice(allocator, "\"wasDegenerate\":true");
-        }
-        try buf.append(allocator, '}');
+        try buf.appendSlice(allocator, ",\"diagnostics\":");
+        const diag_json = try std.json.Stringify.valueAlloc(allocator, d, .{
+            .emit_null_optional_fields = false,
+        });
+        defer allocator.free(diag_json);
+        try buf.appendSlice(allocator, diag_json);
     };
     // Close `message` wrapper.
     try buf.appendSlice(allocator, "}");
@@ -1166,70 +1064,28 @@ fn parseMessage(
         break :blk .custom;
     };
 
-    // v1.29.0 — Diagnostics round-trip. Old transcripts without
-    // the field decode as null and round-trip cleanly.
+    // v1.29.0 — Diagnostics round-trip. v1.34.0 — parsed via
+    // `Diagnostics.jsonParseFromValue` hook (std.json). Old transcripts
+    // without the field decode as null and round-trip cleanly.
+    // Uses `parseFromValueLeaky` with the caller's allocator so that
+    // string fields are owned by the `Diagnostics` struct (freed via
+    // `deinit(allocator)`), not by a throwaway arena.
     var diag_opt: ?ai.types.Diagnostics = null;
     if (msg_obj.get("diagnostics")) |dv| if (dv == .object) {
-        const dobj = dv.object;
-        var diag: ai.types.Diagnostics = .{};
-        if (dobj.get("traceId")) |v| if (v == .string) {
-            diag.trace_id = try allocator.dupe(u8, v.string);
-        };
-        if (dobj.get("finishReasonRaw")) |v| if (v == .string) {
-            diag.finish_reason_raw = try allocator.dupe(u8, v.string);
-        };
-        if (dobj.get("partsSeen")) |v| if (v == .integer) {
-            diag.parts_seen = @intCast(v.integer);
-        };
-        if (dobj.get("candidatesTokens")) |v| if (v == .integer) {
-            diag.candidates_tokens = @intCast(v.integer);
-        };
-        if (dobj.get("thoughtsTokens")) |v| if (v == .integer) {
-            diag.thoughts_tokens = @intCast(v.integer);
-        };
-        if (dobj.get("textEvents")) |v| if (v == .integer) {
-            diag.text_event_count = @intCast(v.integer);
-        };
-        if (dobj.get("thinkingEvents")) |v| if (v == .integer) {
-            diag.thinking_event_count = @intCast(v.integer);
-        };
-        if (dobj.get("toolCallEvents")) |v| if (v == .integer) {
-            diag.tool_call_event_count = @intCast(v.integer);
-        };
-        if (dobj.get("wasDegenerate")) |v| if (v == .bool) {
-            diag.was_degenerate = v.bool;
-        };
-        diag_opt = diag;
+        diag_opt = std.json.parseFromValueLeaky(ai.types.Diagnostics, allocator, dv, .{
+            .ignore_unknown_fields = true,
+        }) catch null;
     };
 
     // v1.31.0 — Usage round-trip. v1.33.0 — accept Claude-Code key
     // names (`input_tokens` etc.) in addition to franky v4 names
-    // (`input` etc.). Token counts arrive as JSON integers; cost
-    // fields as JSON floats.
+    // (`input` etc.). v1.34.0 — parsed via `Usage.jsonParseFromValue`
+    // hook (std.json).
     var usage_opt: ?ai.types.Usage = null;
     if (msg_obj.get("usage")) |uv| if (uv == .object) {
-        const uobj = uv.object;
-        var usage: ai.types.Usage = .{};
-        // v5 `input_tokens` is the uncached portion; v4 `input` is the
-        // total (incl. cached). We restore the TOTAL into `Usage.input`
-        // so the internal model sees the provider-reported total.
-        const input_from_v4 = ai.utils.jsonInt(uobj, "input");
-        const input_from_v5 = ai.utils.jsonInt(uobj, "input_tokens");
-        usage.output = ai.utils.jsonInt(uobj, "output") orelse ai.utils.jsonInt(uobj, "output_tokens") orelse 0;
-        usage.cache_read = ai.utils.jsonInt(uobj, "cacheRead") orelse ai.utils.jsonInt(uobj, "cache_read_input_tokens") orelse 0;
-        usage.cache_write = ai.utils.jsonInt(uobj, "cacheWrite") orelse ai.utils.jsonInt(uobj, "cache_creation_input_tokens") orelse 0;
-        usage.thinking_tokens = ai.utils.jsonInt(uobj, "thinkingTokens") orelse ai.utils.jsonInt(uobj, "thinking_tokens") orelse 0;
-        usage.cache_creation_ephemeral_5m = ai.utils.jsonInt(uobj, "cacheCreationEphemeral5m") orelse ai.utils.jsonInt(uobj, "cache_creation_5m_input_tokens") orelse 0;
-        usage.cache_creation_ephemeral_1h = ai.utils.jsonInt(uobj, "cacheCreationEphemeral1h") orelse ai.utils.jsonInt(uobj, "cache_creation_1h_input_tokens") orelse 0;
-        usage.web_search_requests = ai.utils.jsonInt(uobj, "webSearchRequests") orelse ai.utils.jsonInt(uobj, "web_search_requests") orelse 0;
-        usage.cost_input = ai.utils.jsonFloat(uobj, "costInput") orelse ai.utils.jsonFloat(uobj, "cost_input");
-        usage.cost_output = ai.utils.jsonFloat(uobj, "costOutput") orelse ai.utils.jsonFloat(uobj, "cost_output");
-        usage.cost_cache_read = ai.utils.jsonFloat(uobj, "costCacheRead") orelse ai.utils.jsonFloat(uobj, "cost_cache_read");
-        usage.cost_cache_write = ai.utils.jsonFloat(uobj, "costCacheWrite") orelse ai.utils.jsonFloat(uobj, "cost_cache_write");
-        // Fix up: if we only had v5 `input_tokens` (uncached), add back
-        // the cached tokens to restore the provider-reported total.
-        usage.input = input_from_v4 orelse (input_from_v5 orelse 0) + usage.cache_read + usage.cache_write;
-        usage_opt = usage;
+        usage_opt = std.json.parseFromValueLeaky(ai.types.Usage, allocator, uv, .{
+            .ignore_unknown_fields = true,
+        }) catch null;
     };
 
     // Timestamp: v5 is ISO-8601 string at record level; v4 is epoch-ms
