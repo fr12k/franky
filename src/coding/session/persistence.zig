@@ -567,42 +567,27 @@ fn strOpt(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 /// Format an epoch-millisecond timestamp as a Claude-Code-compatible
 /// ISO-8601 string: `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC, millisecond
-/// precision, trailing `Z`). Writes into the caller-provided
-/// `buf` (needs ≥ 24 bytes) and returns the written slice.
+/// precision, trailing `Z`). Uses `std.time.epoch` for the
+/// epoch-seconds → year/month/day/hour/minute/second conversion.
 fn formatIso8601(ts_ms: i64, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     const ms: u64 = if (ts_ms < 0) 0 else @intCast(ts_ms);
     const total_sec: u64 = ms / 1000;
     const millis: u64 = ms % 1000;
 
-    // Days from 1970-01-01 to the civil date using the Howard Hinnant
-    // algorithm (days_from_civil in reverse). We split total_sec into
-    // day + seconds-of-day first.
-    const days: i64 = @intCast(total_sec / 86400);
-    const secs_of_day: u64 = total_sec % 86400;
-    const hour: u64 = secs_of_day / 3600;
-    const minute: u64 = (secs_of_day % 3600) / 60;
-    const second: u64 = secs_of_day % 60;
+    const ep = std.time.epoch.EpochSeconds{ .secs = total_sec };
+    const ed = ep.getEpochDay();
+    const ds = ep.getDaySeconds();
+    const yd = ed.calculateYearDay();
+    const md = yd.calculateMonthDay();
 
-    // civil_from_days — https://howardhinnant.github.io/date_algorithms.html
-    const z = days + 719468;
-    const era: i64 = @divFloor(z, 146097);
-    const doe: u64 = @intCast(z - era * 146097); // [0, 146096]
-    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
-    const doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    const mp: u64 = (5 * doy + 2) / 153; // [0, 11]
-    const day: u64 = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    const month: u64 = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
-    const year: i64 = y + @as(i64, if (month <= 2) 1 else 0);
-
-    // Format year: for non-negative years, use unsigned formatting to
-    // avoid the `+` sign that `{d}` would emit for i64. For negative
-    // years (pre-epoch), fall back to signed formatting.
-    const year_buf = try std.fmt.allocPrint(allocator, "{d}", .{year});
-    defer allocator.free(year_buf);
-
-    const s = try std.fmt.allocPrint(allocator, "{s:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
-        year_buf, month, day, hour, minute, second, millis,
+    const s = try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        @as(u32, yd.year),
+        @as(u32, @intFromEnum(md.month)),
+        @as(u32, md.day_index) + 1,
+        @as(u32, ds.getHoursIntoDay()),
+        @as(u32, ds.getMinutesIntoHour()),
+        @as(u32, ds.getSecondsIntoMinute()),
+        millis,
     });
     defer allocator.free(s);
     try buf.appendSlice(allocator, s);
