@@ -21,6 +21,7 @@ const ai = struct {
     pub const errors = @import("../ai/errors.zig");
     pub const stream = @import("../ai/stream.zig");
     pub const registry = @import("../ai/registry.zig");
+    pub const http = @import("../ai/http.zig");
 };
 const at = @import("types.zig");
 const loop_mod = @import("loop.zig");
@@ -54,6 +55,12 @@ pub const Agent = struct {
     /// caller (`stream_options.environ_map`, `stream_options.cancel`,
     /// hooks).
     stream_options: ai.registry.StreamOptions = .{},
+
+    /// v3.x — optional shared HTTP client. When null, the agent
+    /// loop creates its own. When non-null, the loop borrows this
+    /// client — used by subagents to reuse the parent's warm TLS
+    /// connection pool. Caller-owned; must outlive the Agent.
+    http_client: ?*ai.http.Client = null,
 
     /// v1.22.0 — see `Config.tool_gate`. Plain copy from Config
     /// at init time; the userdata pointer stays caller-owned.
@@ -120,6 +127,13 @@ pub const Agent = struct {
         /// `auth_token` to be set, or `environ_map` populated so
         /// the provider can pull them from env.
         stream_options: ai.registry.StreamOptions = .{},
+        /// v3.x — optional shared HTTP client. When null (default),
+        /// the agent loop creates its own client. When non-null,
+        /// the loop borrows this client — used by subagents to
+        /// reuse the parent's warm TLS connection pool, avoiding
+        /// a new handshake from a deeply nested thread (which
+        /// can stall under gvisor's userspace netstack).
+        http_client: ?*ai.http.Client = null,
         /// v1.22.0 — per-Agent tool gate. Lets SDK consumers
         /// (franky-do, future siblings) plug their own
         /// `before_tool_call` / `role_denied` callbacks into the
@@ -191,6 +205,7 @@ pub const Agent = struct {
             .transcript = loop_mod.Transcript.init(allocator),
             .registry = config.registry,
             .stream_options = config.stream_options,
+            .http_client = config.http_client,
             .tool_gate = config.tool_gate,
             .max_turns = config.max_turns,
             .max_turns_hook = config.max_turns_hook,
@@ -495,6 +510,7 @@ pub const Agent = struct {
             .registry = self.registry,
             .cancel = &self.cancel,
             .stream_options = stream_opts,
+            .http_client = self.http_client,
             .hook_userdata = @ptrCast(self),
             .between_turns = betweenTurnsHook,
             .before_tool_call = gate.before_tool_call,

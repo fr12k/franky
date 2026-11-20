@@ -227,6 +227,14 @@ pub const Config = struct {
     /// requested during the between-turns hook is caught promptly.
     stop_requested_fn: ?*const fn (userdata: ?*anyopaque) bool = null,
     stream_options: ai.registry.StreamOptions = .{},
+    /// v3.x — optional shared HTTP client. When null (default),
+    /// `agentLoop` creates a fresh `ai.http.Client` per run so the
+    /// connection pool is reused across turns. When non-null, the
+    /// loop borrows the caller's client instead — used by subagents
+    /// to reuse the parent's already-warm TLS connection pool,
+    /// avoiding a new handshake from a deeply nested thread (which
+    /// can stall under gvisor's userspace netstack).
+    http_client: ?*ai.http.Client = null,
     /// v3.x — when false (default), the loop pre-flights image input:
     /// if any message in the context carries an `.image` block and
     /// `model.capabilities.vision` is false, the loop emits an
@@ -341,22 +349,30 @@ pub fn agentLoop(
     config: Config,
     out: *AgentChannel,
 ) void {
-    // Create one HTTP client per loop run so the connection pool is
-    // reused across turns (avoids a full TLS handshake on every LLM
-    // call). Proxy settings are applied once here rather than per-turn.
-    var loop_client = ai.http.Client{ .allocator = allocator, .io = io };
+    // Use the caller-provided HTTP client when available (subagents
+    // reuse the parent's warm TLS pool); otherwise create one per loop
+    // run so the connection pool is reused across turns (avoids a full
+    // TLS handshake on every LLM call). Proxy settings are applied once
+    // here rather than per-turn.
+    var owned_loop_client = ai.http.Client{ .allocator = allocator, .io = io };
     var loop_proxy_arena: ?std.heap.ArenaAllocator = null;
+    const loop_client: *ai.http.Client = if (config.http_client) |c| c else &owned_loop_client;
     // Single defer block — client.deinit() must run before proxy_arena.deinit()
     // because the client holds pointers into the arena (proxy host/auth strings).
+    // Only deinit the owned client; a borrowed client is the caller's responsibility.
     defer {
-        loop_client.deinit();
+        if (config.http_client == null) loop_client.deinit();
         if (loop_proxy_arena) |*a| a.deinit();
     }
-    if (config.stream_options.environ_map) |env_map| {
-        loop_proxy_arena = ai.http.setupClientFromEnv(&loop_client, allocator, env_map) catch |e| blk: {
-            ai.log.log(.warn, "loop", "proxy_setup_failed", "err={s}", .{@errorName(e)});
-            break :blk null;
-        };
+    // Only set up proxies on an owned client. A borrowed client
+    // (from the parent agent) already has proxies configured.
+    if (config.http_client == null) {
+        if (config.stream_options.environ_map) |env_map| {
+            loop_proxy_arena = ai.http.setupClientFromEnv(loop_client, allocator, env_map) catch |e| blk: {
+                ai.log.log(.warn, "loop", "proxy_setup_failed", "err={s}", .{@errorName(e)});
+                break :blk null;
+            };
+        }
     }
 
     // v3.3 — clear finish_task_completed at the start of each agentLoop
@@ -385,7 +401,7 @@ pub fn agentLoop(
                     return;
                 }
             }
-            const keep_going = runTurn(allocator, io, transcript, config, out, @ptrCast(&loop_client)) catch |err| {
+            const keep_going = runTurn(allocator, io, transcript, config, out, @ptrCast(loop_client)) catch |err| {
                 pushAgentError(out, io, allocator, agentErrorCode(err), @errorName(err)) catch {};
                 return;
             };
@@ -505,7 +521,7 @@ pub fn agentLoop(
     // and fall through to the `agent_error{max_turns_exceeded}` path
     // that callers already handle.
     if (config.max_turns_summarize and !config.cancel.isFired()) {
-        runForcedSummary(allocator, io, transcript, config, out, current_cap, @ptrCast(&loop_client)) catch |err| {
+        runForcedSummary(allocator, io, transcript, config, out, current_cap, @ptrCast(loop_client)) catch |err| {
             ai.log.log(.warn, "loop", "forced_summary_failed", "err={s}", .{@errorName(err)});
         };
     }

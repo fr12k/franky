@@ -482,6 +482,12 @@ pub const Session = struct {
     /// v0.30.0 — MCP client state for externally-proxied tools.
     /// null when --mcp-configs is not set. Owned by role_arena.
     mcp_client: ?*franky.coding.mcp.McpClient = null,
+    /// v3.x — shared HTTP client for the agent loop and subagents.
+    /// Reused across turns and borrowed by subagents to avoid a new
+    /// TLS handshake from a deeply nested thread (gvisor workaround).
+    /// Pointer allocated on role_arena so the Session struct's
+    /// alignment is unaffected by Certificate.Bundle's alignment.
+    http_client: ?*ai.http.Client = null,
 
     /// vN — per-tool call counters, reset at session init.
     /// Indexed by tool name, tracked via afterTurnUsage snapshot.
@@ -555,6 +561,8 @@ pub const Session = struct {
         // v3.2 — memory state + guardrail (allocated on role_arena).
         if (self.memory_state) |ms| ms.deinit();
         if (self.mcp_client) |mc| mc.deinit();
+        // http_client is arena-allocated; role_arena.deinit() frees it.
+        if (self.http_client) |hc| hc.deinit();
         self.registry.deinit();
         self.faux.deinit();
         self.permission_store.deinit();
@@ -869,6 +877,19 @@ pub fn initSession(
     session.compression_ctx.ccr_store = &session.ccr_store;
     session.compression_ctx.stats = &session.compression_stats;
     session.web_search_ctx = .{ .environ_map = session.environ_map };
+    // v3.x — allocate shared HTTP client on the role arena so the
+    // Session struct's alignment is unaffected (Certificate.Bundle
+    // has high alignment). Both the agent loop and subagents borrow
+    // this client to avoid a new TLS handshake from nested threads.
+    {
+        const ra = session.role_arena.allocator();
+        const hc = try ra.create(ai.http.Client);
+        hc.* = .{ .allocator = allocator, .io = io };
+        _ = ai.http.setupClientFromEnv(hc, allocator, environ_map) catch |e| {
+            ai.log.log(.warn, "proxy", "proxy_setup_failed", "err={s}", .{@errorName(e)});
+        };
+        session.http_client = hc;
+    }
     session.guardrail_state = try agent.guardrails.GuardrailState.init(
         allocator,
         .{ .workspace_dir = environ.getPosix("PWD") orelse "." },
@@ -1084,6 +1105,7 @@ pub fn initSession(
             .progress_userdata = session,
             // §6.7 — enable full text/thinking deltas for the panel.
             .verbose_progress = true,
+            .http_client = session.http_client.?,
         };
         const final_tools = try config_mod.finalizeToolSet(ra, .{
             .base_tools = session.tools,
@@ -1097,7 +1119,7 @@ pub fn initSession(
         session.tools = final_tools;
     }
 
-    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, cfg, null);
+    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
 }
 
 // ─── §J + v1.7.3: server-side slash command registry ───────────
@@ -2422,6 +2444,7 @@ fn runOneTurnInternal(
                     .headers = session.attribution_headers,
                     .session_id = session.session_id,
                 },
+                .http_client = session.http_client.?,
             };
             // v3.x — bypass the vision capability gate when --force-image is set.
             lc.force_image = session.cfg.force_image;
@@ -4051,6 +4074,11 @@ fn initSessionForTestWithDir(
     session.compression_ctx.ccr_store = &session.ccr_store;
     session.compression_ctx.stats = &session.compression_stats;
     session.web_search_ctx = .{ .environ_map = session.environ_map };
+    // Test session uses faux provider — allocate a minimal HTTP client
+    // on the test role arena so the loop config's .http_client field
+    // is non-null.
+    session.http_client = try test_role_arena.allocator().create(ai.http.Client);
+    session.http_client.?.* = .{ .allocator = allocator, .io = io };
     session.guardrail_state = try agent.guardrails.GuardrailState.init(allocator, .{ .workspace_dir = "." }, io);
     session.session_gates = .{ .role = &session.role_gate };
     errdefer session.registry.deinit();

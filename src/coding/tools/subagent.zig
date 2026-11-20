@@ -736,6 +736,14 @@ pub const Ctx = struct {
     /// uses. v1.24.0 just passes the same registry through; this
     /// field is reserved for future per-sub-agent isolation.
     faux_userdata: ?*anyopaque = null,
+    /// v3.x — parent's HTTP client for reuse by sub-agents. When
+    /// non-null, the sub-agent's agent loop borrows this client
+    /// instead of creating a fresh one, reusing the parent's warm
+    /// TLS connection pool. This avoids a new TLS handshake from
+    /// the sub-agent's deeply nested thread, which can stall
+    /// under gvisor's userspace netstack. Borrowed; must outlive
+    /// any in-flight subagent execute call.
+    http_client: ?*ai.http.Client = null,
 
     // ── §6.6 — sub-agent progress forwarding ──────────────────────
     //
@@ -868,7 +876,7 @@ const ErrorKind = enum {
 
     fn hint(self: ErrorKind) []const u8 {
         return switch (self) {
-            .profile_not_found => "retry with one of the profile names listed in `available_profiles` (or run with --list-profiles to see the catalog)",
+            .profile_not_found => "retry with one of the profile names listed in `available_profiles`",
             .preset_not_found => "call list_subagent_presets to see available presets, then retry with a valid preset name",
             .role_promotion_denied => "the preset's default_role is higher than the parent's role; run franky with a higher --role or pick a preset with a lower default_role",
             .timeout => "summarize the task more or break into smaller steps; partial_text contains what was produced before the timer fired",
@@ -1118,7 +1126,16 @@ fn runSubagent(
             .api_key = provider_info.api_key,
             .auth_token = provider_info.auth_token,
             .base_url = provider_info.base_url,
-            .timeouts = print_mod.resolveTimeoutsFromMap(&sub_cfg, &local_env_map),
+            .timeouts = blk: {
+                var t = print_mod.resolveTimeoutsFromMap(&sub_cfg, &local_env_map);
+                // v3.x — cap the sub-agent's connect timeout at 5s
+                // so a stalled TLS handshake under gvisor fails fast
+                // instead of blocking for the full 10s default.
+                // The parent's profile can still override via
+                // FRANKY_CONNECT_TIMEOUT_MS in the env block.
+                if (t.connect_ms > 5_000) t.connect_ms = 5_000;
+                break :blk t;
+            },
             .retry_policy = print_mod.resolveRetryPolicyFromMap(&sub_cfg, null),
             // Use the per-call cloned env so the sub-agent's HTTP
             // client sees the profile's `env: {}` block (e.g.
@@ -1127,6 +1144,7 @@ fn runSubagent(
             .environ_map = &local_env_map,
             .headers = sub_attribution_headers,
         },
+        .http_client = ctx.http_client,
         .tool_gate = .{
             .userdata = @ptrCast(&sub_gates),
             .before_tool_call = permissions_mod.SessionGates.beforeToolCall,
