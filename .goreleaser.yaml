@@ -28,9 +28,18 @@ builds:
       - aarch64-macos
     flags:
       - -Doptimize=Debug
+      - -Dstrip=true
       - -Dversion={{ .Version }}
       - -Dcommit={{ .ShortCommit }}
       - -Ddate={{ .CommitDate }}
+    # NOTE: -Dstrip=true omits DWARF .debug_* sections, reducing the
+    # binary from ~110MB to ~56MB. The unstripped Debug binary hangs
+    # under gvisor sandboxes — stripping debug info avoids the hang
+    # while keeping all Debug-mode safety checks (integer overflow,
+    # null deref, etc.). Source-location stacktraces are provided by
+    # the custom panic handler in src/bin/main.zig, which resolves
+    # addresses via DWARF when available and falls back to raw hex
+    # addresses (resolvable offline with addr2line) otherwise.
 archives:
   - id: release
     ids: [release]
