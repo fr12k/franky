@@ -124,6 +124,70 @@ pub fn stringifyWithMeta(self: anytype, jw: anytype) !void {
     try jw.endObject();
 }
 
+/// Generic `jsonParseFromValue` implementation that respects `json_meta`.
+///
+/// Call this from a struct's `pub fn jsonParseFromValue` hook. It:
+///   1. Validates at comptime that every field named in `json_meta`
+///      actually exists on T (same typo check as `stringifyWithMeta`).
+///   2. Iterates the JSON object's keys, matching each against the wire
+///      name (renamed or original) of every non-skipped field, and parses
+///      the value via `std.json.parseFromValueLeaky` (so nested types with
+///      their own hooks recurse correctly).
+///   3. Skipped fields retain their default value. Unknown keys are
+///      ignored (forward-compatible).
+///
+/// The returned struct is default-initialized first, so any field absent
+/// from the JSON keeps its default. String slices are duped into
+/// `allocator` (the caller owns them).
+pub fn parseWithMeta(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+) std.json.ParseFromValueError!T {
+    // 1. Comptime typo check — same as stringifyWithMeta.
+    if (@hasDecl(T, "json_meta")) {
+        const Meta = @TypeOf(T.json_meta);
+        const meta_info = @typeInfo(Meta).@"struct";
+        inline for (meta_info.field_names) |meta_field_name| {
+            if (!@hasField(T, meta_field_name)) {
+                @compileError(
+                    "json_meta on '" ++ @typeName(T) ++
+                        "' references non-existent field '" ++ meta_field_name ++ "'",
+                );
+            }
+        }
+    }
+
+    const o = switch (source) {
+        .object => |obj| obj,
+        .null => return std.mem.zeroes(T),
+        else => return error.UnexpectedToken,
+    };
+
+    var r: T = std.mem.zeroes(T);
+    const struct_info = @typeInfo(T).@"struct";
+    var it = o.iterator();
+    while (it.next()) |kv| {
+        const wire_name = kv.key_ptr.*;
+        inline for (struct_info.field_names, struct_info.field_types) |f_name, f_type| {
+            const cfg = fieldConfig(T, f_name);
+            if (!cfg.skip) {
+                const expected = cfg.rename orelse f_name;
+                if (std.mem.eql(u8, expected, wire_name)) {
+                    @field(r, f_name) = try std.json.parseFromValueLeaky(
+                        f_type,
+                        allocator,
+                        kv.value_ptr.*,
+                        .{ .ignore_unknown_fields = true },
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    return r;
+}
+
 // ─── tests ───────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -142,6 +206,15 @@ const TestUser = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try stringifyWithMeta(self, jw);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        _ = options;
+        return parseWithMeta(@This(), allocator, source);
     }
 };
 
@@ -184,3 +257,29 @@ test "stringifyWithMeta: null optional omitted with emit_null_optional_fields=fa
         json_str,
     );
 }
+
+test "parseWithMeta: round-trip with rename + skip" {
+    const user = TestUser{
+        .id = 42,
+        .first_name = "Alice",
+        .password_hash = "super_secret",
+        .tags = &.{},
+    };
+    const json_str = try std.json.Stringify.valueAlloc(testing.allocator, user, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(json_str);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const restored = try std.json.parseFromValueLeaky(TestUser, testing.allocator, parsed.value, .{ .ignore_unknown_fields = true });
+    defer testing.allocator.free(restored.first_name);
+    testing.allocator.free(restored.tags);
+
+    try testing.expectEqual(@as(u32, 42), restored.id);
+    try testing.expectEqualStrings("Alice", restored.first_name);
+    // password_hash is skipped → retains default (empty string from zero-init).
+    try testing.expectEqual(@as(usize, 0), restored.password_hash.len);
+}
+

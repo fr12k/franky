@@ -417,62 +417,19 @@ pub const CostState = struct {
         try json_meta_mod.stringifyWithMeta(self, jw);
     }
 
-    /// Parse a `std.json.Value` (object) into a `CostState`. Accepts
-    /// the camelCase wire keys; `started` is inferred from the presence
-    /// of a non-null `startTime`. Unknown keys are ignored.
+    /// Parse a `std.json.Value` (object) into a `CostState` via the
+    /// generic `json_meta.parseWithMeta` helper. `started` is inferred
+    /// from the presence of a parsed `startTime` (the field is skipped
+    /// on the wire — see `json_meta`).
     pub fn jsonParseFromValue(
         allocator: std.mem.Allocator,
         source: std.json.Value,
         options: std.json.ParseOptions,
     ) !CostState {
-        _ = allocator;
         _ = options;
-        const o = switch (source) {
-            .object => |obj| obj,
-            .null => return .{},
-            else => return error.UnexpectedToken,
-        };
-        var cs: CostState = .{};
-        if (o.get("totalAPIDuration")) |v| if (jsonIntU64(v)) |n| {
-            cs.total_api_duration_ms = n;
-        };
-        if (o.get("totalAPIDurationWithoutRetries")) |v| if (jsonIntU64(v)) |n| {
-            cs.total_api_duration_without_retries_ms = n;
-        };
-        if (o.get("totalToolDuration")) |v| if (jsonIntU64(v)) |n| {
-            cs.total_tool_duration_ms = n;
-        };
-        if (o.get("totalLinesAdded")) |v| if (jsonIntU64(v)) |n| {
-            cs.total_lines_added = n;
-        };
-        if (o.get("totalLinesRemoved")) |v| if (jsonIntU64(v)) |n| {
-            cs.total_lines_removed = n;
-        };
-        if (o.get("startTime")) |v| if (jsonIntI64(v)) |n| {
-            cs.start_time_ms = n;
-            cs.started = true;
-        };
+        var cs = try json_meta_mod.parseWithMeta(CostState, allocator, source);
+        cs.started = cs.start_time_ms != 0;
         return cs;
-    }
-
-    /// Extract a u64 from a `std.json.Value` (integer/float/number_string).
-    fn jsonIntU64(v: std.json.Value) ?u64 {
-        return switch (v) {
-            .integer => |i| if (i >= 0) @intCast(i) else null,
-            .float => |f| if (f >= 0 and f <= @as(f64, @floatFromInt(std.math.maxInt(u64)))) @intFromFloat(f) else null,
-            .number_string => |s| std.fmt.parseInt(u64, s, 10) catch null,
-            else => null,
-        };
-    }
-
-    /// Extract an i64 from a `std.json.Value` (integer/float/number_string).
-    fn jsonIntI64(v: std.json.Value) ?i64 {
-        return switch (v) {
-            .integer => |i| i,
-            .float => |f| if (f >= @as(f64, @floatFromInt(std.math.minInt(i64))) and f <= @as(f64, @floatFromInt(std.math.maxInt(i64)))) @intFromFloat(f) else null,
-            .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
-            else => null,
-        };
     }
 };
 
@@ -675,48 +632,16 @@ pub const Diagnostics = struct {
         try jw.endObject();
     }
 
-    /// Deserialize from a `std.json.Value`. Expects camelCase keys.
-    /// String fields are duped into `allocator`.
+    /// Parse a `std.json.Value` (object) into a `Diagnostics` via the
+    /// generic `json_meta.parseWithMeta` helper. String fields are
+    /// duped into `allocator` by `parseFromValueLeaky`.
     pub fn jsonParseFromValue(
         allocator: std.mem.Allocator,
         source: std.json.Value,
         options: std.json.ParseOptions,
     ) !Diagnostics {
         _ = options;
-        if (source != .object) return error.UnexpectedToken;
-        const o = source.object;
-
-        var d: Diagnostics = .{};
-
-        if (o.get("traceId")) |v| if (v == .string) {
-            d.trace_id = try allocator.dupe(u8, v.string);
-        };
-        if (o.get("finishReasonRaw")) |v| if (v == .string) {
-            d.finish_reason_raw = try allocator.dupe(u8, v.string);
-        };
-        if (o.get("partsSeen")) |v| if (v == .integer) {
-            d.parts_seen = @intCast(v.integer);
-        };
-        if (o.get("candidatesTokens")) |v| if (v == .integer) {
-            d.candidates_tokens = @intCast(v.integer);
-        };
-        if (o.get("thoughtsTokens")) |v| if (v == .integer) {
-            d.thoughts_tokens = @intCast(v.integer);
-        };
-        if (o.get("textEvents")) |v| if (v == .integer) {
-            d.text_event_count = @intCast(v.integer);
-        };
-        if (o.get("thinkingEvents")) |v| if (v == .integer) {
-            d.thinking_event_count = @intCast(v.integer);
-        };
-        if (o.get("toolCallEvents")) |v| if (v == .integer) {
-            d.tool_call_event_count = @intCast(v.integer);
-        };
-        if (o.get("wasDegenerate")) |v| if (v == .bool) {
-            d.was_degenerate = v.bool;
-        };
-
-        return d;
+        return json_meta_mod.parseWithMeta(Diagnostics, allocator, source);
     }
 };
 
