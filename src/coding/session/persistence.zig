@@ -109,6 +109,74 @@ pub const SessionHeader = struct {
     thinking_level: []const u8,
     active_branch: []const u8 = "main",
     system_prompt_hash: []const u8 = "",
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    // Wire format uses camelCase keys. The `version` field is not
+    // stored on the struct (it's a module-level constant) so the
+    // custom `jsonStringify` prepends it manually.
+
+    pub const json_meta = .{
+        .created_at_ms = .{ .rename = "createdAtMs" },
+        .updated_at_ms = .{ .rename = "updatedAtMs" },
+        .thinking_level = .{ .rename = "thinkingLevel" },
+        .active_branch = .{ .rename = "activeBranch" },
+        .system_prompt_hash = .{ .rename = "systemPromptHash" },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer. Emits the
+    /// `version` field first, then all struct fields with camelCase
+    /// wire names.
+    pub fn jsonStringify(self: SessionHeader, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(current_session_version);
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("createdAtMs");
+        try jw.write(self.created_at_ms);
+        try jw.objectField("updatedAtMs");
+        try jw.write(self.updated_at_ms);
+        try jw.objectField("title");
+        try jw.write(self.title);
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("api");
+        try jw.write(self.api);
+        try jw.objectField("thinkingLevel");
+        try jw.write(self.thinking_level);
+        try jw.objectField("activeBranch");
+        try jw.write(self.active_branch);
+        try jw.objectField("systemPromptHash");
+        try jw.write(self.system_prompt_hash);
+        try jw.endObject();
+    }
+
+    /// Deserialize from a `std.json.Value`. Expects camelCase keys.
+    /// String fields are duped into `allocator`. Missing fields get
+    /// sensible defaults.
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !SessionHeader {
+        _ = options;
+        if (source != .object) return error.UnexpectedToken;
+        const o = source.object;
+        return .{
+            .id = try allocator.dupe(u8, strOpt(o, "id") orelse ""),
+            .created_at_ms = if (o.get("createdAtMs")) |v| v.integer else 0,
+            .updated_at_ms = if (o.get("updatedAtMs")) |v| v.integer else 0,
+            .title = try allocator.dupe(u8, strOpt(o, "title") orelse ""),
+            .provider = try allocator.dupe(u8, strOpt(o, "provider") orelse ""),
+            .model = try allocator.dupe(u8, strOpt(o, "model") orelse ""),
+            .api = try allocator.dupe(u8, strOpt(o, "api") orelse ""),
+            .thinking_level = try allocator.dupe(u8, strOpt(o, "thinkingLevel") orelse "off"),
+            .active_branch = try allocator.dupe(u8, strOpt(o, "activeBranch") orelse "main"),
+            .system_prompt_hash = try allocator.dupe(u8, strOpt(o, "systemPromptHash") orelse ""),
+        };
+    }
 };
 
 /// Write `session.json` atomically under `session_dir`.
@@ -120,19 +188,13 @@ pub fn writeSessionHeader(
 ) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\n");
-    try writeJsonField(&buf, allocator, "version", current_session_version, false);
-    try writeJsonStrField(&buf, allocator, "id", header.id, false);
-    try writeJsonField(&buf, allocator, "createdAtMs", header.created_at_ms, false);
-    try writeJsonField(&buf, allocator, "updatedAtMs", header.updated_at_ms, false);
-    try writeJsonStrField(&buf, allocator, "title", header.title, false);
-    try writeJsonStrField(&buf, allocator, "provider", header.provider, false);
-    try writeJsonStrField(&buf, allocator, "model", header.model, false);
-    try writeJsonStrField(&buf, allocator, "api", header.api, false);
-    try writeJsonStrField(&buf, allocator, "thinkingLevel", header.thinking_level, false);
-    try writeJsonStrField(&buf, allocator, "activeBranch", header.active_branch, false);
-    try writeJsonStrField(&buf, allocator, "systemPromptHash", header.system_prompt_hash, true);
-    try buf.appendSlice(allocator, "\n}\n");
+    // v1.34.0 — serialized via `SessionHeader.jsonStringify` hook.
+    const json_str = try std.json.Stringify.valueAlloc(allocator, header, .{
+        .whitespace = .indent_2,
+    });
+    defer allocator.free(json_str);
+    try buf.appendSlice(allocator, json_str);
+    try buf.append(allocator, '\n');
 
     const path = try std.fs.path.join(allocator, &.{ session_dir, "session.json" });
     defer allocator.free(path);
@@ -158,18 +220,12 @@ pub fn readSessionHeader(
     const version = if (obj.get("version")) |v| v.integer else 0;
     if (version > current_session_version) return error.UnsupportedSessionVersion;
 
-    return .{
-        .id = try allocator.dupe(u8, strOpt(obj, "id") orelse ""),
-        .created_at_ms = if (obj.get("createdAtMs")) |v| v.integer else 0,
-        .updated_at_ms = if (obj.get("updatedAtMs")) |v| v.integer else 0,
-        .title = try allocator.dupe(u8, strOpt(obj, "title") orelse ""),
-        .provider = try allocator.dupe(u8, strOpt(obj, "provider") orelse ""),
-        .model = try allocator.dupe(u8, strOpt(obj, "model") orelse ""),
-        .api = try allocator.dupe(u8, strOpt(obj, "api") orelse ""),
-        .thinking_level = try allocator.dupe(u8, strOpt(obj, "thinkingLevel") orelse "off"),
-        .active_branch = try allocator.dupe(u8, strOpt(obj, "activeBranch") orelse "main"),
-        .system_prompt_hash = try allocator.dupe(u8, strOpt(obj, "systemPromptHash") orelse ""),
-    };
+    // v1.34.0 — parsed via `SessionHeader.jsonParseFromValue` hook.
+    // Uses `parseFromValueLeaky` with the caller's allocator so string
+    // fields are owned by the struct (freed via `freeSessionHeader`).
+    return std.json.parseFromValueLeaky(SessionHeader, allocator, parsed.value, .{
+        .ignore_unknown_fields = true,
+    });
 }
 
 /// Free all strings allocated by `readSessionHeader`.
@@ -1211,44 +1267,6 @@ fn parseContentBlock(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.ty
     }
     // Unknown type → text fallback.
     return .{ .text = .{ .text = try allocator.dupe(u8, "") } };
-}
-
-fn writeJsonField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    value: anytype,
-    last: bool,
-) !void {
-    try buf.appendSlice(allocator, "  ");
-    try appendJsonStr(buf, allocator, name);
-    try buf.append(allocator, ':');
-    try buf.append(allocator, ' ');
-    switch (@typeInfo(@TypeOf(value))) {
-        .int, .comptime_int => {
-            const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
-            defer allocator.free(s);
-            try buf.appendSlice(allocator, s);
-        },
-        else => @compileError("writeJsonField only supports integers"),
-    }
-    if (!last) try buf.append(allocator, ',');
-    try buf.append(allocator, '\n');
-}
-
-fn writeJsonStrField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    value: []const u8,
-    last: bool,
-) !void {
-    try buf.appendSlice(allocator, "  ");
-    try appendJsonStr(buf, allocator, name);
-    try buf.appendSlice(allocator, ": ");
-    try appendJsonStr(buf, allocator, value);
-    if (!last) try buf.append(allocator, ',');
-    try buf.append(allocator, '\n');
 }
 
 fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
