@@ -5,6 +5,7 @@
 //! call `deinit(allocator)` to release.
 
 const std = @import("std");
+const json_meta = @import("json_meta.zig");
 
 /// TextContent — `TextContent` in spec.
 pub const TextContent = struct {
@@ -180,6 +181,178 @@ pub const Usage = struct {
             self.web_search_requests == 0 and
             self.cost_input == null and self.cost_output == null and
             self.cost_cache_read == null and self.cost_cache_write == null;
+    }
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    //
+    // `Usage` opts into `std.json.Stringify` / `std.json.parseFromValue`
+    // via the `jsonStringify` and `jsonParseFromValue` hooks. A
+    // `json_meta` anonymous struct maps Zig field names to the
+    // Claude-Code-compatible wire keys; `json_meta.stringifyWithMeta`
+    // validates at comptime that every renamed field actually exists.
+    //
+    // The serialization has two provider-specific quirks that prevent
+    // using the plain `stringifyWithMeta` helper:
+    //   1. `input` is emitted as `input_tokens` with the *uncached*
+    //      portion (`input - cache_read - cache_write`), not the raw
+    //      stored total.
+    //   2. Zero-valued integer fields are omitted entirely (Claude-Code
+    //      compatibility) rather than emitted as `0`.
+    // The custom `jsonStringify` below handles both while still using
+    // `jw.write(...)` for all value formatting (escaping, numbers).
+
+    /// Wire-key rename map for `Usage` fields. Comptime-validated by
+    /// `json_meta.stringifyWithMeta` / `json_meta.fieldConfig`.
+    pub const json_meta = .{
+        .input = .{ .rename = "input_tokens" },
+        .output = .{ .rename = "output_tokens" },
+        .cache_read = .{ .rename = "cache_read_input_tokens" },
+        .cache_write = .{ .rename = "cache_creation_input_tokens" },
+        .cache_creation_ephemeral_5m = .{ .rename = "cache_creation_5m_input_tokens" },
+        .cache_creation_ephemeral_1h = .{ .rename = "cache_creation_1h_input_tokens" },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer. Emits the
+    /// Claude-Code-compatible wire shape: `input_tokens` carries the
+    /// uncached portion, zero-valued token fields are omitted, and
+    /// null cost fields are omitted.
+    pub fn jsonStringify(self: Usage, jw: anytype) !void {
+        try jw.beginObject();
+
+        // input_tokens — uncached portion (total minus cache hits).
+        // Claude Code reports only the uncached portion; franky's
+        // `Usage.input` includes cached tokens (the provider's total
+        // `prompt_tokens`), so subtract cache_read + cache_write
+        // (clamped ≥ 0). Saturating add guards against u64 overflow.
+        const cached = self.cache_read +| self.cache_write;
+        const uncached_input: u64 = if (self.input > cached) self.input - cached else 0;
+        if (uncached_input != 0) {
+            try jw.objectField("input_tokens");
+            try jw.write(uncached_input);
+        }
+
+        // output_tokens
+        if (self.output != 0) {
+            try jw.objectField("output_tokens");
+            try jw.write(self.output);
+        }
+
+        // cache_read_input_tokens
+        if (self.cache_read != 0) {
+            try jw.objectField("cache_read_input_tokens");
+            try jw.write(self.cache_read);
+        }
+
+        // cache_creation_input_tokens
+        if (self.cache_write != 0) {
+            try jw.objectField("cache_creation_input_tokens");
+            try jw.write(self.cache_write);
+        }
+
+        // thinking_tokens (franky extension, snake_case)
+        if (self.thinking_tokens != 0) {
+            try jw.objectField("thinking_tokens");
+            try jw.write(self.thinking_tokens);
+        }
+
+        // cache_creation_5m_input_tokens
+        if (self.cache_creation_ephemeral_5m != 0) {
+            try jw.objectField("cache_creation_5m_input_tokens");
+            try jw.write(self.cache_creation_ephemeral_5m);
+        }
+
+        // cache_creation_1h_input_tokens
+        if (self.cache_creation_ephemeral_1h != 0) {
+            try jw.objectField("cache_creation_1h_input_tokens");
+            try jw.write(self.cache_creation_ephemeral_1h);
+        }
+
+        // web_search_requests
+        if (self.web_search_requests != 0) {
+            try jw.objectField("web_search_requests");
+            try jw.write(self.web_search_requests);
+        }
+
+        // Cost fields — optional f64, omit when null.
+        if (self.cost_input) |ci| {
+            try jw.objectField("cost_input");
+            try jw.write(ci);
+        }
+        if (self.cost_output) |co| {
+            try jw.objectField("cost_output");
+            try jw.write(co);
+        }
+        if (self.cost_cache_read) |cr| {
+            try jw.objectField("cost_cache_read");
+            try jw.write(cr);
+        }
+        if (self.cost_cache_write) |cw| {
+            try jw.objectField("cost_cache_write");
+            try jw.write(cw);
+        }
+
+        try jw.endObject();
+    }
+
+    /// Deserialize from a `std.json.Value`. Accepts both v5
+    /// (Claude-Code `snake_case`) and v4 (franky `camelCase`) key
+    /// names. Restores the provider-reported total into `input` from
+    /// the uncached `input_tokens` by adding back cache hits.
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Usage {
+        _ = allocator;
+        _ = options;
+        if (source != .object) return error.UnexpectedToken;
+        const o = source.object;
+
+        var u: Usage = .{};
+
+        // input — v4 `input` is the total; v5 `input_tokens` is
+        // uncached. We restore the total so the internal model sees
+        // the provider-reported prompt_tokens.
+        const input_from_v4 = if (o.get("input")) |v| jsonInt(v) else null;
+        const input_from_v5 = if (o.get("input_tokens")) |v| jsonInt(v) else null;
+        u.output = if (o.get("output")) |v| jsonInt(v) orelse 0 else if (o.get("output_tokens")) |v| jsonInt(v) orelse 0 else 0;
+        u.cache_read = if (o.get("cacheRead")) |v| jsonInt(v) orelse 0 else if (o.get("cache_read_input_tokens")) |v| jsonInt(v) orelse 0 else 0;
+        u.cache_write = if (o.get("cacheWrite")) |v| jsonInt(v) orelse 0 else if (o.get("cache_creation_input_tokens")) |v| jsonInt(v) orelse 0 else 0;
+        u.thinking_tokens = if (o.get("thinkingTokens")) |v| jsonInt(v) orelse 0 else if (o.get("thinking_tokens")) |v| jsonInt(v) orelse 0 else 0;
+        u.cache_creation_ephemeral_5m = if (o.get("cacheCreationEphemeral5m")) |v| jsonInt(v) orelse 0 else if (o.get("cache_creation_5m_input_tokens")) |v| jsonInt(v) orelse 0 else 0;
+        u.cache_creation_ephemeral_1h = if (o.get("cacheCreationEphemeral1h")) |v| jsonInt(v) orelse 0 else if (o.get("cache_creation_1h_input_tokens")) |v| jsonInt(v) orelse 0 else 0;
+        u.web_search_requests = if (o.get("webSearchRequests")) |v| jsonInt(v) orelse 0 else if (o.get("web_search_requests")) |v| jsonInt(v) orelse 0 else 0;
+        u.cost_input = if (o.get("costInput")) |v| jsonFloat(v) else if (o.get("cost_input")) |v| jsonFloat(v) else null;
+        u.cost_output = if (o.get("costOutput")) |v| jsonFloat(v) else if (o.get("cost_output")) |v| jsonFloat(v) else null;
+        u.cost_cache_read = if (o.get("costCacheRead")) |v| jsonFloat(v) else if (o.get("cost_cache_read")) |v| jsonFloat(v) else null;
+        u.cost_cache_write = if (o.get("costCacheWrite")) |v| jsonFloat(v) else if (o.get("cost_cache_write")) |v| jsonFloat(v) else null;
+
+        // Fix up: if we only had v5 `input_tokens` (uncached), add
+        // back the cached tokens to restore the provider total.
+        u.input = input_from_v4 orelse (input_from_v5 orelse 0) + u.cache_read + u.cache_write;
+
+        return u;
+    }
+
+    /// Extract a u64 from a `std.json.Value` (integer or float).
+    fn jsonInt(v: std.json.Value) ?u64 {
+        return switch (v) {
+            .integer => |i| if (i >= 0) @intCast(i) else null,
+            .float => |f| if (f >= 0 and f <= @as(f64, @floatFromInt(std.math.maxInt(u64)))) @intFromFloat(f) else null,
+            .number_string => |s| std.fmt.parseInt(u64, s, 10) catch null,
+            else => null,
+        };
+    }
+
+    /// Extract an f64 from a `std.json.Value` (integer, float, or
+    /// number_string).
+    fn jsonFloat(v: std.json.Value) ?f64 {
+        return switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            .number_string => |s| std.fmt.parseFloat(f64, s) catch null,
+            else => null,
+        };
     }
 };
 
@@ -567,4 +740,160 @@ test "StopReason round-trips" {
     try std.testing.expectEqual(StopReason.tool_use, StopReason.fromString("tool_use").?);
     try std.testing.expectEqual(StopReason.tool_use, StopReason.fromString("toolUse").?);
     try std.testing.expectEqualStrings("toolUse", StopReason.tool_use.toString());
+}
+
+// ─── Usage JSON (de)serialization tests ──────────────────────────────
+
+test "Usage.jsonStringify emits Claude-Code-compatible keys with uncached input" {
+    const u: Usage = .{
+        .input = 1000, // total (incl. cached)
+        .output = 500,
+        .cache_read = 200,
+        .cache_write = 100,
+        .thinking_tokens = 50,
+        .cost_input = 0.01,
+        .cost_output = 0.02,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, u, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // uncached_input = 1000 - 200 - 100 = 700
+    // zero fields (web_search_requests, ephemeral) are omitted
+    // null cost fields (cost_cache_read, cost_cache_write) are omitted
+    try std.testing.expectEqualStrings(
+        "{\"input_tokens\":700,\"output_tokens\":500," ++
+            "\"cache_read_input_tokens\":200," ++
+            "\"cache_creation_input_tokens\":100," ++
+            "\"thinking_tokens\":50," ++
+            "\"cost_input\":0.01,\"cost_output\":0.02}",
+        json_str,
+    );
+}
+
+test "Usage.jsonStringify omits all zero fields" {
+    const u: Usage = .{
+        .input = 100,
+        .output = 0,
+        .cache_read = 0,
+        .cache_write = 0,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, u, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Only input_tokens (uncached = 100) is non-zero.
+    try std.testing.expectEqualStrings("{\"input_tokens\":100}", json_str);
+}
+
+test "Usage round-trip: stringify then parseFromValue restores original" {
+    const original: Usage = .{
+        .input = 1000,
+        .output = 500,
+        .cache_read = 200,
+        .cache_write = 100,
+        .thinking_tokens = 50,
+        .cache_creation_ephemeral_5m = 30,
+        .cache_creation_ephemeral_1h = 20,
+        .web_search_requests = 5,
+        .cost_input = 0.01,
+        .cost_output = 0.02,
+        .cost_cache_read = 0.003,
+        .cost_cache_write = 0.004,
+    };
+
+    // Serialize
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, original, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Parse back via the jsonParseFromValue hook.
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    // input is stored as total; serialization emits uncached (700),
+    // parse restores total (700 + 200 + 100 = 1000).
+    try std.testing.expectEqual(@as(u64, 1000), u.input);
+    try std.testing.expectEqual(@as(u64, 500), u.output);
+    try std.testing.expectEqual(@as(u64, 200), u.cache_read);
+    try std.testing.expectEqual(@as(u64, 100), u.cache_write);
+    try std.testing.expectEqual(@as(u64, 50), u.thinking_tokens);
+    try std.testing.expectEqual(@as(u64, 30), u.cache_creation_ephemeral_5m);
+    try std.testing.expectEqual(@as(u64, 20), u.cache_creation_ephemeral_1h);
+    try std.testing.expectEqual(@as(u64, 5), u.web_search_requests);
+    try std.testing.expectEqual(@as(?f64, 0.01), u.cost_input);
+    try std.testing.expectEqual(@as(?f64, 0.02), u.cost_output);
+    try std.testing.expectEqual(@as(?f64, 0.003), u.cost_cache_read);
+    try std.testing.expectEqual(@as(?f64, 0.004), u.cost_cache_write);
+}
+
+test "Usage.jsonParseFromValue accepts v5 snake_case keys" {
+    const json_str =
+        "{\"input_tokens\":700,\"output_tokens\":500," ++
+        "\"cache_read_input_tokens\":200," ++
+        "\"cache_creation_input_tokens\":100," ++
+        "\"thinking_tokens\":50," ++
+        "\"web_search_requests\":5," ++
+        "\"cost_input\":0.01,\"cost_output\":0.02}";
+
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    // input is restored as total: uncached(700) + cache_read(200) + cache_write(100) = 1000
+    try std.testing.expectEqual(@as(u64, 1000), u.input);
+    try std.testing.expectEqual(@as(u64, 500), u.output);
+    try std.testing.expectEqual(@as(u64, 200), u.cache_read);
+    try std.testing.expectEqual(@as(u64, 100), u.cache_write);
+    try std.testing.expectEqual(@as(u64, 50), u.thinking_tokens);
+    try std.testing.expectEqual(@as(u64, 5), u.web_search_requests);
+    try std.testing.expectEqual(@as(?f64, 0.01), u.cost_input);
+    try std.testing.expectEqual(@as(?f64, 0.02), u.cost_output);
+}
+
+test "Usage.jsonParseFromValue accepts v4 camelCase keys" {
+    const json_str =
+        "{\"input\":1000,\"output\":500," ++
+        "\"cacheRead\":200,\"cacheWrite\":100," ++
+        "\"thinkingTokens\":50," ++
+        "\"webSearchRequests\":5," ++
+        "\"costInput\":0.01,\"costOutput\":0.02}";
+
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    // v4 `input` is the total, so no fix-up needed.
+    try std.testing.expectEqual(@as(u64, 1000), u.input);
+    try std.testing.expectEqual(@as(u64, 500), u.output);
+    try std.testing.expectEqual(@as(u64, 200), u.cache_read);
+    try std.testing.expectEqual(@as(u64, 100), u.cache_write);
+    try std.testing.expectEqual(@as(u64, 50), u.thinking_tokens);
+    try std.testing.expectEqual(@as(u64, 5), u.web_search_requests);
+    try std.testing.expectEqual(@as(?f64, 0.01), u.cost_input);
+    try std.testing.expectEqual(@as(?f64, 0.02), u.cost_output);
+}
+
+test "Usage.jsonParseFromValue handles empty object" {
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    try std.testing.expect(u.isEmpty());
 }
