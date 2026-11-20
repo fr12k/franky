@@ -20,6 +20,7 @@
 //! glue settles.
 
 const std = @import("std");
+const ai_utils = @import("../ai/utils.zig");
 
 pub const RpcError = error{
     MalformedFrame,
@@ -169,7 +170,7 @@ pub fn encodeResponse(allocator: std.mem.Allocator, resp: Response) ![]u8 {
         try buf.appendSlice(allocator, ",\"error\":{\"code\":");
         try appendJsonInt(&buf, allocator, e.code);
         try buf.appendSlice(allocator, ",\"message\":");
-        try appendJsonStr(&buf, allocator, e.message);
+        try ai_utils.appendJsonStr(&buf, allocator, e.message);
         try buf.append(allocator, '}');
     } else if (resp.result_raw) |r| {
         try buf.appendSlice(allocator, ",\"result\":");
@@ -189,7 +190,7 @@ pub fn encodeNotification(
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"method\":");
-    try appendJsonStr(&buf, allocator, method);
+    try ai_utils.appendJsonStr(&buf, allocator, method);
     if (params_raw) |p| {
         try buf.appendSlice(allocator, ",\"params\":");
         try buf.appendSlice(allocator, p);
@@ -212,7 +213,7 @@ fn renderJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: std.json
             const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
             try buf.appendSlice(allocator, s);
         },
-        .string => |s| try appendJsonStr(buf, allocator, s),
+        .string => |s| try ai_utils.appendJsonStr(buf, allocator, s),
         .array => |arr| {
             try buf.append(allocator, '[');
             for (arr.items, 0..) |item, i| {
@@ -227,7 +228,7 @@ fn renderJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: std.json
             var first = true;
             while (it.next()) |e| {
                 if (!first) try buf.append(allocator, ',');
-                try appendJsonStr(buf, allocator, e.key_ptr.*);
+                try ai_utils.appendJsonStr(buf, allocator, e.key_ptr.*);
                 try buf.append(allocator, ':');
                 try renderJson(buf, allocator, e.value_ptr.*);
                 first = false;
@@ -236,24 +237,6 @@ fn renderJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: std.json
         },
         .number_string => |s| try buf.appendSlice(allocator, s),
     }
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
 }
 
 fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {

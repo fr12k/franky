@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const models = @import("models.zig");
+const ai_utils = @import("../../ai/utils.zig");
 
 pub const RenderOptions = struct {
     /// ISO-8601 timestamp written into `generatedAt`. Caller-supplied
@@ -61,9 +62,7 @@ fn writePreamble(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, opts: *c
     try buf.appendSlice(allocator, ind1);
     try buf.appendSlice(allocator, "\"generatedAt\":");
     try buf.appendSlice(allocator, sp);
-    try buf.append(allocator, '"');
-    try appendJsonString(buf, allocator, opts.generated_at);
-    try buf.append(allocator, '"');
+    try ai_utils.appendJsonStr(buf, allocator, opts.generated_at);
     try buf.appendSlice(allocator, ",");
     try buf.appendSlice(allocator, nl);
 
@@ -181,9 +180,7 @@ fn writeStringField(
     try buf.append(allocator, '"');
     try buf.append(allocator, ':');
     if (pretty) try buf.append(allocator, ' ');
-    try buf.append(allocator, '"');
-    try appendJsonString(buf, allocator, val);
-    try buf.append(allocator, '"');
+    try ai_utils.appendJsonStr(buf, allocator, val);
 }
 
 fn writeCapabilities(
@@ -251,22 +248,6 @@ fn writeCost(
 
 /// Append `s` with JSON-string escaping. Handles `"`, `\`, control
 /// chars; assumes valid UTF-8.
-fn appendJsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    for (s) |b| switch (b) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0x00...0x07, 0x0B, 0x0E...0x1F => {
-            const esc = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{b});
-            defer allocator.free(esc);
-            try buf.appendSlice(allocator, esc);
-        },
-        else => try buf.append(allocator, b),
-    };
-}
-
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;

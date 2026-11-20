@@ -154,7 +154,7 @@ pub fn renderTreeJson(allocator: std.mem.Allocator, tree: *const Tree) TreeIoErr
     try buf.appendSlice(allocator, "{\"version\":");
     try writeInt(&buf, allocator, @intCast(current_tree_version));
     try buf.appendSlice(allocator, ",\"active\":");
-    try writeJsonStr(&buf, allocator, tree.active);
+    try utils.appendJsonStr(&buf, allocator, tree.active);
     try buf.appendSlice(allocator, ",\"branches\":[");
     var first = true;
     var it = tree.branches.iterator();
@@ -164,10 +164,10 @@ pub fn renderTreeJson(allocator: std.mem.Allocator, tree: *const Tree) TreeIoErr
         const b = entry.value_ptr.*;
         try buf.append(allocator, '{');
         try buf.appendSlice(allocator, "\"name\":");
-        try writeJsonStr(&buf, allocator, b.name);
+        try utils.appendJsonStr(&buf, allocator, b.name);
         try buf.appendSlice(allocator, ",\"parent\":");
         if (b.parent) |p| {
-            try writeJsonStr(&buf, allocator, p);
+            try utils.appendJsonStr(&buf, allocator, p);
         } else {
             try buf.appendSlice(allocator, "null");
         }
@@ -177,7 +177,7 @@ pub fn renderTreeJson(allocator: std.mem.Allocator, tree: *const Tree) TreeIoErr
         try writeInt(&buf, allocator, b.message_count);
         if (b.head_hash.len > 0) {
             try buf.appendSlice(allocator, ",\"headHash\":");
-            try writeJsonStr(&buf, allocator, b.head_hash);
+            try utils.appendJsonStr(&buf, allocator, b.head_hash);
         }
         try buf.append(allocator, '}');
     }
@@ -246,25 +246,6 @@ pub fn parseTreeJson(allocator: std.mem.Allocator, body: []const u8) TreeIoError
     return tree;
 }
 
-fn writeJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-            var enc: [6]u8 = .{ '\\', 'u', '0', '0', 0, 0 };
-            const hex = "0123456789abcdef";
-            enc[4] = hex[(c >> 4) & 0x0f];
-            enc[5] = hex[c & 0x0f];
-            try buf.appendSlice(allocator, &enc);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
 
 fn writeInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: u32) !void {
     const s = try std.fmt.allocPrint(allocator, "{d}", .{n});
