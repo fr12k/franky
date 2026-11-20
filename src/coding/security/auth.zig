@@ -238,7 +238,7 @@ fn renderAuthJson(
     while (it.next()) |entry| {
         if (!first) try buf.append(allocator, ',');
         first = false;
-        try writeJsonString(buf, allocator, entry.key_ptr.*);
+        try utils.appendJsonStr(buf, allocator, entry.key_ptr.*);
         try buf.append(allocator, ':');
         try renderProvider(buf, allocator, entry.value_ptr);
     }
@@ -252,7 +252,7 @@ fn renderProvider(
 ) !void {
     try buf.append(allocator, '{');
     try buf.appendSlice(allocator, "\"type\":");
-    try writeJsonString(buf, allocator, switch (pa.type) {
+    try utils.appendJsonStr(buf, allocator, switch (pa.type) {
         .api_key => "apiKey",
         .oauth => "oauth",
     });
@@ -271,33 +271,9 @@ fn writeJsonField(
     value: []const u8,
 ) !void {
     try buf.append(allocator, ',');
-    try writeJsonString(buf, allocator, key);
+    try utils.appendJsonStr(buf, allocator, key);
     try buf.append(allocator, ':');
-    try writeJsonString(buf, allocator, value);
-}
-
-fn writeJsonString(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    s: []const u8,
-) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-            var enc: [6]u8 = .{ '\\', 'u', '0', '0', 0, 0 };
-            const hex = "0123456789abcdef";
-            enc[4] = hex[(c >> 4) & 0x0f];
-            enc[5] = hex[c & 0x0f];
-            try buf.appendSlice(allocator, &enc);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
+    try utils.appendJsonStr(buf, allocator, value);
 }
 
 /// Build a credential record suitable for `Auth.providers.put` from
