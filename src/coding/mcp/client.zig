@@ -500,10 +500,26 @@ fn callRemoteWithHeaders(
     defer req.deinit();
 
     req.transfer_encoding = .{ .content_length = payload.len };
-    var body = try req.sendBodyUnflushed(&.{});
-    try body.writer.writeAll(payload);
-    try body.end();
-    if (req.connection) |conn| try conn.flush() else return error.HttpErrorStatus;
+    // On any write failure mark the connection closing — a failed
+    // write leaves the connection state unknown (stale keep-alive,
+    // half-open TCP), and Request.deinit would otherwise release it
+    // back to the pool for the next caller to trip over.
+    var body = req.sendBodyUnflushed(&.{}) catch |e| {
+        if (req.connection) |conn| conn.closing = true;
+        return e;
+    };
+    body.writer.writeAll(payload) catch |e| {
+        if (req.connection) |conn| conn.closing = true;
+        return e;
+    };
+    body.end() catch |e| {
+        if (req.connection) |conn| conn.closing = true;
+        return e;
+    };
+    if (req.connection) |conn| conn.flush() catch |e| {
+        conn.closing = true;
+        return e;
+    } else return error.HttpErrorStatus;
 
     var redirect_buf: [8 * 1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
