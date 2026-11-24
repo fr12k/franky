@@ -34,7 +34,9 @@ pub fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i
 }
 
 pub fn appendJsonFloat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, f: f32) !void {
-    var tmp: [32]u8 = undefined;
+    // `{d}` for f32 can emit up to ~48 chars (denormals like -1e-45); 64
+    // covers every finite f32 with headroom. A smaller buffer would panic.
+    var tmp: [64]u8 = undefined;
     const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
     try buf.appendSlice(allocator, s);
 }

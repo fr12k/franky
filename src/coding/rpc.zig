@@ -20,6 +20,7 @@
 //! glue settles.
 
 const std = @import("std");
+const ai_utils = @import("../ai/utils.zig");
 
 pub const RpcError = error{
     MalformedFrame,
@@ -71,10 +72,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, body: []const u8) !Request {
     if (o.get("params")) |pv| {
         // Re-serialize the params sub-object as a raw slice so the
         // caller can re-parse without a second json.Value pass.
-        var tmp: std.ArrayList(u8) = .empty;
-        defer tmp.deinit(allocator);
-        try renderJson(&tmp, allocator, pv);
-        req.params_raw = try allocator.dupe(u8, tmp.items);
+        req.params_raw = try std.json.Stringify.valueAlloc(allocator, pv, .{});
     }
 
     return req;
@@ -155,21 +153,17 @@ pub fn encodeResponse(allocator: std.mem.Allocator, resp: Response) ![]u8 {
     if (resp.id) |idv| {
         try buf.appendSlice(allocator, ",\"id\":");
         switch (idv) {
-            .number => |n| try appendJsonInt(&buf, allocator, n),
-            .string => |s| {
-                try buf.append(allocator, '"');
-                try buf.appendSlice(allocator, s);
-                try buf.append(allocator, '"');
-            },
+            .number => |n| try ai_utils.appendJsonInt(&buf, allocator, n),
+            .string => |s| try ai_utils.appendJsonStr(&buf, allocator, s),
         }
     } else {
         try buf.appendSlice(allocator, ",\"id\":null");
     }
     if (resp.err) |e| {
         try buf.appendSlice(allocator, ",\"error\":{\"code\":");
-        try appendJsonInt(&buf, allocator, e.code);
+        try ai_utils.appendJsonInt(&buf, allocator, e.code);
         try buf.appendSlice(allocator, ",\"message\":");
-        try appendJsonStr(&buf, allocator, e.message);
+        try ai_utils.appendJsonStr(&buf, allocator, e.message);
         try buf.append(allocator, '}');
     } else if (resp.result_raw) |r| {
         try buf.appendSlice(allocator, ",\"result\":");
@@ -186,80 +180,29 @@ pub fn encodeNotification(
     method: []const u8,
     params_raw: ?[]const u8,
 ) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"method\":");
-    try appendJsonStr(&buf, allocator, method);
-    if (params_raw) |p| {
-        try buf.appendSlice(allocator, ",\"params\":");
-        try buf.appendSlice(allocator, p);
-    }
-    try buf.append(allocator, '}');
-    return try buf.toOwnedSlice(allocator);
-}
+    // `params_raw` is a pre-serialized JSON blob embedded verbatim via
+    // `.format = .raw_json`; `method` is escaped by std.json. The constant
+    // `jsonrpc` field comes from `json_prefix`.
+    const Notification = struct {
+        method: []const u8,
+        params_raw: ?[]const u8 = null,
 
-fn renderJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: std.json.Value) !void {
-    switch (v) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |i| {
-            var tmp: [20]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .string => |s| try appendJsonStr(buf, allocator, s),
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, i| {
-                if (i > 0) try buf.append(allocator, ',');
-                try renderJson(buf, allocator, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var it = obj.iterator();
-            var first = true;
-            while (it.next()) |e| {
-                if (!first) try buf.append(allocator, ',');
-                try appendJsonStr(buf, allocator, e.key_ptr.*);
-                try buf.append(allocator, ':');
-                try renderJson(buf, allocator, e.value_ptr.*);
-                first = false;
-            }
-            try buf.append(allocator, '}');
-        },
-        .number_string => |s| try buf.appendSlice(allocator, s),
-    }
-}
+        pub const json_prefix = .{
+            .jsonrpc = @as([]const u8, "2.0"),
+        };
 
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
+        pub const json_meta = .{
+            .params_raw = .{ .rename = "params", .format = .raw_json },
+        };
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try @import("../ai/json_meta.zig").stringifyWithMeta(self, jw);
+        }
     };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
+    return std.json.Stringify.valueAlloc(allocator, Notification{
+        .method = method,
+        .params_raw = params_raw,
+    }, .{ .emit_null_optional_fields = false });
 }
 
 // ─── tests ────────────────────────────────────────────────────────

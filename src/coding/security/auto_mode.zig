@@ -39,6 +39,7 @@
 //! parsing is intentionally conservative — when in doubt, block.
 
 const std = @import("std");
+const ai_utils = @import("../../ai/utils.zig");
 const path_safety = @import("path_safety.zig");
 
 // ─── public types ─────────────────────────────────────────────────
@@ -813,21 +814,13 @@ pub fn bashGlobMatches(pattern: []const u8, command: []const u8) bool {
 const testing = std.testing;
 
 fn mkBashJson(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
-    // Escape the command for embedding in a JSON string value.
+    // Escape the command for embedding in a JSON string value, reusing
+    // the canonical shared escaper (also handles control chars).
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"command\":\"");
-    for (command) |c| {
-        switch (c) {
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, c),
-        }
-    }
-    try buf.appendSlice(allocator, "\"}");
+    try buf.appendSlice(allocator, "{\"command\":");
+    try ai_utils.appendJsonStr(&buf, allocator, command);
+    try buf.append(allocator, '}');
     return try buf.toOwnedSlice(allocator);
 }
 

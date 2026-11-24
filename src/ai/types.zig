@@ -5,6 +5,8 @@
 //! call `deinit(allocator)` to release.
 
 const std = @import("std");
+const json_meta = @import("json_meta.zig");
+const json_meta_mod = json_meta; // unshadowed alias for use inside structs that declare their own `json_meta`
 
 /// TextContent — `TextContent` in spec.
 pub const TextContent = struct {
@@ -181,6 +183,113 @@ pub const Usage = struct {
             self.cost_input == null and self.cost_output == null and
             self.cost_cache_read == null and self.cost_cache_write == null;
     }
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    //
+    // `Usage` opts into `std.json.Stringify` / `std.json.parseFromValue`
+    // via the `jsonStringify` and `jsonParseFromValue` hooks. The wire
+    // shape is the Claude-Code-compatible transcript.jsonl v5 format;
+    // `json_meta` declares the rename / omit / compute / alias metadata
+    // and the generic `json_meta` helpers do the (de)serialization.
+    //
+    // Provider-specific quirks, all expressed declaratively:
+    //   1. `input` is emitted as `input_tokens` with the *uncached*
+    //      portion (`input - cache_read - cache_write`) via `.compute`.
+    //   2. Zero-valued integer fields are omitted via `.omit_default`.
+    //   3. Cost fields serialize with a forced decimal point (`0.0` not
+    //      `0`) via `.format = .float_force_decimal` so they round-trip
+    //      as `.float`.
+    //   4. Parse accepts both v5 (snake_case) and v4 (camelCase) key
+    //      names via `.aliases`.
+    // The only piece that stays manual is the parse-side cross-field
+    // fix-up that restores the provider total into `input` from the
+    // uncached `input_tokens` (it reads three fields at once).
+
+    /// Uncached input tokens: the provider total minus cache hits,
+    /// clamped >= 0. Claude Code reports only the uncached portion as
+    /// `input_tokens`; franky's `Usage.input` includes cached tokens.
+    /// Saturating add guards against u64 overflow. Referenced by the
+    /// `.compute` hook in `json_meta`.
+    pub fn uncachedInput(self: Usage) u64 {
+        const cached = self.cache_read +| self.cache_write;
+        return if (self.input > cached) self.input - cached else 0;
+    }
+
+    /// Wire metadata for `Usage`. Comptime-validated by the `json_meta`
+    /// helpers: every renamed/aliased field exists, and the `.compute`
+    /// method is present on the struct.
+    pub const json_meta = .{
+        .input = .{ .rename = "input_tokens", .compute = "uncachedInput", .omit_default = true, .aliases = &.{"input"}, .merge = .first },
+        .output = .{ .rename = "output_tokens", .omit_default = true, .aliases = &.{"output"} },
+        .cache_read = .{ .rename = "cache_read_input_tokens", .omit_default = true, .aliases = &.{"cacheRead"} },
+        .cache_write = .{ .rename = "cache_creation_input_tokens", .omit_default = true, .aliases = &.{"cacheWrite"} },
+        .thinking_tokens = .{ .omit_default = true, .aliases = &.{"thinkingTokens"} },
+        .cache_creation_ephemeral_5m = .{ .rename = "cache_creation_5m_input_tokens", .omit_default = true, .aliases = &.{"cacheCreationEphemeral5m"} },
+        .cache_creation_ephemeral_1h = .{ .rename = "cache_creation_1h_input_tokens", .omit_default = true, .aliases = &.{"cacheCreationEphemeral1h"} },
+        .web_search_requests = .{ .omit_default = true, .aliases = &.{"webSearchRequests"} },
+        .cost_input = .{ .format = .float_force_decimal, .aliases = &.{"costInput"} },
+        .cost_output = .{ .format = .float_force_decimal, .aliases = &.{"costOutput"} },
+        .cost_cache_read = .{ .format = .float_force_decimal, .aliases = &.{"costCacheRead"} },
+        .cost_cache_write = .{ .format = .float_force_decimal, .aliases = &.{"costCacheWrite"} },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer via the generic
+    /// `json_meta.stringifyWithMeta` helper. The Claude-Code-compatible
+    /// wire shape is fully declarative in `json_meta`: `input_tokens`
+    /// carries the uncached portion (`.compute = "uncachedInput"`),
+    /// zero-valued token fields are omitted (`.omit_default`), null cost
+    /// fields are omitted, and present cost fields serialize with a forced
+    /// decimal point (`.format = .float_force_decimal`).
+    pub fn jsonStringify(self: Usage, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
+
+    /// Deserialize from a `std.json.Value`. Accepts both v5
+    /// (Claude-Code `snake_case`) and v4 (franky `camelCase`) key
+    /// names — the dual names come from each field's `.aliases` in
+    /// `json_meta`, parsed by the generic `json_meta.parseWithMeta`.
+    /// Restores the provider-reported total into `input` from the
+    /// uncached `input_tokens` by adding back cache hits.
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Usage {
+        _ = options;
+        if (source != .object) return error.UnexpectedToken;
+        const o = source.object;
+
+        // Parse every field via the generic helper (aliases handle the
+        // v4/v5 dual names; `input` uses `.merge = .first` so a present
+        // v4 `input` total outranks the v5 `input_tokens` alias).
+        var u = try json_meta_mod.parseWithMeta(Usage, allocator, source);
+
+        // Cross-field fix-up, kept manual: `input` is the one field whose
+        // value depends on others. v4 `input` is already the total; v5
+        // `input_tokens` is uncached, so add back the cache hits to
+        // restore the provider-reported total.
+        const input_from_v4 = if (o.get("input")) |v| jsonInt(v) else null;
+        if (input_from_v4 == null) {
+            u.input = u.input + u.cache_read + u.cache_write;
+        }
+
+        return u;
+    }
+
+    /// Extract a u64 from a `std.json.Value` (integer or float).
+    fn jsonInt(v: std.json.Value) ?u64 {
+        return switch (v) {
+            .integer => |i| if (i >= 0) @intCast(i) else null,
+            // Strict upper bound: `@floatFromInt(maxInt(u64))` rounds UP to
+            // 2^64 (f64 can't represent 2^64-1 exactly), so `f <= that`
+            // would admit f == 2^64 and `@intFromFloat` would panic. Use
+            // strict `<` against the exact 2^64 boundary instead.
+            .float => |f| if (f >= 0 and f < @as(f64, @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1))) @intFromFloat(f) else null,
+            .number_string => |s| std.fmt.parseInt(u64, s, 10) catch null,
+            else => null,
+        };
+    }
+
 };
 
 /// v1.32.0 — Session-level cost-state accumulators for the
@@ -211,6 +320,59 @@ pub const CostState = struct {
     start_time_ms: i64 = 0,
     /// True once `start_time_ms` has been latched.
     started: bool = false,
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    //
+    // `CostState` opts into `std.json.Stringify` / `std.json.parseFromValue`
+    // via the `jsonStringify` and `jsonParseFromValue` hooks. The
+    // `json_meta` map below renames Zig snake_case fields to the
+    // Claude-Code-compatible camelCase wire keys used in the
+    // transcript.jsonl `cost-state` aggregate line. `started` is an
+    // internal latch — it is skipped on the wire (its truth is inferred
+    // from the presence of `startTime` on parse).
+
+    pub const json_meta = .{
+        .total_api_duration_ms = .{ .rename = "totalAPIDuration" },
+        .total_api_duration_without_retries_ms = .{ .rename = "totalAPIDurationWithoutRetries" },
+        .total_tool_duration_ms = .{ .rename = "totalToolDuration" },
+        .total_lines_added = .{ .rename = "totalLinesAdded" },
+        .total_lines_removed = .{ .rename = "totalLinesRemoved" },
+        .start_time_ms = .{ .rename = "startTime" },
+        .started = .{ .skip = true },
+    };
+
+    /// Serialize the stored fields to a `std.json.Stringify` writer.
+    /// Emits the six Claude-Code-compatible camelCase fields; `started`
+    /// is skipped (internal latch). The caller (`renderCostStateLine`)
+    /// emits the computed wrapper fields (`type`, `sessionId`,
+    /// `totalCostUSD`, `totalDuration`, `modelUsage`,
+    /// `hasUnknownModelCost`) around this object's fields — see
+    /// `persistence.renderCostStateLine` for the full wire shape.
+    pub fn jsonStringify(self: CostState, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
+
+    /// Parse a `std.json.Value` (object) into a `CostState` via the
+    /// generic `json_meta.parseWithMeta` helper. `started` is inferred
+    /// from the presence of a `startTime` key in the source object
+    /// (the field is skipped on the wire — see `json_meta`).
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !CostState {
+        _ = options;
+        var cs = try json_meta_mod.parseWithMeta(CostState, allocator, source);
+        // `started` is true when the `startTime` key was present AND held an
+        // integer, matching the old manual parser's behavior
+        // (`if (o.get("startTime")) |v| if (v == .integer) { started = true }`).
+        if (source == .object) {
+            if (source.object.get("startTime")) |v| {
+                if (v == .integer) cs.started = true;
+            }
+        }
+        return cs;
+    }
 };
 
 pub const StopReason = enum {
@@ -346,6 +508,44 @@ pub const Diagnostics = struct {
             .tool_call_event_count = self.tool_call_event_count,
             .was_degenerate = self.was_degenerate,
         };
+    }
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    //
+    // Like `Usage`, `Diagnostics` opts into `std.json` via hooks.
+    // The wire format uses camelCase keys and omits zero/null/false
+    // fields (matching the transcript.jsonl v5 shape).
+
+    pub const json_meta = .{
+        .trace_id = .{ .rename = "traceId" },
+        .finish_reason_raw = .{ .rename = "finishReasonRaw" },
+        .parts_seen = .{ .rename = "partsSeen", .omit_default = true },
+        .candidates_tokens = .{ .rename = "candidatesTokens" },
+        .thoughts_tokens = .{ .rename = "thoughtsTokens" },
+        .text_event_count = .{ .rename = "textEvents", .omit_default = true },
+        .thinking_event_count = .{ .rename = "thinkingEvents", .omit_default = true },
+        .tool_call_event_count = .{ .rename = "toolCallEvents", .omit_default = true },
+        .was_degenerate = .{ .rename = "wasDegenerate", .omit_default = true },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer via the generic
+    /// `json_meta.stringifyWithMeta` helper. camelCase renames come from
+    /// `json_meta`; zero-valued integers, `false` bools, and null optionals
+    /// are omitted via `omit_default` + `emit_null_optional_fields`.
+    pub fn jsonStringify(self: Diagnostics, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
+
+    /// Parse a `std.json.Value` (object) into a `Diagnostics` via the
+    /// generic `json_meta.parseWithMeta` helper. String fields are
+    /// duped into `allocator` by `parseFromValueLeaky`.
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Diagnostics {
+        _ = options;
+        return json_meta_mod.parseWithMeta(Diagnostics, allocator, source);
     }
 };
 
@@ -568,3 +768,310 @@ test "StopReason round-trips" {
     try std.testing.expectEqual(StopReason.tool_use, StopReason.fromString("toolUse").?);
     try std.testing.expectEqualStrings("toolUse", StopReason.tool_use.toString());
 }
+
+// ─── Usage JSON (de)serialization tests ──────────────────────────────
+
+test "Usage.jsonStringify emits Claude-Code-compatible keys with uncached input" {
+    const u: Usage = .{
+        .input = 1000, // total (incl. cached)
+        .output = 500,
+        .cache_read = 200,
+        .cache_write = 100,
+        .thinking_tokens = 50,
+        .cost_input = 0.01,
+        .cost_output = 0.02,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, u, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // uncached_input = 1000 - 200 - 100 = 700
+    // zero fields (web_search_requests, ephemeral) are omitted
+    // null cost fields (cost_cache_read, cost_cache_write) are omitted
+    try std.testing.expectEqualStrings(
+        "{\"input_tokens\":700,\"output_tokens\":500," ++
+            "\"cache_read_input_tokens\":200," ++
+            "\"cache_creation_input_tokens\":100," ++
+            "\"thinking_tokens\":50," ++
+            "\"cost_input\":0.01,\"cost_output\":0.02}",
+        json_str,
+    );
+}
+
+test "Usage.jsonStringify omits all zero fields" {
+    const u: Usage = .{
+        .input = 100,
+        .output = 0,
+        .cache_read = 0,
+        .cache_write = 0,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, u, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Only input_tokens (uncached = 100) is non-zero.
+    try std.testing.expectEqualStrings("{\"input_tokens\":100}", json_str);
+}
+
+test "Usage round-trip: stringify then parseFromValue restores original" {
+    const original: Usage = .{
+        .input = 1000,
+        .output = 500,
+        .cache_read = 200,
+        .cache_write = 100,
+        .thinking_tokens = 50,
+        .cache_creation_ephemeral_5m = 30,
+        .cache_creation_ephemeral_1h = 20,
+        .web_search_requests = 5,
+        .cost_input = 0.01,
+        .cost_output = 0.02,
+        .cost_cache_read = 0.003,
+        .cost_cache_write = 0.004,
+    };
+
+    // Serialize
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, original, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Parse back via the jsonParseFromValue hook.
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    // input is stored as total; serialization emits uncached (700),
+    // parse restores total (700 + 200 + 100 = 1000).
+    try std.testing.expectEqual(@as(u64, 1000), u.input);
+    try std.testing.expectEqual(@as(u64, 500), u.output);
+    try std.testing.expectEqual(@as(u64, 200), u.cache_read);
+    try std.testing.expectEqual(@as(u64, 100), u.cache_write);
+    try std.testing.expectEqual(@as(u64, 50), u.thinking_tokens);
+    try std.testing.expectEqual(@as(u64, 30), u.cache_creation_ephemeral_5m);
+    try std.testing.expectEqual(@as(u64, 20), u.cache_creation_ephemeral_1h);
+    try std.testing.expectEqual(@as(u64, 5), u.web_search_requests);
+    try std.testing.expectEqual(@as(?f64, 0.01), u.cost_input);
+    try std.testing.expectEqual(@as(?f64, 0.02), u.cost_output);
+    try std.testing.expectEqual(@as(?f64, 0.003), u.cost_cache_read);
+    try std.testing.expectEqual(@as(?f64, 0.004), u.cost_cache_write);
+}
+
+test "Usage.jsonParseFromValue accepts v5 snake_case keys" {
+    const json_str =
+        "{\"input_tokens\":700,\"output_tokens\":500," ++
+        "\"cache_read_input_tokens\":200," ++
+        "\"cache_creation_input_tokens\":100," ++
+        "\"thinking_tokens\":50," ++
+        "\"web_search_requests\":5," ++
+        "\"cost_input\":0.01,\"cost_output\":0.02}";
+
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    // input is restored as total: uncached(700) + cache_read(200) + cache_write(100) = 1000
+    try std.testing.expectEqual(@as(u64, 1000), u.input);
+    try std.testing.expectEqual(@as(u64, 500), u.output);
+    try std.testing.expectEqual(@as(u64, 200), u.cache_read);
+    try std.testing.expectEqual(@as(u64, 100), u.cache_write);
+    try std.testing.expectEqual(@as(u64, 50), u.thinking_tokens);
+    try std.testing.expectEqual(@as(u64, 5), u.web_search_requests);
+    try std.testing.expectEqual(@as(?f64, 0.01), u.cost_input);
+    try std.testing.expectEqual(@as(?f64, 0.02), u.cost_output);
+}
+
+test "Usage.jsonParseFromValue accepts v4 camelCase keys" {
+    const json_str =
+        "{\"input\":1000,\"output\":500," ++
+        "\"cacheRead\":200,\"cacheWrite\":100," ++
+        "\"thinkingTokens\":50," ++
+        "\"webSearchRequests\":5," ++
+        "\"costInput\":0.01,\"costOutput\":0.02}";
+
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    // v4 `input` is the total, so no fix-up needed.
+    try std.testing.expectEqual(@as(u64, 1000), u.input);
+    try std.testing.expectEqual(@as(u64, 500), u.output);
+    try std.testing.expectEqual(@as(u64, 200), u.cache_read);
+    try std.testing.expectEqual(@as(u64, 100), u.cache_write);
+    try std.testing.expectEqual(@as(u64, 50), u.thinking_tokens);
+    try std.testing.expectEqual(@as(u64, 5), u.web_search_requests);
+    try std.testing.expectEqual(@as(?f64, 0.01), u.cost_input);
+    try std.testing.expectEqual(@as(?f64, 0.02), u.cost_output);
+}
+
+test "Usage.jsonParseFromValue handles empty object" {
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer value_parsed.deinit();
+
+    var parsed = try std.json.parseFromValue(Usage, std.testing.allocator, value_parsed.value, .{});
+    defer parsed.deinit();
+    const u = parsed.value;
+
+    try std.testing.expect(u.isEmpty());
+}
+
+// ─── Diagnostics JSON (de)serialization tests ─────────────────────────
+
+test "Diagnostics.jsonStringify emits camelCase keys, omits defaults" {
+    const d: Diagnostics = .{
+        .trace_id = "trace_123",
+        .finish_reason_raw = "end_turn",
+        .parts_seen = 5,
+        .candidates_tokens = 100,
+        .was_degenerate = true,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, d, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Zero fields (text_event_count, etc.) and null optionals
+    // (thoughts_tokens) are omitted.
+    try std.testing.expectEqualStrings(
+        "{\"traceId\":\"trace_123\",\"finishReasonRaw\":\"end_turn\"," ++
+            "\"partsSeen\":5,\"candidatesTokens\":100,\"wasDegenerate\":true}",
+        json_str,
+    );
+}
+
+test "Diagnostics round-trip: stringify then parseFromValue restores original" {
+    const original: Diagnostics = .{
+        .trace_id = "trace_456",
+        .finish_reason_raw = "tool_calls",
+        .parts_seen = 3,
+        .candidates_tokens = 200,
+        .thoughts_tokens = 50,
+        .text_event_count = 10,
+        .thinking_event_count = 5,
+        .tool_call_event_count = 2,
+        .was_degenerate = false,
+    };
+
+    // Serialize
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, original, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // Parse back via the jsonParseFromValue hook.
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    // Use parseFromValueLeaky with testing.allocator so we can free strings.
+    const d = try std.json.parseFromValueLeaky(Diagnostics, std.testing.allocator, value_parsed.value, .{});
+    defer {
+        if (d.trace_id) |s| std.testing.allocator.free(s);
+        if (d.finish_reason_raw) |s| std.testing.allocator.free(s);
+    }
+
+    try std.testing.expectEqualStrings("trace_456", d.trace_id.?);
+    try std.testing.expectEqualStrings("tool_calls", d.finish_reason_raw.?);
+    try std.testing.expectEqual(@as(u32, 3), d.parts_seen);
+    try std.testing.expectEqual(@as(?u64, 200), d.candidates_tokens);
+    try std.testing.expectEqual(@as(?u64, 50), d.thoughts_tokens);
+    try std.testing.expectEqual(@as(u32, 10), d.text_event_count);
+    try std.testing.expectEqual(@as(u32, 5), d.thinking_event_count);
+    try std.testing.expectEqual(@as(u32, 2), d.tool_call_event_count);
+    try std.testing.expectEqual(false, d.was_degenerate);
+}
+
+test "Diagnostics.jsonParseFromValue handles empty object" {
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer value_parsed.deinit();
+
+    const d = try std.json.parseFromValueLeaky(Diagnostics, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expect(d.isEmpty());
+}
+
+// ─── CostState json_meta hook tests ──────────────────────────────────
+
+test "CostState.jsonStringify emits camelCase wire keys" {
+    const cs = CostState{
+        .total_api_duration_ms = 1234,
+        .total_api_duration_without_retries_ms = 1000,
+        .total_tool_duration_ms = 5678,
+        .total_lines_added = 42,
+        .total_lines_removed = 10,
+        .start_time_ms = 1700000000000,
+        .started = true,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, cs, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    // `started` is skipped; the six stored fields use camelCase keys.
+    try std.testing.expectEqualStrings(
+        "{\"totalAPIDuration\":1234,\"totalAPIDurationWithoutRetries\":1000,\"totalToolDuration\":5678,\"totalLinesAdded\":42,\"totalLinesRemoved\":10,\"startTime\":1700000000000}",
+        json_str,
+    );
+}
+
+test "CostState round-trip: stringify then parseFromValue restores original" {
+    const cs = CostState{
+        .total_api_duration_ms = 9999,
+        .total_api_duration_without_retries_ms = 8888,
+        .total_tool_duration_ms = 7777,
+        .total_lines_added = 100,
+        .total_lines_removed = 50,
+        .start_time_ms = -12345, // negative start time (pre-epoch edge)
+        .started = true,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(std.testing.allocator, cs, .{
+        .emit_null_optional_fields = false,
+    });
+    defer std.testing.allocator.free(json_str);
+
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    const restored = try std.json.parseFromValueLeaky(CostState, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expectEqual(cs.total_api_duration_ms, restored.total_api_duration_ms);
+    try std.testing.expectEqual(cs.total_api_duration_without_retries_ms, restored.total_api_duration_without_retries_ms);
+    try std.testing.expectEqual(cs.total_tool_duration_ms, restored.total_tool_duration_ms);
+    try std.testing.expectEqual(cs.total_lines_added, restored.total_lines_added);
+    try std.testing.expectEqual(cs.total_lines_removed, restored.total_lines_removed);
+    try std.testing.expectEqual(cs.start_time_ms, restored.start_time_ms);
+    try std.testing.expect(restored.started); // inferred from startTime presence
+}
+
+test "CostState.jsonParseFromValue handles empty object" {
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer value_parsed.deinit();
+
+    const cs = try std.json.parseFromValueLeaky(CostState, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expectEqual(@as(u64, 0), cs.total_api_duration_ms);
+    try std.testing.expectEqual(@as(u64, 0), cs.total_tool_duration_ms);
+    try std.testing.expect(!cs.started);
+}
+
+test "CostState.jsonParseFromValue ignores unknown keys (cost-state wrapper fields)" {
+    // The cost-state line wrapper carries computed fields the hook
+    // must ignore: totalCostUSD, totalDuration, modelUsage,
+    // hasUnknownModelCost, type, sessionId.
+    const json_str =
+        "{\"type\":\"cost-state\",\"sessionId\":\"abc\",\"totalCostUSD\":0.0,\"totalAPIDuration\":100,\"totalDuration\":200,\"modelUsage\":{},\"hasUnknownModelCost\":false,\"startTime\":1700000000000}";
+    var value_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_str, .{});
+    defer value_parsed.deinit();
+
+    const cs = try std.json.parseFromValueLeaky(CostState, std.testing.allocator, value_parsed.value, .{});
+    try std.testing.expectEqual(@as(u64, 100), cs.total_api_duration_ms);
+    try std.testing.expectEqual(@as(i64, 1700000000000), cs.start_time_ms);
+    try std.testing.expect(cs.started);
+}
+

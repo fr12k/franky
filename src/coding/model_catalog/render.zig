@@ -32,241 +32,40 @@ pub fn render(
     defer allocator.free(sorted);
     std.mem.sort(models.Entry, sorted, {}, lessThanById);
 
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    // Build the top-level object via std.json.Stringify, leveraging the
+    // jsonStringify hooks on Entry/Cost/Capabilities (json_meta). The
+    // anonymous wrapper carries the `version` + `generatedAt` envelope;
+    // the `models` array serializes via the Entry hook.
+    const wrapper = .{
+        .version = @as(i64, 1),
+        .generatedAt = opts.generated_at,
+        .models = sorted,
+    };
+    const stringify_opts: std.json.Stringify.Options = if (opts.pretty)
+        .{ .whitespace = .indent_2 }
+    else
+        .{ .whitespace = .minified };
+    const json = try std.json.Stringify.valueAlloc(allocator, wrapper, stringify_opts);
+    errdefer allocator.free(json);
 
-    try writePreamble(&buf, allocator, &opts);
-    for (sorted, 0..) |e, i| {
-        try writeModelEntry(&buf, allocator, e, &opts);
-        if (i + 1 < sorted.len) try buf.append(allocator, ',');
-        try buf.appendSlice(allocator, if (opts.pretty) "\n" else "");
+    // The manual renderer appended a trailing newline after `}` in
+    // pretty mode; replicate that so the output is byte-identical.
+    if (opts.pretty) {
+        const with_nl = try allocator.alloc(u8, json.len + 1);
+        @memcpy(with_nl[0..json.len], json);
+        with_nl[json.len] = '\n';
+        allocator.free(json);
+        return with_nl;
     }
-    try writeEpilogue(&buf, allocator, sorted.len, &opts);
-
-    return buf.toOwnedSlice(allocator);
-}
-
-fn writePreamble(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, opts: *const RenderOptions) !void {
-    const nl: []const u8 = if (opts.pretty) "\n" else "";
-    const ind1: []const u8 = if (opts.pretty) "  " else "";
-    const sp: []const u8 = if (opts.pretty) " " else "";
-
-    try buf.appendSlice(allocator, "{");
-    try buf.appendSlice(allocator, nl);
-
-    try writeKv(buf, allocator, ind1, "version", .{ .integer = 1 }, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-
-    try buf.appendSlice(allocator, ind1);
-    try buf.appendSlice(allocator, "\"generatedAt\":");
-    try buf.appendSlice(allocator, sp);
-    try buf.append(allocator, '"');
-    try appendJsonString(buf, allocator, opts.generated_at);
-    try buf.append(allocator, '"');
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-
-    try buf.appendSlice(allocator, ind1);
-    try buf.appendSlice(allocator, "\"models\":");
-    try buf.appendSlice(allocator, sp);
-    try buf.appendSlice(allocator, "[");
-}
-
-fn writeModelEntry(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, e: models.Entry, opts: *const RenderOptions) !void {
-    const nl: []const u8 = if (opts.pretty) "\n" else "";
-    const ind2: []const u8 = if (opts.pretty) "    " else "";
-    const ind3: []const u8 = if (opts.pretty) "      " else "";
-
-    try buf.appendSlice(allocator, nl);
-    try buf.appendSlice(allocator, ind2);
-    try buf.appendSlice(allocator, "{");
-    try buf.appendSlice(allocator, nl);
-
-    try writeStringField(buf, allocator, ind3, "id", e.id, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-    try writeStringField(buf, allocator, ind3, "provider", e.provider, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-    try writeStringField(buf, allocator, ind3, "api", e.api, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-    try writeStringField(buf, allocator, ind3, "displayName", e.display_name, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-
-    try writeKv(buf, allocator, ind3, "contextWindow", .{ .integer = e.context_window }, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-    try writeKv(buf, allocator, ind3, "maxOutput", .{ .integer = e.max_output }, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-
-    try writeCapabilities(buf, allocator, ind3, e.capabilities, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-    try writeCost(buf, allocator, ind3, e.cost, opts.pretty);
-    try buf.appendSlice(allocator, ",");
-    try buf.appendSlice(allocator, nl);
-
-    try writeStringField(buf, allocator, ind3, "knowledgeCutoff", e.knowledge_cutoff, opts.pretty);
-    try buf.appendSlice(allocator, nl);
-
-    try buf.appendSlice(allocator, ind2);
-    try buf.append(allocator, '}');
-}
-
-fn writeEpilogue(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, entry_count: usize, opts: *const RenderOptions) !void {
-    const nl: []const u8 = if (opts.pretty) "\n" else "";
-    const ind1: []const u8 = if (opts.pretty) "  " else "";
-
-    if (entry_count > 0) try buf.appendSlice(allocator, ind1);
-    try buf.appendSlice(allocator, "]");
-    try buf.appendSlice(allocator, nl);
-    try buf.appendSlice(allocator, "}");
-    if (opts.pretty) try buf.append(allocator, '\n');
+    return json;
 }
 
 fn lessThanById(_: void, a: models.Entry, b: models.Entry) bool {
     return std.mem.lessThan(u8, a.id, b.id);
 }
 
-const Scalar = union(enum) {
-    integer: u32,
-    float: f32,
-    boolean: bool,
-};
-
-fn writeKv(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    indent: []const u8,
-    key: []const u8,
-    value: Scalar,
-    pretty: bool,
-) !void {
-    try buf.appendSlice(allocator, indent);
-    try buf.append(allocator, '"');
-    try buf.appendSlice(allocator, key);
-    try buf.append(allocator, '"');
-    try buf.append(allocator, ':');
-    if (pretty) try buf.append(allocator, ' ');
-    switch (value) {
-        .integer => |n| {
-            const s = try std.fmt.allocPrint(allocator, "{d}", .{n});
-            defer allocator.free(s);
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            const s = try std.fmt.allocPrint(allocator, "{d}", .{f});
-            defer allocator.free(s);
-            try buf.appendSlice(allocator, s);
-        },
-        .boolean => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-    }
-}
-
-fn writeStringField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    indent: []const u8,
-    key: []const u8,
-    val: []const u8,
-    pretty: bool,
-) !void {
-    try buf.appendSlice(allocator, indent);
-    try buf.append(allocator, '"');
-    try buf.appendSlice(allocator, key);
-    try buf.append(allocator, '"');
-    try buf.append(allocator, ':');
-    if (pretty) try buf.append(allocator, ' ');
-    try buf.append(allocator, '"');
-    try appendJsonString(buf, allocator, val);
-    try buf.append(allocator, '"');
-}
-
-fn writeCapabilities(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    indent: []const u8,
-    c: models.Capabilities,
-    pretty: bool,
-) !void {
-    const inner_indent = if (pretty) try std.fmt.allocPrint(allocator, "{s}  ", .{indent}) else try allocator.dupe(u8, "");
-    defer allocator.free(inner_indent);
-
-    try buf.appendSlice(allocator, indent);
-    try buf.appendSlice(allocator, "\"capabilities\":");
-    if (pretty) try buf.append(allocator, ' ');
-    try buf.append(allocator, '{');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "vision", .{ .boolean = c.vision }, pretty);
-    try buf.append(allocator, ',');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "toolUse", .{ .boolean = c.tool_use }, pretty);
-    try buf.append(allocator, ',');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "reasoning", .{ .boolean = c.reasoning }, pretty);
-    try buf.append(allocator, ',');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "cache", .{ .boolean = c.cache }, pretty);
-    try buf.append(allocator, ',');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "streaming", .{ .boolean = c.streaming }, pretty);
-    if (pretty) try buf.append(allocator, '\n');
-    try buf.appendSlice(allocator, indent);
-    try buf.append(allocator, '}');
-}
-
-fn writeCost(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    indent: []const u8,
-    c: models.Cost,
-    pretty: bool,
-) !void {
-    const inner_indent = if (pretty) try std.fmt.allocPrint(allocator, "{s}  ", .{indent}) else try allocator.dupe(u8, "");
-    defer allocator.free(inner_indent);
-
-    try buf.appendSlice(allocator, indent);
-    try buf.appendSlice(allocator, "\"cost\":");
-    if (pretty) try buf.append(allocator, ' ');
-    try buf.append(allocator, '{');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "inputPer1M", .{ .float = c.input_per_1m }, pretty);
-    try buf.append(allocator, ',');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "outputPer1M", .{ .float = c.output_per_1m }, pretty);
-    try buf.append(allocator, ',');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "cacheReadPer1M", .{ .float = c.cache_read_per_1m }, pretty);
-    try buf.append(allocator, ',');
-    if (pretty) try buf.append(allocator, '\n');
-    try writeKv(buf, allocator, inner_indent, "cacheWritePer1M", .{ .float = c.cache_write_per_1m }, pretty);
-    if (pretty) try buf.append(allocator, '\n');
-    try buf.appendSlice(allocator, indent);
-    try buf.append(allocator, '}');
-}
-
 /// Append `s` with JSON-string escaping. Handles `"`, `\`, control
 /// chars; assumes valid UTF-8.
-fn appendJsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    for (s) |b| switch (b) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0x00...0x07, 0x0B, 0x0E...0x1F => {
-            const esc = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{b});
-            defer allocator.free(esc);
-            try buf.appendSlice(allocator, esc);
-        },
-        else => try buf.append(allocator, b),
-    };
-}
-
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;

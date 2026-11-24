@@ -79,13 +79,10 @@ fn executeFetch(
     const api_key = web_search.resolveApiKey(ctx, provider);
     const environ_map: ?*const std.process.Environ.Map = if (ctx) |c| c.environ_map else null;
 
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.appendSlice(allocator, "{\"url\":");
-    try utils.appendJsonStr(&body, allocator, url);
-    try body.append(allocator, '}');
+    const body = try std.json.Stringify.valueAlloc(allocator, .{ .url = url }, .{});
+    defer allocator.free(body);
 
-    const resp = web_search.doPost(allocator, io, cancel, fetchEndpoint(provider), api_key, body.items, environ_map) catch |e|
+    const resp = web_search.doPost(allocator, io, cancel, fetchEndpoint(provider), api_key, body, environ_map) catch |e|
         return web_search.httpError(allocator, "web_fetch", e);
     defer allocator.free(resp);
 

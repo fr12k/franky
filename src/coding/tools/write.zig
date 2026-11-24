@@ -143,7 +143,11 @@ pub fn writeFile(
     const added = common.countLines(content);
     const removed: u64 = if (old_content) |old| common.countLines(old) else 0;
 
-    const details = try std.fmt.allocPrint(allocator, "{{\"bytesWritten\":{d},\"parentCreated\":{}}}", .{ content.len, parent_created });
+    // Anonymous wire-shaped struct; std.json handles escaping/ordering.
+    const details = try std.json.Stringify.valueAlloc(allocator, .{
+        .bytesWritten = content.len,
+        .parentCreated = parent_created,
+    }, .{});
     const text = try std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ content.len, path });
     const arr = try allocator.alloc(ai.types.ContentBlock, 1);
     arr[0] = .{ .text = .{ .text = text } };

@@ -11,3 +11,5 @@ franky-box.db
 franky-box.db-shm
 franky-box.db-wal
 franky-box.db-journaltest_orelse.o
+test_compile
+test_getsym

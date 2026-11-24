@@ -123,18 +123,13 @@ fn executeSearch(
     const api_key = resolveApiKey(ctx, provider);
     const environ_map: ?*const std.process.Environ.Map = if (ctx) |c| c.environ_map else null;
 
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.appendSlice(allocator, "{\"query\":");
-    try utils.appendJsonStr(&body, allocator, query);
-    {
-        var num: [16]u8 = undefined;
-        try body.appendSlice(allocator, ",\"max_results\":");
-        try body.appendSlice(allocator, std.fmt.bufPrint(&num, "{d}", .{max_results}) catch unreachable);
-    }
-    try body.append(allocator, '}');
+    const body = try std.json.Stringify.valueAlloc(allocator, .{
+        .query = query,
+        .max_results = max_results,
+    }, .{});
+    defer allocator.free(body);
 
-    const resp = doPost(allocator, io, cancel, searchEndpoint(provider), api_key, body.items, environ_map) catch |e|
+    const resp = doPost(allocator, io, cancel, searchEndpoint(provider), api_key, body, environ_map) catch |e|
         return httpError(allocator, "web_search", e);
     defer allocator.free(resp);
 

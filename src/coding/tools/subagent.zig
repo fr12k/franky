@@ -631,17 +631,15 @@ fn executeListPresets(
         if (!first) try buf.append(allocator, ',');
         first = false;
         const p = entry.value_ptr.*;
-        try buf.appendSlice(allocator, "{\"name\":");
-        try ai.utils.appendJsonStr(&buf, allocator, p.name);
-        try buf.appendSlice(allocator, ",\"description\":");
-        try ai.utils.appendJsonStr(&buf, allocator, p.description);
-        try buf.appendSlice(allocator, ",\"default_profile\":");
-        try ai.utils.appendJsonStr(&buf, allocator, p.default_profile);
-        try buf.appendSlice(allocator, ",\"default_role\":");
-        try ai.utils.appendJsonStr(&buf, allocator, p.default_role.toString());
-        try buf.appendSlice(allocator, ",\"read_only\":");
-        try buf.appendSlice(allocator, if (p.safety.read_only) "true" else "false");
-        try buf.append(allocator, '}');
+        const entry_json = try std.json.Stringify.valueAlloc(allocator, .{
+            .name = p.name,
+            .description = p.description,
+            .default_profile = p.default_profile,
+            .default_role = p.default_role.toString(),
+            .read_only = p.safety.read_only,
+        }, .{});
+        defer allocator.free(entry_json);
+        try buf.appendSlice(allocator, entry_json);
     }
     try buf.append(allocator, ']');
 
@@ -1679,29 +1677,20 @@ fn successResult(
     /// to the tool-call `id` issued by the parent model.
     spawn_id: []const u8,
 ) !at.ToolResult {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"ok\":true,\"final_text\":");
-    try ai.utils.appendJsonStr(&buf, allocator, final_text);
-    try buf.appendSlice(allocator, ",\"turn_count\":");
-    try ai.utils.appendJsonInt(&buf, allocator, turn_count);
-    try buf.appendSlice(allocator, ",\"tool_call_count\":");
-    try ai.utils.appendJsonInt(&buf, allocator, tool_call_count);
-    try buf.appendSlice(allocator, ",\"duration_ms\":");
-    try ai.utils.appendJsonInt(&buf, allocator, duration_ms);
-    try buf.appendSlice(allocator, ",\"session_id\":");
-    try ai.utils.appendJsonStr(&buf, allocator, session_id);
-    try buf.appendSlice(allocator, ",\"spawn_id\":");
-    try ai.utils.appendJsonStr(&buf, allocator, spawn_id);
-    if (transcript_path) |p| {
-        try buf.appendSlice(allocator, ",\"transcript_path\":");
-        try ai.utils.appendJsonStr(&buf, allocator, p);
-    }
-    try buf.append(allocator, '}');
+    const result = try std.json.Stringify.valueAlloc(allocator, .{
+        .ok = true,
+        .final_text = final_text,
+        .turn_count = turn_count,
+        .tool_call_count = tool_call_count,
+        .duration_ms = duration_ms,
+        .session_id = session_id,
+        .spawn_id = spawn_id,
+        .transcript_path = transcript_path,
+    }, .{ .emit_null_optional_fields = false });
+    errdefer allocator.free(result);
 
-    const text = try buf.toOwnedSlice(allocator);
     var content = try allocator.alloc(ai.types.ContentBlock, 1);
-    content[0] = .{ .text = .{ .text = text } };
+    content[0] = .{ .text = .{ .text = result } };
     return .{ .content = content, .is_error = false };
 }
 
@@ -1722,36 +1711,20 @@ fn errorResult(
     msg: []const u8,
     opts: ErrorOpts,
 ) !at.ToolResult {
-    const partial_text = opts.partial_text;
-    const turn_count = opts.turn_count;
-    const profiles_listing = opts.profiles_listing;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\"ok\":false,\"error_kind\":");
-    try ai.utils.appendJsonStr(&buf, allocator, kind.name());
-    try buf.appendSlice(allocator, ",\"error_message\":");
-    try ai.utils.appendJsonStr(&buf, allocator, msg);
-    try buf.appendSlice(allocator, ",\"hint\":");
-    try ai.utils.appendJsonStr(&buf, allocator, kind.hint());
-    if (partial_text) |p| {
-        try buf.appendSlice(allocator, ",\"partial_text\":");
-        try ai.utils.appendJsonStr(&buf, allocator, p);
-    }
-    try buf.appendSlice(allocator, ",\"turn_count\":");
-    try ai.utils.appendJsonInt(&buf, allocator, turn_count);
-    if (profiles_listing) |pl| {
-        try buf.appendSlice(allocator, ",\"available_profiles\":");
-        try ai.utils.appendJsonStr(&buf, allocator, pl);
-    }
-    if (opts.spawn_id) |sid| {
-        try buf.appendSlice(allocator, ",\"spawn_id\":");
-        try ai.utils.appendJsonStr(&buf, allocator, sid);
-    }
-    try buf.append(allocator, '}');
+    const result = try std.json.Stringify.valueAlloc(allocator, .{
+        .ok = false,
+        .error_kind = kind.name(),
+        .error_message = msg,
+        .hint = kind.hint(),
+        .partial_text = opts.partial_text,
+        .turn_count = opts.turn_count,
+        .available_profiles = opts.profiles_listing,
+        .spawn_id = opts.spawn_id,
+    }, .{ .emit_null_optional_fields = false });
+    errdefer allocator.free(result);
 
-    const text = try buf.toOwnedSlice(allocator);
     var content = try allocator.alloc(ai.types.ContentBlock, 1);
-    content[0] = .{ .text = .{ .text = text } };
+    content[0] = .{ .text = .{ .text = result } };
     const tool_code_owned = try allocator.dupe(u8, kind.name());
     return .{ .content = content, .is_error = true, .tool_code = tool_code_owned };
 }
@@ -1806,27 +1779,39 @@ fn persistSubagentSession(
         .active_branch = "main",
     }, args.transcript, null);
 
-    // meta.json sidecar — debugging context.
+    // meta.json sidecar — debugging context. Anonymous wire-shaped struct;
+    // the only rename is `start_ms` → `started_at_ms`, so `json_meta`
+    // handles the escaping + ordering and a typo in a key is a compile error.
+    const Meta = struct {
+        profile: []const u8,
+        prompt: []const u8,
+        call_id: []const u8,
+        provider: []const u8,
+        model: []const u8,
+        start_ms: i64,
+        duration_ms: i64,
+
+        pub const json_meta = .{
+            .start_ms = .{ .rename = "started_at_ms" },
+        };
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try @import("../../ai/json_meta.zig").stringifyWithMeta(self, jw);
+        }
+    };
     const meta_path = try std.fs.path.join(allocator, &.{ subagents_dir, args.call_id, "meta.json" });
     defer allocator.free(meta_path);
-    var meta_buf: std.ArrayList(u8) = .empty;
-    defer meta_buf.deinit(allocator);
-    try meta_buf.appendSlice(allocator, "{\"profile\":");
-    try ai.utils.appendJsonStr(&meta_buf, allocator, args.profile);
-    try meta_buf.appendSlice(allocator, ",\"prompt\":");
-    try ai.utils.appendJsonStr(&meta_buf, allocator, args.prompt);
-    try meta_buf.appendSlice(allocator, ",\"call_id\":");
-    try ai.utils.appendJsonStr(&meta_buf, allocator, args.call_id);
-    try meta_buf.appendSlice(allocator, ",\"provider\":");
-    try ai.utils.appendJsonStr(&meta_buf, allocator, args.provider);
-    try meta_buf.appendSlice(allocator, ",\"model\":");
-    try ai.utils.appendJsonStr(&meta_buf, allocator, args.model);
-    try meta_buf.appendSlice(allocator, ",\"started_at_ms\":");
-    try ai.utils.appendJsonInt(&meta_buf, allocator, args.start_ms);
-    try meta_buf.appendSlice(allocator, ",\"duration_ms\":");
-    try ai.utils.appendJsonInt(&meta_buf, allocator, args.duration_ms);
-    try meta_buf.append(allocator, '}');
-    try cwd.writeFile(io, .{ .sub_path = meta_path, .data = meta_buf.items });
+    const meta_json = try std.json.Stringify.valueAlloc(allocator, Meta{
+        .profile = args.profile,
+        .prompt = args.prompt,
+        .call_id = args.call_id,
+        .provider = args.provider,
+        .model = args.model,
+        .start_ms = args.start_ms,
+        .duration_ms = args.duration_ms,
+    }, .{});
+    defer allocator.free(meta_json);
+    try cwd.writeFile(io, .{ .sub_path = meta_path, .data = meta_json });
 }
 
 // ─── tests ─────────────────────────────────────────────────────────

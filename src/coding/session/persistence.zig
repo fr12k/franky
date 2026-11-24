@@ -47,6 +47,8 @@ const ai = struct {
 };
 const agent_mod = @import("../../agent/mod.zig");
 const object_store = @import("object_store.zig");
+const json_meta = @import("../../ai/json_meta.zig");
+const json_meta_mod = json_meta; // unshadowed alias for use inside structs that declare their own `json_meta`
 
 pub const current_session_version: u32 = 3;
 /// v1.30.0 — transcript schema bumped to 4 for the JSON Lines
@@ -109,6 +111,58 @@ pub const SessionHeader = struct {
     thinking_level: []const u8,
     active_branch: []const u8 = "main",
     system_prompt_hash: []const u8 = "",
+
+    // ─── JSON (de)serialization via std.json hooks ───────────────
+    // Wire format uses camelCase keys. The `version` field is not
+    // stored on the struct (it's a module-level constant) so it is
+    // emitted via `json_prefix` before the struct fields.
+
+    /// Leading constant fields emitted before the struct fields. The
+    /// `version` key is part of the wire envelope, not the struct.
+    pub const json_prefix = .{
+        .version = current_session_version,
+    };
+
+    pub const json_meta = .{
+        .created_at_ms = .{ .rename = "createdAtMs" },
+        .updated_at_ms = .{ .rename = "updatedAtMs" },
+        .thinking_level = .{ .rename = "thinkingLevel" },
+        .active_branch = .{ .rename = "activeBranch" },
+        .system_prompt_hash = .{ .rename = "systemPromptHash" },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer via the generic
+    /// `json_meta.stringifyWithMeta` helper. `json_prefix` emits the
+    /// constant `version` field first; the struct fields follow with
+    /// camelCase wire names from `json_meta`.
+    pub fn jsonStringify(self: SessionHeader, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
+
+    /// Deserialize from a `std.json.Value`. Expects camelCase keys.
+    /// String fields are duped into `allocator`. Missing fields get
+    /// sensible defaults.
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !SessionHeader {
+        _ = options;
+        if (source != .object) return error.UnexpectedToken;
+        const o = source.object;
+        return .{
+            .id = try allocator.dupe(u8, strOpt(o, "id") orelse ""),
+            .created_at_ms = if (o.get("createdAtMs")) |v| v.integer else 0,
+            .updated_at_ms = if (o.get("updatedAtMs")) |v| v.integer else 0,
+            .title = try allocator.dupe(u8, strOpt(o, "title") orelse ""),
+            .provider = try allocator.dupe(u8, strOpt(o, "provider") orelse ""),
+            .model = try allocator.dupe(u8, strOpt(o, "model") orelse ""),
+            .api = try allocator.dupe(u8, strOpt(o, "api") orelse ""),
+            .thinking_level = try allocator.dupe(u8, strOpt(o, "thinkingLevel") orelse "off"),
+            .active_branch = try allocator.dupe(u8, strOpt(o, "activeBranch") orelse "main"),
+            .system_prompt_hash = try allocator.dupe(u8, strOpt(o, "systemPromptHash") orelse ""),
+        };
+    }
 };
 
 /// Write `session.json` atomically under `session_dir`.
@@ -120,19 +174,13 @@ pub fn writeSessionHeader(
 ) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    try buf.appendSlice(allocator, "{\n");
-    try writeJsonField(&buf, allocator, "version", current_session_version, false);
-    try writeJsonStrField(&buf, allocator, "id", header.id, false);
-    try writeJsonField(&buf, allocator, "createdAtMs", header.created_at_ms, false);
-    try writeJsonField(&buf, allocator, "updatedAtMs", header.updated_at_ms, false);
-    try writeJsonStrField(&buf, allocator, "title", header.title, false);
-    try writeJsonStrField(&buf, allocator, "provider", header.provider, false);
-    try writeJsonStrField(&buf, allocator, "model", header.model, false);
-    try writeJsonStrField(&buf, allocator, "api", header.api, false);
-    try writeJsonStrField(&buf, allocator, "thinkingLevel", header.thinking_level, false);
-    try writeJsonStrField(&buf, allocator, "activeBranch", header.active_branch, false);
-    try writeJsonStrField(&buf, allocator, "systemPromptHash", header.system_prompt_hash, true);
-    try buf.appendSlice(allocator, "\n}\n");
+    // v1.34.0 — serialized via `SessionHeader.jsonStringify` hook.
+    const json_str = try std.json.Stringify.valueAlloc(allocator, header, .{
+        .whitespace = .indent_2,
+    });
+    defer allocator.free(json_str);
+    try buf.appendSlice(allocator, json_str);
+    try buf.append(allocator, '\n');
 
     const path = try std.fs.path.join(allocator, &.{ session_dir, "session.json" });
     defer allocator.free(path);
@@ -158,18 +206,12 @@ pub fn readSessionHeader(
     const version = if (obj.get("version")) |v| v.integer else 0;
     if (version > current_session_version) return error.UnsupportedSessionVersion;
 
-    return .{
-        .id = try allocator.dupe(u8, strOpt(obj, "id") orelse ""),
-        .created_at_ms = if (obj.get("createdAtMs")) |v| v.integer else 0,
-        .updated_at_ms = if (obj.get("updatedAtMs")) |v| v.integer else 0,
-        .title = try allocator.dupe(u8, strOpt(obj, "title") orelse ""),
-        .provider = try allocator.dupe(u8, strOpt(obj, "provider") orelse ""),
-        .model = try allocator.dupe(u8, strOpt(obj, "model") orelse ""),
-        .api = try allocator.dupe(u8, strOpt(obj, "api") orelse ""),
-        .thinking_level = try allocator.dupe(u8, strOpt(obj, "thinkingLevel") orelse "off"),
-        .active_branch = try allocator.dupe(u8, strOpt(obj, "activeBranch") orelse "main"),
-        .system_prompt_hash = try allocator.dupe(u8, strOpt(obj, "systemPromptHash") orelse ""),
-    };
+    // v1.34.0 — parsed via `SessionHeader.jsonParseFromValue` hook.
+    // Uses `parseFromValueLeaky` with the caller's allocator so string
+    // fields are owned by the struct (freed via `freeSessionHeader`).
+    return std.json.parseFromValueLeaky(SessionHeader, allocator, parsed.value, .{
+        .ignore_unknown_fields = true,
+    });
 }
 
 /// Free all strings allocated by `readSessionHeader`.
@@ -221,7 +263,7 @@ fn renderTranscriptJsonl(
     defer allocator.free(ver);
     try out.appendSlice(allocator, ver);
     try out.appendSlice(allocator, ",\"branch\":");
-    try appendJsonStr(out, allocator, branch);
+    try ai.utils.appendJsonStr(out, allocator, branch);
     try out.appendSlice(allocator, "}");
     try out.append(allocator, '\n');
 
@@ -461,7 +503,7 @@ fn parseTranscriptJsonl(
             // last cost-state line so resumed sessions keep their
             // cumulative durations / line counts / start time.
             if (std.mem.eql(u8, type_str, "cost-state")) {
-                transcript.cost_state = parseCostState(obj);
+                transcript.cost_state = parseCostState(allocator, obj);
             }
             first_line = false;
             // v1.33.0 — `user`/`assistant` are message record types,
@@ -517,28 +559,18 @@ fn parseTranscriptLegacyJson(
 /// per-message usage are restored; `modelUsage` / `totalCostUSD` /
 /// `hasUnknownModelCost` are always recomputed from the transcript
 /// at write time, so they are not stored here.
-fn parseCostState(o: std.json.ObjectMap) ai.types.CostState {
-    var cs: ai.types.CostState = .{};
-    if (o.get("totalAPIDuration")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_api_duration_ms = @intCast(v.integer);
-    };
-    if (o.get("totalAPIDurationWithoutRetries")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_api_duration_without_retries_ms = @intCast(v.integer);
-    };
-    if (o.get("totalToolDuration")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_tool_duration_ms = @intCast(v.integer);
-    };
-    if (o.get("totalLinesAdded")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_lines_added = @intCast(v.integer);
-    };
-    if (o.get("totalLinesRemoved")) |v| if (v == .integer and v.integer >= 0) {
-        cs.total_lines_removed = @intCast(v.integer);
-    };
-    if (o.get("startTime")) |v| if (v == .integer) {
-        cs.start_time_ms = v.integer;
-        cs.started = true;
-    };
-    return cs;
+///
+/// v1.34.0 — delegates to `CostState.jsonParseFromValue` (std.json
+/// hook). The wrapper's computed fields (`totalCostUSD`,
+/// `totalDuration`, `modelUsage`, `hasUnknownModelCost`) are ignored
+/// by the hook; only the six stored camelCase fields are restored.
+fn parseCostState(allocator: std.mem.Allocator, o: std.json.ObjectMap) ai.types.CostState {
+    // The leaky variant returns the value directly (no `Parsed` wrapper
+    // to deinit). CostState's jsonParseFromValue hook never allocates
+    // (all fields are integers/bools), but we pass the real allocator
+    // for safety and future-proofing.
+    return std.json.parseFromValueLeaky(ai.types.CostState, allocator, .{ .object = o }, .{}) catch
+        ai.types.CostState{};
 }
 
 /// Compute the SHA-256 of a canonical UTF-8 string. Used for
@@ -611,10 +643,10 @@ fn appendMessageJson(
         .custom => "user",
     };
     try buf.appendSlice(allocator, "{\"type\":");
-    try appendJsonStr(buf, allocator, record_type);
+    try ai.utils.appendJsonStr(buf, allocator, record_type);
     if (session_id) |sid| if (sid.len > 0) {
         try buf.appendSlice(allocator, ",\"sessionId\":");
-        try appendJsonStr(buf, allocator, sid);
+        try ai.utils.appendJsonStr(buf, allocator, sid);
     };
     try buf.appendSlice(allocator, ",\"timestamp\":");
     try buf.append(allocator, '"');
@@ -630,7 +662,7 @@ fn appendMessageJson(
         .custom => m.custom_role orelse "custom",
     };
     try buf.appendSlice(allocator, "\"role\":");
-    try appendJsonStr(buf, allocator, role_name);
+    try ai.utils.appendJsonStr(buf, allocator, role_name);
 
     // v1.33.0 — `isError` at the message-wrapper level is only emitted
     // for non-tool_result rows. For tool_result, the `is_error` flag is
@@ -648,7 +680,7 @@ fn appendMessageJson(
         try buf.appendSlice(allocator, "{\"type\":\"tool_result\"");
         if (m.tool_call_id) |tid| {
             try buf.appendSlice(allocator, ",\"tool_use_id\":");
-            try appendJsonStr(buf, allocator, tid);
+            try ai.utils.appendJsonStr(buf, allocator, tid);
         }
         if (m.is_error) try buf.appendSlice(allocator, ",\"is_error\":true");
         try buf.appendSlice(allocator, ",\"content\":[");
@@ -667,11 +699,11 @@ fn appendMessageJson(
 
     if (m.stop_reason) |sr| {
         try buf.appendSlice(allocator, ",\"stop_reason\":");
-        try appendJsonStr(buf, allocator, sr.toClaudeCodeString());
+        try ai.utils.appendJsonStr(buf, allocator, sr.toClaudeCodeString());
     }
     if (m.model) |p| {
         try buf.appendSlice(allocator, ",\"model\":");
-        try appendJsonStr(buf, allocator, p);
+        try ai.utils.appendJsonStr(buf, allocator, p);
     }
     // v1.33.0 — `provider` and `api` are franky-specific extensions
     // emitted inside the `message` wrapper. Claude Code doesn't write
@@ -679,144 +711,42 @@ fn appendMessageJson(
     // own read path restores them.
     if (m.provider) |p| {
         try buf.appendSlice(allocator, ",\"provider\":");
-        try appendJsonStr(buf, allocator, p);
+        try ai.utils.appendJsonStr(buf, allocator, p);
     }
     if (m.api) |p| {
         try buf.appendSlice(allocator, ",\"api\":");
-        try appendJsonStr(buf, allocator, p);
+        try ai.utils.appendJsonStr(buf, allocator, p);
     }
     // v1.31.0 — Message.Usage (per-turn token counts + USD costs).
     // v1.33.0 — Claude-Code-compatible key names inside `message.usage`.
+    // v1.34.0 — serialized via `Usage.jsonStringify` hook (std.json).
     // Only emit when at least one field is non-default; pre-v1.31
     // transcripts (and user/tool_result rows that never carry usage)
     // round-trip unchanged.
     if (m.usage) |u| if (!u.isEmpty()) {
-        try buf.appendSlice(allocator, ",\"usage\":{");
-        var first = true;
-        // Claude Code reports only the uncached portion in
-        // `input_tokens`. Franky's `Usage.input` includes cached
-        // tokens (the provider's total `prompt_tokens`), so subtract
-        // cache_read + cache_write (clamped ≥ 0). Saturating add guards
-        // against u64 overflow on adversarial inputs.
-        const cached = u.cache_read +| u.cache_write;
-        const uncached_input: u64 = if (u.input > cached) u.input - cached else 0;
-        if (uncached_input != 0) {
-            try appendJsonU64Field(buf, allocator, "\"input_tokens\":", uncached_input);
-            first = false;
-        }
-        if (u.output != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"output_tokens\":", u.output);
-            first = false;
-        }
-        if (u.cache_read != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_read_input_tokens\":", u.cache_read);
-            first = false;
-        }
-        if (u.cache_write != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_creation_input_tokens\":", u.cache_write);
-            first = false;
-        }
-        // Franky-specific extensions (not in Claude Code's usage) —
-        // emitted with snake_case names for consistency. Downstream
-        // readers that only know Claude's keys ignore these.
-        if (u.thinking_tokens != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"thinking_tokens\":", u.thinking_tokens);
-            first = false;
-        }
-        if (u.cache_creation_ephemeral_5m != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_creation_5m_input_tokens\":", u.cache_creation_ephemeral_5m);
-            first = false;
-        }
-        if (u.cache_creation_ephemeral_1h != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"cache_creation_1h_input_tokens\":", u.cache_creation_ephemeral_1h);
-            first = false;
-        }
-        if (u.web_search_requests != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"web_search_requests\":", u.web_search_requests);
-            first = false;
-        }
-        if (u.cost_input) |ci| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_input\":", ci);
-            first = false;
-        }
-        if (u.cost_output) |co| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_output\":", co);
-            first = false;
-        }
-        if (u.cost_cache_read) |cr| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_cache_read\":", cr);
-            first = false;
-        }
-        if (u.cost_cache_write) |cw| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonF64Field(buf, allocator, "\"cost_cache_write\":", cw);
-            first = false;
-        }
-        try buf.append(allocator, '}');
+        try buf.appendSlice(allocator, ",\"usage\":");
+        // `Usage.jsonStringify` emits the Claude-Code-compatible wire
+        // shape: `input_tokens` carries the uncached portion (total
+        // minus cache_read + cache_write), zero-valued fields are
+        // omitted, null cost fields are omitted.
+        const usage_json = try std.json.Stringify.valueAlloc(allocator, u, .{
+            .emit_null_optional_fields = false,
+        });
+        defer allocator.free(usage_json);
+        try buf.appendSlice(allocator, usage_json);
     };
     // v1.29.0 — Message.Diagnostics. Franky-specific; emitted inside
-    // the `message` wrapper under `diagnostics`. Only emit when at
-    // least one field is non-default; pre-v1.29 transcripts round-trip
+    // the `message` wrapper under `diagnostics`. v1.34.0 — serialized
+    // via `Diagnostics.jsonStringify` hook (std.json). Only emit when
+    // at least one field is non-default; pre-v1.29 transcripts round-trip
     // unchanged.
     if (m.diagnostics) |d| if (!d.isEmpty()) {
-        try buf.appendSlice(allocator, ",\"diagnostics\":{");
-        var first = true;
-        if (d.trace_id) |s| {
-            try buf.appendSlice(allocator, "\"traceId\":");
-            try appendJsonStr(buf, allocator, s);
-            first = false;
-        }
-        if (d.finish_reason_raw) |s| {
-            if (!first) try buf.append(allocator, ',');
-            try buf.appendSlice(allocator, "\"finishReasonRaw\":");
-            try appendJsonStr(buf, allocator, s);
-            first = false;
-        }
-        if (d.parts_seen != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"partsSeen\":", d.parts_seen);
-            first = false;
-        }
-        if (d.candidates_tokens) |n| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"candidatesTokens\":", n);
-            first = false;
-        }
-        if (d.thoughts_tokens) |n| {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"thoughtsTokens\":", n);
-            first = false;
-        }
-        if (d.text_event_count != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"textEvents\":", d.text_event_count);
-            first = false;
-        }
-        if (d.thinking_event_count != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"thinkingEvents\":", d.thinking_event_count);
-            first = false;
-        }
-        if (d.tool_call_event_count != 0) {
-            if (!first) try buf.append(allocator, ',');
-            try appendJsonU64Field(buf, allocator, "\"toolCallEvents\":", d.tool_call_event_count);
-            first = false;
-        }
-        if (d.was_degenerate) {
-            if (!first) try buf.append(allocator, ',');
-            try buf.appendSlice(allocator, "\"wasDegenerate\":true");
-        }
-        try buf.append(allocator, '}');
+        try buf.appendSlice(allocator, ",\"diagnostics\":");
+        const diag_json = try std.json.Stringify.valueAlloc(allocator, d, .{
+            .emit_null_optional_fields = false,
+        });
+        defer allocator.free(diag_json);
+        try buf.appendSlice(allocator, diag_json);
     };
     // Close `message` wrapper.
     try buf.appendSlice(allocator, "}");
@@ -837,7 +767,72 @@ const ModelUsageAccum = struct {
     web_search_requests: u64 = 0,
     cost_usd: f64 = 0,
     /// True when at least one turn for this model reported no cost data.
+    /// NOT emitted per-model — aggregated into the top-level
+    /// `hasUnknownModelCost` field by `renderCostStateLine`.
     has_unknown_cost: bool = false,
+
+    // ─── JSON serialization via std.json hook ────────────────────
+    // `json_meta` renames Zig snake_case fields to the camelCase wire
+    // keys used in the `cost-state` line's `modelUsage` map values.
+    // `has_unknown_cost` is skipped (it's aggregated, not per-model).
+    pub const json_meta = .{
+        .input_tokens = .{ .rename = "inputTokens" },
+        .output_tokens = .{ .rename = "outputTokens" },
+        .thinking_tokens = .{ .rename = "thinkingTokens" },
+        .cache_read_input_tokens = .{ .rename = "cacheReadInputTokens" },
+        .cache_creation_input_tokens = .{ .rename = "cacheCreationInputTokens" },
+        .cache_creation_ephemeral_5m_input_tokens = .{ .rename = "cacheCreationEphemeral5mInputTokens" },
+        .cache_creation_ephemeral_1h_input_tokens = .{ .rename = "cacheCreationEphemeral1hInputTokens" },
+        .web_search_requests = .{ .rename = "webSearchRequests" },
+        // `cost_usd` serializes with a forced decimal point (`0.0`, `1.5`)
+        // via `.float_force_decimal` so it round-trips as `.float`,
+        // preserving the prior wire format — std.json would emit `0` for
+        // whole-number f64.
+        .cost_usd = .{ .rename = "costUSD", .format = .float_force_decimal },
+        .has_unknown_cost = .{ .skip = true },
+    };
+
+    /// Serialize to a `std.json.Stringify` writer via the generic
+    /// `json_meta.stringifyWithMeta` helper. Emits the eight integer
+    /// fields + `costUSD` (forced-decimal) with camelCase keys;
+    /// `has_unknown_cost` is skipped (aggregated into the top-level
+    /// `hasUnknownModelCost` by `renderCostStateLine`).
+    pub fn jsonStringify(self: ModelUsageAccum, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
+};
+
+/// v1.34.0 — wire-shape struct for the flat numeric fields of the
+/// `cost-state` line. `renderCostStateLine` stringifies this via the
+/// `jsonStringify` hook (std.json) and splices the fields (minus the
+/// outer braces) into the wrapper object, preserving the exact field
+/// order and camelCase key names of the prior hand-rolled emitter.
+/// `totalDuration` (computed) is emitted after the stored `CostState`
+/// fields. `totalCostUSD` (computed f64) is emitted manually by
+/// `renderCostStateLine` with a forced decimal point to preserve the
+/// prior wire format — std.json emits `0` for whole-number f64.
+const CostStateLine = struct {
+    total_api_duration_ms: u64 = 0,
+    total_api_duration_without_retries_ms: u64 = 0,
+    total_tool_duration_ms: u64 = 0,
+    total_lines_added: u64 = 0,
+    total_lines_removed: u64 = 0,
+    total_duration: u64 = 0,
+    start_time: u64 = 0,
+
+    pub const json_meta = .{
+        .total_api_duration_ms = .{ .rename = "totalAPIDuration" },
+        .total_api_duration_without_retries_ms = .{ .rename = "totalAPIDurationWithoutRetries" },
+        .total_tool_duration_ms = .{ .rename = "totalToolDuration" },
+        .total_lines_added = .{ .rename = "totalLinesAdded" },
+        .total_lines_removed = .{ .rename = "totalLinesRemoved" },
+        .total_duration = .{ .rename = "totalDuration" },
+        .start_time = .{ .rename = "startTime" },
+    };
+
+    pub fn jsonStringify(self: CostStateLine, jw: anytype) !void {
+        try json_meta_mod.stringifyWithMeta(self, jw);
+    }
 };
 
 /// v1.32.0 — render the `cost-state` aggregate line.
@@ -923,36 +918,58 @@ fn renderCostStateLine(
     try out.appendSlice(allocator, "{\"type\":\"cost-state\"");
     if (session_id) |sid| if (sid.len > 0) {
         try out.appendSlice(allocator, ",\"sessionId\":");
-        try appendJsonStr(out, allocator, sid);
+        try ai.utils.appendJsonStr(out, allocator, sid);
     };
-    try appendJsonF64Field(out, allocator, ",\"totalCostUSD\":", total_cost_usd);
-    try appendJsonU64Field(out, allocator, ",\"totalAPIDuration\":", cs.total_api_duration_ms);
-    try appendJsonU64Field(out, allocator, ",\"totalAPIDurationWithoutRetries\":", cs.total_api_duration_without_retries_ms);
-    try appendJsonU64Field(out, allocator, ",\"totalToolDuration\":", cs.total_tool_duration_ms);
-    try appendJsonU64Field(out, allocator, ",\"totalLinesAdded\":", cs.total_lines_added);
-    try appendJsonU64Field(out, allocator, ",\"totalLinesRemoved\":", cs.total_lines_removed);
-    try appendJsonU64Field(out, allocator, ",\"totalDuration\":", total_duration);
-    try appendJsonU64Field(out, allocator, ",\"startTime\":", @as(u64, @intCast(cs.start_time_ms)));
+    // v1.34.0 — `totalCostUSD` is emitted with a forced decimal point
+    // (e.g. `0.0`, `1.5`) so downstream parsers tag it as `.float`;
+    // the six stored `CostState` fields + `totalDuration` go through
+    // the `CostStateLine` wire struct's `jsonStringify` hook (std.json),
+    // which renames snake_case → camelCase via `json_meta`. Non-finite
+    // `totalCostUSD` is clamped to 0 (not valid JSON).
+    const safe_total_cost = if (std.math.isFinite(total_cost_usd)) total_cost_usd else 0;
+    try appendJsonF64Field(out, allocator, ",\"totalCostUSD\":", safe_total_cost);
+    const line = CostStateLine{
+        .total_api_duration_ms = cs.total_api_duration_ms,
+        .total_api_duration_without_retries_ms = cs.total_api_duration_without_retries_ms,
+        .total_tool_duration_ms = cs.total_tool_duration_ms,
+        .total_lines_added = cs.total_lines_added,
+        .total_lines_removed = cs.total_lines_removed,
+        .total_duration = total_duration,
+        .start_time = @as(u64, @intCast(cs.start_time_ms)),
+    };
+    const line_json = try std.json.Stringify.valueAlloc(allocator, line, .{
+        .emit_null_optional_fields = false,
+    });
+    defer allocator.free(line_json);
+    // `CostStateLine.jsonStringify` emits a `{...}` object; strip the
+    // outer braces so the fields splice into the wrapper object. `> 2`
+    // (not `>= 2`) so an empty `{}` payload appends nothing — `>= 2` would
+    // emit a bare comma and produce invalid JSON.
+    if (line_json.len > 2) {
+        try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, line_json[1 .. line_json.len - 1]);
+    }
 
-    // modelUsage map.
+    // modelUsage map — std.json cannot stringify a `StringHashMap`
+    // directly (it isn't an array), so iterate manually. Each value's
+    // eight integer fields are emitted via the `ModelUsageAccum.jsonStringify`
+    // hook (v1.34.0); `costUSD` is spliced in manually with a forced
+    // decimal point (the hook skips `cost_usd`) to preserve the prior
+    // wire format (`0.0` not `0`).
     try out.appendSlice(allocator, ",\"modelUsage\":{");
     var first = true;
     var mit = models.iterator();
     while (mit.next()) |e| {
         if (!first) try out.append(allocator, ',');
         first = false;
-        try appendJsonStr(out, allocator, e.key_ptr.*);
-        try out.appendSlice(allocator, ":{\"inputTokens\":");
-        try appendJsonU64Field(out, allocator, "", e.value_ptr.*.input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"outputTokens\":", e.value_ptr.*.output_tokens);
-        try appendJsonU64Field(out, allocator, ",\"thinkingTokens\":", e.value_ptr.*.thinking_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheReadInputTokens\":", e.value_ptr.*.cache_read_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheCreationInputTokens\":", e.value_ptr.*.cache_creation_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheCreationEphemeral5mInputTokens\":", e.value_ptr.*.cache_creation_ephemeral_5m_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"cacheCreationEphemeral1hInputTokens\":", e.value_ptr.*.cache_creation_ephemeral_1h_input_tokens);
-        try appendJsonU64Field(out, allocator, ",\"webSearchRequests\":", e.value_ptr.*.web_search_requests);
-        try appendJsonF64Field(out, allocator, ",\"costUSD\":", e.value_ptr.*.cost_usd);
-        try out.appendSlice(allocator, "}");
+        try ai.utils.appendJsonStr(out, allocator, e.key_ptr.*);
+        try out.appendSlice(allocator, ":");
+        // The hook emits all fields including `costUSD` (forced-decimal).
+        const entry_json = try std.json.Stringify.valueAlloc(allocator, e.value_ptr.*, .{
+            .emit_null_optional_fields = false,
+        });
+        defer allocator.free(entry_json);
+        try out.appendSlice(allocator, entry_json);
     }
     try out.appendSlice(allocator, "}");
 
@@ -976,37 +993,37 @@ pub fn appendContentBlockJson(
     try buf.appendSlice(allocator, "{\"type\":");
     switch (cb) {
         .text => |t| {
-            try appendJsonStr(buf, allocator, "text");
+            try ai.utils.appendJsonStr(buf, allocator, "text");
             try buf.appendSlice(allocator, ",\"text\":");
-            try appendJsonStr(buf, allocator, t.text);
+            try ai.utils.appendJsonStr(buf, allocator, t.text);
             if (t.text_signature) |sig| {
                 try buf.appendSlice(allocator, ",\"textSignature\":");
-                try appendJsonStr(buf, allocator, sig);
+                try ai.utils.appendJsonStr(buf, allocator, sig);
             }
         },
         .thinking => |t| {
-            try appendJsonStr(buf, allocator, "thinking");
+            try ai.utils.appendJsonStr(buf, allocator, "thinking");
             try buf.appendSlice(allocator, ",\"thinking\":");
-            try appendJsonStr(buf, allocator, t.thinking);
+            try ai.utils.appendJsonStr(buf, allocator, t.thinking);
             if (t.thinking_signature) |sig| {
                 try buf.appendSlice(allocator, ",\"thinkingSignature\":");
-                try appendJsonStr(buf, allocator, sig);
+                try ai.utils.appendJsonStr(buf, allocator, sig);
             }
             if (t.redacted) try buf.appendSlice(allocator, ",\"redacted\":true");
         },
         .image => |t| {
-            try appendJsonStr(buf, allocator, "image");
+            try ai.utils.appendJsonStr(buf, allocator, "image");
             try buf.appendSlice(allocator, ",\"data\":");
-            try appendJsonStr(buf, allocator, t.data);
+            try ai.utils.appendJsonStr(buf, allocator, t.data);
             try buf.appendSlice(allocator, ",\"mimeType\":");
-            try appendJsonStr(buf, allocator, t.mime_type);
+            try ai.utils.appendJsonStr(buf, allocator, t.mime_type);
         },
         .tool_call => |t| {
-            try appendJsonStr(buf, allocator, "tool_use");
+            try ai.utils.appendJsonStr(buf, allocator, "tool_use");
             try buf.appendSlice(allocator, ",\"id\":");
-            try appendJsonStr(buf, allocator, t.id);
+            try ai.utils.appendJsonStr(buf, allocator, t.id);
             try buf.appendSlice(allocator, ",\"name\":");
-            try appendJsonStr(buf, allocator, t.name);
+            try ai.utils.appendJsonStr(buf, allocator, t.name);
             // `input` is emitted as a raw JSON value (we trust it to be
             // valid JSON — it came from the model via the partial-json
             // parser or, on round-trip, from a prior serialization).
@@ -1166,70 +1183,34 @@ fn parseMessage(
         break :blk .custom;
     };
 
-    // v1.29.0 — Diagnostics round-trip. Old transcripts without
-    // the field decode as null and round-trip cleanly.
+    // v1.29.0 — Diagnostics round-trip. v1.34.0 — parsed via
+    // `Diagnostics.jsonParseFromValue` hook (std.json). Old transcripts
+    // without the field decode as null and round-trip cleanly.
+    // Uses `parseFromValueLeaky` with the caller's allocator so that
+    // string fields are owned by the `Diagnostics` struct (freed via
+    // `deinit(allocator)`), not by a throwaway arena.
     var diag_opt: ?ai.types.Diagnostics = null;
     if (msg_obj.get("diagnostics")) |dv| if (dv == .object) {
-        const dobj = dv.object;
-        var diag: ai.types.Diagnostics = .{};
-        if (dobj.get("traceId")) |v| if (v == .string) {
-            diag.trace_id = try allocator.dupe(u8, v.string);
+        diag_opt = std.json.parseFromValueLeaky(ai.types.Diagnostics, allocator, dv, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory, // hard failure — don't drop data silently
+            else => null, // shape error → absent diagnostics (old transcripts)
         };
-        if (dobj.get("finishReasonRaw")) |v| if (v == .string) {
-            diag.finish_reason_raw = try allocator.dupe(u8, v.string);
-        };
-        if (dobj.get("partsSeen")) |v| if (v == .integer) {
-            diag.parts_seen = @intCast(v.integer);
-        };
-        if (dobj.get("candidatesTokens")) |v| if (v == .integer) {
-            diag.candidates_tokens = @intCast(v.integer);
-        };
-        if (dobj.get("thoughtsTokens")) |v| if (v == .integer) {
-            diag.thoughts_tokens = @intCast(v.integer);
-        };
-        if (dobj.get("textEvents")) |v| if (v == .integer) {
-            diag.text_event_count = @intCast(v.integer);
-        };
-        if (dobj.get("thinkingEvents")) |v| if (v == .integer) {
-            diag.thinking_event_count = @intCast(v.integer);
-        };
-        if (dobj.get("toolCallEvents")) |v| if (v == .integer) {
-            diag.tool_call_event_count = @intCast(v.integer);
-        };
-        if (dobj.get("wasDegenerate")) |v| if (v == .bool) {
-            diag.was_degenerate = v.bool;
-        };
-        diag_opt = diag;
     };
 
     // v1.31.0 — Usage round-trip. v1.33.0 — accept Claude-Code key
     // names (`input_tokens` etc.) in addition to franky v4 names
-    // (`input` etc.). Token counts arrive as JSON integers; cost
-    // fields as JSON floats.
+    // (`input` etc.). v1.34.0 — parsed via `Usage.jsonParseFromValue`
+    // hook (std.json).
     var usage_opt: ?ai.types.Usage = null;
     if (msg_obj.get("usage")) |uv| if (uv == .object) {
-        const uobj = uv.object;
-        var usage: ai.types.Usage = .{};
-        // v5 `input_tokens` is the uncached portion; v4 `input` is the
-        // total (incl. cached). We restore the TOTAL into `Usage.input`
-        // so the internal model sees the provider-reported total.
-        const input_from_v4 = ai.utils.jsonInt(uobj, "input");
-        const input_from_v5 = ai.utils.jsonInt(uobj, "input_tokens");
-        usage.output = ai.utils.jsonInt(uobj, "output") orelse ai.utils.jsonInt(uobj, "output_tokens") orelse 0;
-        usage.cache_read = ai.utils.jsonInt(uobj, "cacheRead") orelse ai.utils.jsonInt(uobj, "cache_read_input_tokens") orelse 0;
-        usage.cache_write = ai.utils.jsonInt(uobj, "cacheWrite") orelse ai.utils.jsonInt(uobj, "cache_creation_input_tokens") orelse 0;
-        usage.thinking_tokens = ai.utils.jsonInt(uobj, "thinkingTokens") orelse ai.utils.jsonInt(uobj, "thinking_tokens") orelse 0;
-        usage.cache_creation_ephemeral_5m = ai.utils.jsonInt(uobj, "cacheCreationEphemeral5m") orelse ai.utils.jsonInt(uobj, "cache_creation_5m_input_tokens") orelse 0;
-        usage.cache_creation_ephemeral_1h = ai.utils.jsonInt(uobj, "cacheCreationEphemeral1h") orelse ai.utils.jsonInt(uobj, "cache_creation_1h_input_tokens") orelse 0;
-        usage.web_search_requests = ai.utils.jsonInt(uobj, "webSearchRequests") orelse ai.utils.jsonInt(uobj, "web_search_requests") orelse 0;
-        usage.cost_input = ai.utils.jsonFloat(uobj, "costInput") orelse ai.utils.jsonFloat(uobj, "cost_input");
-        usage.cost_output = ai.utils.jsonFloat(uobj, "costOutput") orelse ai.utils.jsonFloat(uobj, "cost_output");
-        usage.cost_cache_read = ai.utils.jsonFloat(uobj, "costCacheRead") orelse ai.utils.jsonFloat(uobj, "cost_cache_read");
-        usage.cost_cache_write = ai.utils.jsonFloat(uobj, "costCacheWrite") orelse ai.utils.jsonFloat(uobj, "cost_cache_write");
-        // Fix up: if we only had v5 `input_tokens` (uncached), add back
-        // the cached tokens to restore the provider-reported total.
-        usage.input = input_from_v4 orelse (input_from_v5 orelse 0) + usage.cache_read + usage.cache_write;
-        usage_opt = usage;
+        usage_opt = std.json.parseFromValueLeaky(ai.types.Usage, allocator, uv, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory, // hard failure — don't drop data silently
+            else => null, // shape error → absent usage (old transcripts)
+        };
     };
 
     // Timestamp: v5 is ISO-8601 string at record level; v4 is epoch-ms
@@ -1357,93 +1338,16 @@ fn parseContentBlock(allocator: std.mem.Allocator, o: std.json.ObjectMap) !ai.ty
     return .{ .text = .{ .text = try allocator.dupe(u8, "") } };
 }
 
-fn writeJsonField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    value: anytype,
-    last: bool,
-) !void {
-    try buf.appendSlice(allocator, "  ");
-    try appendJsonStr(buf, allocator, name);
-    try buf.append(allocator, ':');
-    try buf.append(allocator, ' ');
-    switch (@typeInfo(@TypeOf(value))) {
-        .int, .comptime_int => {
-            const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
-            defer allocator.free(s);
-            try buf.appendSlice(allocator, s);
-        },
-        else => @compileError("writeJsonField only supports integers"),
-    }
-    if (!last) try buf.append(allocator, ',');
-    try buf.append(allocator, '\n');
-}
-
-fn writeJsonStrField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    value: []const u8,
-    last: bool,
-) !void {
-    try buf.appendSlice(allocator, "  ");
-    try appendJsonStr(buf, allocator, name);
-    try buf.appendSlice(allocator, ": ");
-    try appendJsonStr(buf, allocator, value);
-    if (!last) try buf.append(allocator, ',');
-    try buf.append(allocator, '\n');
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            const hex = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
-            defer allocator.free(hex);
-            try buf.appendSlice(allocator, hex);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonNumField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    prefix: []const u8,
-    value: i64,
-) !void {
-    try buf.appendSlice(allocator, prefix);
-    const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
-    defer allocator.free(s);
-    try buf.appendSlice(allocator, s);
-}
-
-/// v1.29.0 — same shape but for unsigned 64-bit values used in
-/// the diagnostics serializer (token counts can exceed i64 range
-/// in pathological cases; cheap to keep them unsigned).
-fn appendJsonU64Field(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    prefix: []const u8,
-    value: u64,
-) !void {
-    try buf.appendSlice(allocator, prefix);
-    const s = try std.fmt.allocPrint(allocator, "{d}", .{value});
-    defer allocator.free(s);
-    try buf.appendSlice(allocator, s);
-}
-
 /// Serialize an f64 cost field as a JSON number. Always emits a
 /// decimal point (even for whole numbers like `0` or `1`) so the
 /// JSON parser tags it as `.float` on round-trip. Guards against
 /// non-finite values (nan/inf are not valid JSON).
+///
+/// v1.34.0 — the integer field emitters (`appendJsonNumField`,
+/// `appendJsonU64Field`) were removed; the cost-state line now emits
+/// integers via the `CostStateLine`/`ModelUsageAccum` `jsonStringify`
+/// hooks (std.json). This f64 helper remains because std.json emits
+/// `0` for whole-number f64, and the prior wire format used `0.0`.
 fn appendJsonF64Field(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -1628,3 +1532,78 @@ pub fn assertRefsInKeep(
         }
     }
 }
+
+// ─── tests ─────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "ModelUsageAccum.jsonStringify emits camelCase wire keys" {
+    const accum = ModelUsageAccum{
+        .input_tokens = 100,
+        .output_tokens = 200,
+        .thinking_tokens = 50,
+        .cache_read_input_tokens = 10,
+        .cache_creation_input_tokens = 5,
+        .cache_creation_ephemeral_5m_input_tokens = 3,
+        .cache_creation_ephemeral_1h_input_tokens = 2,
+        .web_search_requests = 1,
+        .cost_usd = 0.0072,
+        .has_unknown_cost = true, // must be skipped
+    };
+    const json_str = try std.json.Stringify.valueAlloc(testing.allocator, accum, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(json_str);
+
+    // `has_unknown_cost` is skipped (aggregated upstream); `cost_usd`
+    // serializes as `costUSD` with a forced decimal point. The eight
+    // integer wire fields use camelCase keys.
+    try testing.expectEqualStrings(
+        "{\"inputTokens\":100,\"outputTokens\":200,\"thinkingTokens\":50,\"cacheReadInputTokens\":10,\"cacheCreationInputTokens\":5,\"cacheCreationEphemeral5mInputTokens\":3,\"cacheCreationEphemeral1hInputTokens\":2,\"webSearchRequests\":1,\"costUSD\":0.0072}",
+        json_str,
+    );
+}
+
+test "ModelUsageAccum.jsonStringify forces a decimal point on whole-number costUSD" {
+    // A whole-number `cost_usd` must serialize as `0.0` (not `0`) so it
+    // round-trips as `.float`; non-finite values clamp to `0.0`.
+    const zero = ModelUsageAccum{};
+    const zero_json = try std.json.Stringify.valueAlloc(testing.allocator, zero, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(zero_json);
+    try testing.expectEqualStrings(
+        "{\"inputTokens\":0,\"outputTokens\":0,\"thinkingTokens\":0,\"cacheReadInputTokens\":0,\"cacheCreationInputTokens\":0,\"cacheCreationEphemeral5mInputTokens\":0,\"cacheCreationEphemeral1hInputTokens\":0,\"webSearchRequests\":0,\"costUSD\":0.0}",
+        zero_json,
+    );
+
+    const nan_accum = ModelUsageAccum{ .cost_usd = std.math.nan(f64) };
+    const nan_json = try std.json.Stringify.valueAlloc(testing.allocator, nan_accum, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(nan_json);
+    try testing.expect(std.mem.indexOf(u8, nan_json, "\"costUSD\":0.0") != null);
+}
+
+test "CostStateLine.jsonStringify emits the flat cost-state numeric fields" {
+    const line = CostStateLine{
+        .total_api_duration_ms = 100,
+        .total_api_duration_without_retries_ms = 90,
+        .total_tool_duration_ms = 200,
+        .total_lines_added = 5,
+        .total_lines_removed = 3,
+        .total_duration = 500,
+        .start_time = 1700000000000,
+    };
+    const json_str = try std.json.Stringify.valueAlloc(testing.allocator, line, .{
+        .emit_null_optional_fields = false,
+    });
+    defer testing.allocator.free(json_str);
+
+    // `totalCostUSD` is NOT here — emitted manually by renderCostStateLine.
+    try testing.expectEqualStrings(
+        "{\"totalAPIDuration\":100,\"totalAPIDurationWithoutRetries\":90,\"totalToolDuration\":200,\"totalLinesAdded\":5,\"totalLinesRemoved\":3,\"totalDuration\":500,\"startTime\":1700000000000}",
+        json_str,
+    );
+}
+
