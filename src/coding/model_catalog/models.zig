@@ -22,6 +22,23 @@ pub const Capabilities = struct {
     reasoning: bool = false,
     cache: bool = false,
     streaming: bool = true,
+
+    pub const json_meta = .{
+        .tool_use = .{ .rename = "toolUse" },
+    };
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try @import("../../ai/json_meta.zig").stringifyWithMeta(self, jw);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Capabilities {
+        _ = options;
+        return @import("../../ai/json_meta.zig").parseWithMeta(Capabilities, allocator, source);
+    }
 };
 
 pub const Cost = struct {
@@ -29,6 +46,30 @@ pub const Cost = struct {
     output_per_1m: f32 = 0,
     cache_read_per_1m: f32 = 0,
     cache_write_per_1m: f32 = 0,
+
+    /// `.format = .shortest_float` renders each f32 with `{d}` (shortest
+    /// round-trip, e.g. `0.3`), matching the prior manual renderer. Without
+    /// it, `jw.write(f32)` would emit full precision (`0.30000001192092896`),
+    /// changing models.json bytes.
+    pub const json_meta = .{
+        .input_per_1m = .{ .rename = "inputPer1M", .format = .shortest_float },
+        .output_per_1m = .{ .rename = "outputPer1M", .format = .shortest_float },
+        .cache_read_per_1m = .{ .rename = "cacheReadPer1M", .format = .shortest_float },
+        .cache_write_per_1m = .{ .rename = "cacheWritePer1M", .format = .shortest_float },
+    };
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try @import("../../ai/json_meta.zig").stringifyWithMeta(self, jw);
+    }
+
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Cost {
+        _ = options;
+        return @import("../../ai/json_meta.zig").parseWithMeta(Cost, allocator, source);
+    }
 };
 
 pub const Entry = struct {
@@ -41,6 +82,44 @@ pub const Entry = struct {
     capabilities: Capabilities,
     cost: Cost,
     knowledge_cutoff: []const u8,
+
+    pub const json_meta = .{
+        .display_name = .{ .rename = "displayName" },
+        .context_window = .{ .rename = "contextWindow" },
+        .max_output = .{ .rename = "maxOutput" },
+        .knowledge_cutoff = .{ .rename = "knowledgeCutoff" },
+    };
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try @import("../../ai/json_meta.zig").stringifyWithMeta(self, jw);
+    }
+
+    /// Parse a `std.json.Value` (object) into an `Entry` via the generic
+    /// `json_meta.parseWithMeta` helper (which recurses into `capabilities`
+    /// / `cost` via their own hooks and dups the string fields). Requires
+    /// `id`; `display_name` falls back to `id` when absent (matching the
+    /// prior manual parser).
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !Entry {
+        _ = options;
+        if (source != .object) return error.UnexpectedToken;
+        const id_v = source.object.get("id") orelse return error.MissingField;
+        if (id_v != .string) return error.UnexpectedToken;
+        var e = try @import("../../ai/json_meta.zig").parseWithMeta(Entry, allocator, source);
+        // `display_name` falls back to `id` when the `displayName` key is
+        // absent OR present-but-not-a-string — matching the prior manual
+        // parser's `strOr(o, "displayName", id)`, which used the default in
+        // both cases. An explicitly-empty `displayName` string is kept.
+        if (source.object.get("displayName")) |dn| {
+            if (dn != .string) e.display_name = try allocator.dupe(u8, id_v.string);
+        } else {
+            e.display_name = try allocator.dupe(u8, id_v.string);
+        }
+        return e;
+    }
 };
 
 /// Built-in catalog. Order matters for `lookup`: the first match
@@ -128,19 +207,13 @@ pub fn parseFromSlice(
 
     for (models_v.array.items) |item| {
         if (item != .object) continue;
-        const o = item.object;
-        const id = if (o.get("id")) |v| (if (v == .string) v.string else null) else null;
-        if (id == null) continue;
-        const entry = Entry{
-            .id = try allocator.dupe(u8, id.?),
-            .provider = try allocator.dupe(u8, strOr(o, "provider", "")),
-            .api = try allocator.dupe(u8, strOr(o, "api", "")),
-            .display_name = try allocator.dupe(u8, strOr(o, "displayName", id.?)),
-            .context_window = intOr(o, "contextWindow", 0),
-            .max_output = intOr(o, "maxOutput", 0),
-            .capabilities = parseCaps(o),
-            .cost = parseCost(o),
-            .knowledge_cutoff = try allocator.dupe(u8, strOr(o, "knowledgeCutoff", "")),
+        // Parse via the Entry.jsonParseFromValue hook (requires id, dups the
+        // string fields, recurses into capabilities/cost, camelCase renames,
+        // display_name falls back to id). Entries with a missing/malformed id
+        // are skipped, matching the prior manual loop.
+        const entry = std.json.parseFromValueLeaky(Entry, allocator, item, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory, // hard failure — don't skip entries silently
+            else => continue, // shape error → skip entry (matching prior loop)
         };
         try out.append(allocator, entry);
     }
@@ -158,64 +231,6 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
     allocator.free(e.api);
     allocator.free(e.display_name);
     allocator.free(e.knowledge_cutoff);
-}
-
-fn strOr(o: std.json.ObjectMap, key: []const u8, default_value: []const u8) []const u8 {
-    if (o.get(key)) |v| {
-        if (v == .string) return v.string;
-    }
-    return default_value;
-}
-
-fn intOr(o: std.json.ObjectMap, key: []const u8, default_value: u32) u32 {
-    if (o.get(key)) |v| {
-        if (v == .integer and v.integer >= 0) return @intCast(v.integer);
-    }
-    return default_value;
-}
-
-fn parseCaps(o: std.json.ObjectMap) Capabilities {
-    var c = Capabilities{};
-    if (o.get("capabilities")) |cv| if (cv == .object) {
-        if (cv.object.get("vision")) |b| if (b == .bool) {
-            c.vision = b.bool;
-        };
-        if (cv.object.get("toolUse")) |b| if (b == .bool) {
-            c.tool_use = b.bool;
-        };
-        if (cv.object.get("reasoning")) |b| if (b == .bool) {
-            c.reasoning = b.bool;
-        };
-        if (cv.object.get("cache")) |b| if (b == .bool) {
-            c.cache = b.bool;
-        };
-        if (cv.object.get("streaming")) |b| if (b == .bool) {
-            c.streaming = b.bool;
-        };
-    };
-    return c;
-}
-
-fn parseCost(o: std.json.ObjectMap) Cost {
-    var c = Cost{};
-    if (o.get("cost")) |cv| if (cv == .object) {
-        c.input_per_1m = floatOr(cv.object, "inputPer1M", 0);
-        c.output_per_1m = floatOr(cv.object, "outputPer1M", 0);
-        c.cache_read_per_1m = floatOr(cv.object, "cacheReadPer1M", 0);
-        c.cache_write_per_1m = floatOr(cv.object, "cacheWritePer1M", 0);
-    };
-    return c;
-}
-
-fn floatOr(o: std.json.ObjectMap, key: []const u8, default_value: f32) f32 {
-    if (o.get(key)) |v| {
-        switch (v) {
-            .float => |f| return @floatCast(f),
-            .integer => |i| return @floatFromInt(i),
-            else => {},
-        }
-    }
-    return default_value;
 }
 
 // ─── tests ────────────────────────────────────────────────────────
@@ -301,4 +316,21 @@ test "parseFromSlice: entries without id are skipped" {
     defer freeEntries(gpa, entries);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqualStrings("ok", entries[0].id);
+}
+
+test "parseFromSlice: absent capability keys keep their non-zero defaults" {
+    // Regression guard for the json_meta parse migration: parseWithMeta must
+    // default-initialise from the struct's declared defaults, NOT
+    // std.mem.zeroes — otherwise `tool_use = true` and `streaming = true`
+    // would silently parse as false when the keys (or the whole
+    // `capabilities` object) are absent.
+    const gpa = testing.allocator;
+    const bytes =
+        \\{"models":[{"id":"ok","provider":"p","api":"a"}]}
+    ;
+    const entries = try parseFromSlice(gpa, bytes);
+    defer freeEntries(gpa, entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(true, entries[0].capabilities.tool_use);
+    try testing.expectEqual(true, entries[0].capabilities.streaming);
 }
