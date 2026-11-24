@@ -510,6 +510,21 @@ fn classifyTransport(e: anyerror) retry_mod.Outcome {
         error.BrokenPipe,
         error.TlsInitializationFailed,
         error.HttpChunkTruncated,
+        // Stale keep-alive connection: the peer (or a NAT/firewall
+        // on the path) silently dropped the pooled TCP connection
+        // while the loop was idle; the first write on it fails
+        // (EPIPE/ECONNRESET → WriteFailed). Retry is safe for the
+        // chat-completions workload: these POSTs carry no server-
+        // side mutation beyond billable inference, and in the
+        // dominant case the kernel never got an ACK for the bytes
+        // (peer already gone). Corner case: the server received
+        // the full body but the connection died before/during our
+        // final flush — a retry then duplicates the inference
+        // call. Accepted: rare, and the alternative (terminal
+        // failure on every idle-gap first request) is strictly
+        // worse. `fetchPhased` marked the connection closing so
+        // the retry dials fresh.
+        error.WriteFailed,
         => .retryable,
         else => .terminal,
     };
@@ -639,28 +654,46 @@ fn fetchPhased(
     if (opts.payload) |payload| {
         req.transfer_encoding = .{ .content_length = payload.len };
         var body = req.sendBodyUnflushed(&.{}) catch |e| {
-            if (disarmPhase(guard)) return error.Timeout;
+            if (disarmPhase(guard)) {
+                if (req.connection) |c| c.closing = true;
+                return error.Timeout;
+            }
+            // A failed write means the connection state is unknown
+            // (stale keep-alive, half-open TCP, …) — keep it out of
+            // the pool so a retry dials a fresh connection instead of
+            // re-grabbing the dead one.
+            if (req.connection) |c| c.closing = true;
             return e;
         };
         body.writer.writeAll(payload) catch |e| {
+            if (req.connection) |c| c.closing = true;
             if (disarmPhase(guard)) return error.Timeout;
             return e;
         };
         body.end() catch |e| {
+            if (req.connection) |c| c.closing = true;
             if (disarmPhase(guard)) return error.Timeout;
             return e;
         };
         req.connection.?.flush() catch |e| {
+            if (req.connection) |c| c.closing = true;
             if (disarmPhase(guard)) return error.Timeout;
             return e;
         };
     } else {
         req.sendBodiless() catch |e| {
+            if (req.connection) |c| c.closing = true;
             if (disarmPhase(guard)) return error.Timeout;
             return e;
         };
     }
-    if (disarmPhase(guard)) return error.Timeout;
+    if (disarmPhase(guard)) {
+        // Watchdog shutdown(.both) the connection mid-upload — it is
+        // unusable even if no write error surfaced. Keep it out of
+        // the pool (same poisoning vector as a failed write).
+        if (req.connection) |c| c.closing = true;
+        return error.Timeout;
+    }
 
     // ── Phase 3: first byte (response head) ──
     const redirect_buffer: []u8 = if (opts.redirect_behavior == .unhandled) &.{} else opts.redirect_buffer orelse
@@ -669,10 +702,19 @@ fn fetchPhased(
 
     armPhase(guard, .first_byte, req.connection, ctx.timeouts.first_byte_ms);
     var response = req.receiveHead(redirect_buffer) catch |e| {
-        if (disarmPhase(guard)) return error.Timeout;
+        // receiveHead already sets connection.closing on read
+        // failure; the timeout path needs it too — the watchdog
+        // shutdown the stream and the connection must not be pooled.
+        if (disarmPhase(guard)) {
+            if (req.connection) |c| c.closing = true;
+            return error.Timeout;
+        }
         return e;
     };
-    if (disarmPhase(guard)) return error.Timeout;
+    if (disarmPhase(guard)) {
+        if (req.connection) |c| c.closing = true;
+        return error.Timeout;
+    }
 
     // ── Phase 4: body ──
     // No watchdog here — body reads are bounded by `event_gap_ms`
@@ -1208,6 +1250,10 @@ test "classifyTransport: connection resets are retryable" {
     try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.BrokenPipe));
     try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.TlsInitializationFailed));
     try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.HttpChunkTruncated));
+    // Stale keep-alive write failure must be retryable (see
+    // classifyTransport comment) — regression guard for the
+    // "idle loop → transport: http error: WriteFailed" bug.
+    try testing.expectEqual(retry_mod.Outcome.retryable, classifyTransport(error.WriteFailed));
 }
 
 test "deadlineExpired: zero deadline means never" {
