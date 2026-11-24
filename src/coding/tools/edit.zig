@@ -276,16 +276,27 @@ pub fn applyEdits(
     // The `format` field is the contract version the client matches against
     // (see app.js:tryRenderDiffPanel). Bump the suffix when the diff string
     // shape changes and update the client allowlist in lockstep.
+    // The details_json wire shape is a plain anonymous struct — its keys
+    // are already wire-named, so `std.json` handles escaping/ordering
+    // directly (no json_meta renames needed). Two shapes preserve the exact
+    // byte order of the prior hand-rolled emitter: with-diff puts `format`
+    // before `diff`; no-diff omits `format` and emits `diff:null`.
     const details = blk: {
         const diff_str = computeUnifiedDiff(allocator, original, buf.items, path) catch null;
         if (diff_str) |d| {
             defer allocator.free(d);
-            // JSON-escape the diff string for embedding in details_json.
-            const escaped = try escapeJsonString(allocator, d);
-            defer allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"format\":\"unified-diff-v1\",\"diff\":\"{s}\",\"path\":\"{s}\"}}", .{ edits.len, escaped, path });
+            break :blk try std.json.Stringify.valueAlloc(allocator, .{
+                .edits = edits.len,
+                .format = "unified-diff-v1",
+                .diff = d,
+                .path = path,
+            }, .{});
         } else {
-            break :blk try std.fmt.allocPrint(allocator, "{{\"edits\":{d},\"diff\":null,\"path\":\"{s}\"}}", .{ edits.len, path });
+            break :blk try std.json.Stringify.valueAlloc(allocator, .{
+                .edits = edits.len,
+                .diff = @as(?[]const u8, null),
+                .path = path,
+            }, .{});
         }
     };
     const line_counts = countDiffLines(allocator, original, buf.items);
@@ -841,27 +852,6 @@ fn appendUint(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: usize) !
 }
 
 /// JSON-escape a string for embedding in a JSON value.
-fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x0b, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-
-    return buf.toOwnedSlice(allocator);
-}
-
 // ─── tests ────────────────────────────────────────────────────────
 
 const testing = std.testing;

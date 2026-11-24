@@ -16,8 +16,17 @@ const std = @import("std");
 const at = @import("types.zig");
 const ai_types = @import("../ai/types.zig");
 const ai_errors = @import("../ai/errors.zig");
+const ai_utils = @import("../ai/utils.zig");
 
 /// Encode `ev` as a JSON payload — no SSE framing. Caller-owned.
+///
+/// Every variant's payload is a clean struct, so it serialises via
+/// `std.json.Stringify.valueAlloc` over a per-variant payload struct; the
+/// emitted object's braces are stripped and spliced into the `"kind"`
+/// wrapper (`appendPayloadFields`). Two variants splice **raw JSON** that
+/// `std.json` would re-encode as an escaped string — the sub-agent
+/// `update` payload and the front-end `detailsJson` metadata — so their
+/// raw fragment is appended verbatim after the struct fields.
 pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -26,131 +35,119 @@ pub fn encodeEventJson(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
     switch (ev) {
         .turn_start => try buf.appendSlice(allocator, "\"kind\":\"turn_start\""),
         .turn_end => try buf.appendSlice(allocator, "\"kind\":\"turn_end\""),
+        .agent_interrupted => try buf.appendSlice(allocator, "\"kind\":\"agent_interrupted\""),
         .message_start => |s| {
-            try buf.appendSlice(allocator, "\"kind\":\"message_start\",\"role\":");
-            try appendJsonStr(&buf, allocator, roleName(s.role));
-            if (s.custom_role) |cr| {
-                try buf.appendSlice(allocator, ",\"customRole\":");
-                try appendJsonStr(&buf, allocator, cr);
-            }
+            try buf.appendSlice(allocator, "\"kind\":\"message_start\"");
+            try appendPayloadFields(allocator, &buf, .{
+                .role = roleName(s.role),
+                .customRole = s.custom_role,
+            });
         },
         .message_update => |m| switch (m) {
-            .text => |t| {
-                try buf.appendSlice(allocator, "\"kind\":\"message_update\",\"deltaKind\":\"text\",\"blockIndex\":");
-                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
-                try buf.appendSlice(allocator, ",\"delta\":");
-                try appendJsonStr(&buf, allocator, t.delta);
-            },
-            .thinking => |t| {
-                try buf.appendSlice(allocator, "\"kind\":\"message_update\",\"deltaKind\":\"thinking\",\"blockIndex\":");
-                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
-                try buf.appendSlice(allocator, ",\"delta\":");
-                try appendJsonStr(&buf, allocator, t.delta);
-            },
-            .toolcall_args => |t| {
-                try buf.appendSlice(allocator, "\"kind\":\"message_update\",\"deltaKind\":\"toolcall_args\",\"blockIndex\":");
-                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
-                try buf.appendSlice(allocator, ",\"delta\":");
-                try appendJsonStr(&buf, allocator, t.delta);
+            inline .text, .thinking, .toolcall_args => |t, k| {
+                try buf.appendSlice(allocator, "\"kind\":\"message_update\"");
+                try appendPayloadFields(allocator, &buf, .{
+                    .deltaKind = @tagName(k),
+                    .blockIndex = t.block_index,
+                    .delta = t.delta,
+                });
             },
         },
         .message_end => |m| {
-            try buf.appendSlice(allocator, "\"kind\":\"message_end\",\"role\":");
-            try appendJsonStr(&buf, allocator, roleName(m.role));
-            try buf.appendSlice(allocator, ",\"contentBlocks\":");
-            try appendJsonInt(&buf, allocator, @intCast(m.content.len));
+            try buf.appendSlice(allocator, "\"kind\":\"message_end\"");
+            try appendPayloadFields(allocator, &buf, .{
+                .role = roleName(m.role),
+                .contentBlocks = m.content.len,
+            });
         },
         .tool_execution_start => |s| {
-            try buf.appendSlice(allocator, "\"kind\":\"tool_execution_start\",\"callId\":");
-            try appendJsonStr(&buf, allocator, s.call_id);
-            try buf.appendSlice(allocator, ",\"name\":");
-            try appendJsonStr(&buf, allocator, s.name);
-            try buf.appendSlice(allocator, ",\"argsJson\":");
-            try appendJsonStr(&buf, allocator, s.args_json);
+            try buf.appendSlice(allocator, "\"kind\":\"tool_execution_start\"");
+            try appendPayloadFields(allocator, &buf, .{
+                .callId = s.call_id,
+                .name = s.name,
+                .argsJson = s.args_json,
+            });
         },
         .tool_execution_update => |u| {
-            try buf.appendSlice(allocator, "\"kind\":\"tool_execution_update\",\"callId\":");
-            try appendJsonStr(&buf, allocator, u.call_id);
+            try buf.appendSlice(allocator, "\"kind\":\"tool_execution_update\"");
+            try appendPayloadFields(allocator, &buf, .{ .callId = u.call_id });
+            // `update` is already-serialised JSON (the sub-agent's progress
+            // payload); append verbatim so it isn't re-escaped as a string.
             try buf.appendSlice(allocator, ",\"update\":");
             try buf.appendSlice(allocator, u.update_json);
         },
         .tool_execution_end => |e| {
-            try buf.appendSlice(allocator, "\"kind\":\"tool_execution_end\",\"callId\":");
-            try appendJsonStr(&buf, allocator, e.call_id);
-            try buf.appendSlice(allocator, ",\"isError\":");
-            try buf.appendSlice(allocator, if (e.result.is_error) "true" else "false");
-            if (e.result.tool_code) |code| {
-                try buf.appendSlice(allocator, ",\"toolCode\":");
-                try appendJsonStr(&buf, allocator, code);
-            }
+            try buf.appendSlice(allocator, "\"kind\":\"tool_execution_end\"");
             // Concatenate all text content blocks into resultText so the
             // web UI can display the tool output in a collapsible panel.
-            try buf.appendSlice(allocator, ",\"resultText\":");
             var combined: std.ArrayListUnmanaged(u8) = .empty;
             defer combined.deinit(allocator);
             for (e.result.content) |cb| {
                 if (cb == .text) try combined.appendSlice(allocator, cb.text.text);
             }
-            try appendJsonStr(&buf, allocator, combined.items);
-            // §6.8 — include details_json as opaque metadata for the front-end
-            // (e.g. unified diff for the edit tool). The value is already valid
-            // JSON, so we append it directly without re-encoding.
+            try appendPayloadFields(allocator, &buf, .{
+                .callId = e.call_id,
+                .isError = e.result.is_error,
+                .toolCode = e.result.tool_code,
+                .resultText = combined.items,
+            });
+            // §6.8 — `details_json` is already-serialised JSON (e.g. the
+            // unified diff for the edit tool); append verbatim.
             if (e.result.details_json) |dj| {
                 try buf.appendSlice(allocator, ",\"detailsJson\":");
                 try buf.appendSlice(allocator, dj);
             }
         },
         .tool_permission_request => |r| {
-            try buf.appendSlice(allocator, "\"kind\":\"tool_permission_request\",\"callId\":");
-            try appendJsonStr(&buf, allocator, r.call_id);
-            try buf.appendSlice(allocator, ",\"toolName\":");
-            try appendJsonStr(&buf, allocator, r.tool_name);
-            try buf.appendSlice(allocator, ",\"argsJson\":");
-            try appendJsonStr(&buf, allocator, r.args_json);
-            try buf.appendSlice(allocator, ",\"fingerprint\":");
-            try appendJsonStr(&buf, allocator, r.fingerprint);
+            try buf.appendSlice(allocator, "\"kind\":\"tool_permission_request\"");
+            try appendPayloadFields(allocator, &buf, .{
+                .callId = r.call_id,
+                .toolName = r.tool_name,
+                .argsJson = r.args_json,
+                .fingerprint = r.fingerprint,
+            });
         },
         .agent_error => |d| {
-            try buf.appendSlice(allocator, "\"kind\":\"agent_error\",\"code\":");
-            try appendJsonStr(&buf, allocator, d.code.toString());
-            try buf.appendSlice(allocator, ",\"message\":");
-            try appendJsonStr(&buf, allocator, d.message);
-            if (!d.is_fatal) {
-                try buf.appendSlice(allocator, ",\"isFatal\":false");
-            }
-            if (d.http_status) |s| {
-                try buf.appendSlice(allocator, ",\"httpStatus\":");
-                try appendJsonInt(&buf, allocator, @intCast(s));
-            }
-        },
-        .agent_interrupted => {
-            try buf.appendSlice(allocator, "\"kind\":\"agent_interrupted\"");
+            try buf.appendSlice(allocator, "\"kind\":\"agent_error\"");
+            try appendPayloadFields(allocator, &buf, .{
+                .code = d.code.toString(),
+                .message = d.message,
+                // Emitted only when false, to match the prior wire shape.
+                .isFatal = if (d.is_fatal) null else false,
+                .httpStatus = d.http_status,
+            });
         },
         .provider_retry => |r| {
-            try buf.appendSlice(allocator, "\"kind\":\"provider_retry\",\"attempt\":");
-            try appendJsonInt(&buf, allocator, @intCast(r.attempt));
-            try buf.appendSlice(allocator, ",\"max_attempts\":");
-            try appendJsonInt(&buf, allocator, @intCast(r.max_attempts));
-            try buf.appendSlice(allocator, ",\"delay_ms\":");
-            try appendJsonInt(&buf, allocator, @intCast(r.delay_ms));
-            try buf.appendSlice(allocator, ",\"reason\":");
-            try appendJsonStr(&buf, allocator, @tagName(r.reason));
-            if (r.http_status) |s| {
-                try buf.appendSlice(allocator, ",\"http_status\":");
-                try appendJsonInt(&buf, allocator, @intCast(s));
-            }
-            if (r.provider_code) |pc| {
-                try buf.appendSlice(allocator, ",\"provider_code\":");
-                try appendJsonStr(&buf, allocator, pc);
-            }
-            if (r.provider_message) |pm| {
-                try buf.appendSlice(allocator, ",\"provider_message\":");
-                try appendJsonStr(&buf, allocator, pm);
-            }
+            try buf.appendSlice(allocator, "\"kind\":\"provider_retry\"");
+            try appendPayloadFields(allocator, &buf, .{
+                .attempt = r.attempt,
+                .max_attempts = r.max_attempts,
+                .delay_ms = r.delay_ms,
+                .reason = @tagName(r.reason),
+                .http_status = r.http_status,
+                .provider_code = r.provider_code,
+                .provider_message = r.provider_message,
+            });
         },
     }
     try buf.append(allocator, '}');
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Serialise `payload` (a struct of wire fields) via
+/// `std.json.Stringify.valueAlloc`, strip the outer braces, and append the
+/// fields into `buf` (with a leading comma). With
+/// `.emit_null_optional_fields = false`, null optional fields are omitted.
+/// An empty payload struct appends nothing.
+fn appendPayloadFields(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), payload: anytype) !void {
+    const pj = try std.json.Stringify.valueAlloc(allocator, payload, .{
+        .emit_null_optional_fields = false,
+    });
+    defer allocator.free(pj);
+    if (pj.len > 2) {
+        try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, pj[1 .. pj.len - 1]);
+    }
 }
 
 /// HTML-escape `s` into `buf`. Replaces the browser-side `escapeHtml`
@@ -186,14 +183,14 @@ pub fn encodeEventHtml(allocator: std.mem.Allocator, ev: at.AgentEvent) ![]u8 {
             .text => unreachable, // named, handled by guard above
             .thinking => |t| {
                 try buf.appendSlice(allocator, "<div id=\"thinking-");
-                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
+                try ai_utils.appendJsonInt(&buf, allocator, @intCast(t.block_index));
                 try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"thinking-delta\">");
                 try appendHtmlEsc(&buf, allocator, t.delta);
                 try buf.appendSlice(allocator, "</div>");
             },
             .toolcall_args => |t| {
                 try buf.appendSlice(allocator, "<span id=\"toolcall-args-");
-                try appendJsonInt(&buf, allocator, @intCast(t.block_index));
+                try ai_utils.appendJsonInt(&buf, allocator, @intCast(t.block_index));
                 try buf.appendSlice(allocator, "\" hx-swap-oob=\"beforeend\" class=\"toolcall-args-delta\">");
                 try appendHtmlEsc(&buf, allocator, t.delta);
                 try buf.appendSlice(allocator, "</span>");
@@ -263,30 +260,6 @@ fn roleName(r: ai_types.Role) []const u8 {
         .tool_result => "tool_result",
         .custom => "custom",
     };
-}
-
-fn appendJsonStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0...0x07, 0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-            var tmp: [8]u8 = undefined;
-            const w = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
-            try buf.appendSlice(allocator, w);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn appendJsonInt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n: i64) !void {
-    var tmp: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{n}) catch unreachable;
-    try buf.appendSlice(allocator, s);
 }
 
 // ─── tests ────────────────────────────────────────────────────────

@@ -38,6 +38,22 @@ pub const AuthError = error{
 
 pub const ProviderAuthType = enum { api_key, oauth };
 
+/// Wire wrapper for `ProviderAuthType`: serializes the enum as its
+/// Claude-Code-compatible string (`api_key` → `"apiKey"`, `oauth` →
+/// `"oauth"`). `std.json.write` dispatches through these hooks, so a
+/// struct holding a `ProviderAuthType` field can use the generic
+/// `json_meta.stringifyWithMeta` without special-casing the enum.
+pub const ProviderAuthTypeWire = struct {
+    value: ProviderAuthType,
+
+    pub fn jsonStringify(self: ProviderAuthTypeWire, jw: anytype) !void {
+        try jw.write(switch (self.value) {
+            .api_key => "apiKey",
+            .oauth => "oauth",
+        });
+    }
+};
+
 pub const ProviderAuth = struct {
     type: ProviderAuthType,
     api_key: ?[]const u8 = null,
@@ -47,6 +63,71 @@ pub const ProviderAuth = struct {
     /// needs to know when to refresh.
     expires_at: ?[]const u8 = null,
     scope: ?[]const u8 = null,
+
+    /// Wire-format field metadata: camelCase key names + the `type`
+    /// enum serialized as `apiKey`/`oauth` (not the Zig tag `api_key`).
+    pub const json_meta = .{
+        .api_key = .{ .rename = "apiKey" },
+        .access_token = .{ .rename = "accessToken" },
+        .refresh_token = .{ .rename = "refreshToken" },
+        .expires_at = .{ .rename = "expiresAt" },
+    };
+
+    /// Serialize via a wire-shape twin: `type` is wrapped in
+    /// `ProviderAuthTypeWire` (whose hook emits the renamed enum string),
+    /// the remaining fields serialize through the generic
+    /// `json_meta.stringifyWithMeta` on the twin's own `json_meta`.
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const jm = @import("../../ai/json_meta.zig");
+        const Wire = struct {
+            type: ProviderAuthTypeWire,
+            api_key: ?[]const u8 = null,
+            access_token: ?[]const u8 = null,
+            refresh_token: ?[]const u8 = null,
+            expires_at: ?[]const u8 = null,
+            scope: ?[]const u8 = null,
+
+            pub const json_meta = .{
+                .api_key = .{ .rename = "apiKey" },
+                .access_token = .{ .rename = "accessToken" },
+                .refresh_token = .{ .rename = "refreshToken" },
+                .expires_at = .{ .rename = "expiresAt" },
+            };
+
+            pub fn jsonStringify(w: @This(), wjw: anytype) !void {
+                try jm.stringifyWithMeta(w, wjw);
+            }
+        };
+        try jw.write(Wire{
+            .type = .{ .value = self.type },
+            .api_key = self.api_key,
+            .access_token = self.access_token,
+            .refresh_token = self.refresh_token,
+            .expires_at = self.expires_at,
+            .scope = self.scope,
+        });
+    }
+
+    /// Parse a `std.json.Value` (object) into a `ProviderAuth` via the
+    /// generic `json_meta.parseWithMeta` helper, which dups optional
+    /// string fields into `allocator` and honours the camelCase renames.
+    /// `type` is parsed separately because the wire uses `"apiKey"` /
+    /// `"oauth"` (not the Zig tag `api_key`).
+    pub fn jsonParseFromValue(
+        allocator: std.mem.Allocator,
+        source: std.json.Value,
+        options: std.json.ParseOptions,
+    ) !ProviderAuth {
+        _ = options;
+        const jm = @import("../../ai/json_meta.zig");
+        if (source != .object) return error.UnexpectedToken;
+        const type_v = source.object.get("type") orelse return error.MissingField;
+        if (type_v != .string) return error.UnexpectedToken;
+        const atype: ProviderAuthType = if (std.mem.eql(u8, type_v.string, "oauth")) .oauth else .api_key;
+        var pa = try jm.parseWithMeta(ProviderAuth, allocator, source);
+        pa.type = atype;
+        return pa;
+    }
 
     pub fn deinit(self: *ProviderAuth, allocator: std.mem.Allocator) void {
         if (self.api_key) |s| allocator.free(s);
@@ -134,26 +215,14 @@ pub fn load(
             const obj = entry.value_ptr.*;
             if (obj != .object) continue;
 
-            const type_val = obj.object.get("type") orelse continue;
-            if (type_val != .string) continue;
-            const atype: ProviderAuthType = if (std.mem.eql(u8, type_val.string, "oauth")) .oauth else .api_key;
-
-            var pa = ProviderAuth{ .type = atype };
-            if (utils.jsonStr(obj.object, "apiKey")) |s| {
-                pa.api_key = try allocator.dupe(u8, s);
-            }
-            if (utils.jsonStr(obj.object, "accessToken")) |s| {
-                pa.access_token = try allocator.dupe(u8, s);
-            }
-            if (utils.jsonStr(obj.object, "refreshToken")) |s| {
-                pa.refresh_token = try allocator.dupe(u8, s);
-            }
-            if (utils.jsonStr(obj.object, "expiresAt")) |s| {
-                pa.expires_at = try allocator.dupe(u8, s);
-            }
-            if (utils.jsonStr(obj.object, "scope")) |s| {
-                pa.scope = try allocator.dupe(u8, s);
-            }
+            // Parse via the ProviderAuth.jsonParseFromValue hook (dups the
+            // optional string fields into `allocator`; camelCase renames).
+            // Skip entries with a missing/malformed `type`, matching the
+            // prior manual guards.
+            const pa = std.json.parseFromValueLeaky(ProviderAuth, allocator, obj, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory, // hard failure — don't drop credentials silently
+                else => continue, // shape error → skip entry (matching prior guards)
+            };
 
             const owned_name = try allocator.dupe(u8, name);
             try auth.providers.put(owned_name, pa);
@@ -238,66 +307,25 @@ fn renderAuthJson(
     while (it.next()) |entry| {
         if (!first) try buf.append(allocator, ',');
         first = false;
-        try writeJsonString(buf, allocator, entry.key_ptr.*);
+        try utils.appendJsonStr(buf, allocator, entry.key_ptr.*);
         try buf.append(allocator, ':');
         try renderProvider(buf, allocator, entry.value_ptr);
     }
     try buf.appendSlice(allocator, "}}");
 }
 
+/// Serialize a `ProviderAuth` via its `jsonStringify` hook, appending
+/// the result into `buf`.
 fn renderProvider(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     pa: *const ProviderAuth,
 ) !void {
-    try buf.append(allocator, '{');
-    try buf.appendSlice(allocator, "\"type\":");
-    try writeJsonString(buf, allocator, switch (pa.type) {
-        .api_key => "apiKey",
-        .oauth => "oauth",
+    const s = try std.json.Stringify.valueAlloc(allocator, pa.*, .{
+        .emit_null_optional_fields = false,
     });
-    if (pa.api_key) |v| try writeJsonField(buf, allocator, "apiKey", v);
-    if (pa.access_token) |v| try writeJsonField(buf, allocator, "accessToken", v);
-    if (pa.refresh_token) |v| try writeJsonField(buf, allocator, "refreshToken", v);
-    if (pa.expires_at) |v| try writeJsonField(buf, allocator, "expiresAt", v);
-    if (pa.scope) |v| try writeJsonField(buf, allocator, "scope", v);
-    try buf.append(allocator, '}');
-}
-
-fn writeJsonField(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    key: []const u8,
-    value: []const u8,
-) !void {
-    try buf.append(allocator, ',');
-    try writeJsonString(buf, allocator, key);
-    try buf.append(allocator, ':');
-    try writeJsonString(buf, allocator, value);
-}
-
-fn writeJsonString(
-    buf: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    s: []const u8,
-) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-            var enc: [6]u8 = .{ '\\', 'u', '0', '0', 0, 0 };
-            const hex = "0123456789abcdef";
-            enc[4] = hex[(c >> 4) & 0x0f];
-            enc[5] = hex[c & 0x0f];
-            try buf.appendSlice(allocator, &enc);
-        },
-        else => try buf.append(allocator, c),
-    };
-    try buf.append(allocator, '"');
+    defer allocator.free(s);
+    try buf.appendSlice(allocator, s);
 }
 
 /// Build a credential record suitable for `Auth.providers.put` from
