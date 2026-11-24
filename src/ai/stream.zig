@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const types = @import("types.zig");
 const errors = @import("errors.zig");
 const channel_mod = @import("channel.zig");
+const utils = @import("utils.zig");
 
 /// Wall-clock milliseconds since epoch. Plain helper, no `std.Io`
 /// threading.
@@ -432,7 +433,7 @@ pub const Reducer = struct {
     fn appendErrorMessage(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), self: *const Reducer) !void {
         if (self.error_message) |m| {
             try buf.appendSlice(allocator, ",\"errorMessage\":");
-            try appendJsonStrLocal(allocator, buf, m);
+            try utils.appendJsonStr(buf, allocator, m);
         }
     }
 
@@ -480,7 +481,7 @@ pub const Reducer = struct {
             defer allocator.free(ln);
             try buf.appendSlice(allocator, ln);
             try buf.appendSlice(allocator, ",\"text\":");
-            try appendJsonStrLocal(allocator, buf, b.items);
+            try utils.appendJsonStr(buf, allocator, b.items);
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
@@ -495,11 +496,11 @@ pub const Reducer = struct {
             defer allocator.free(ln);
             try buf.appendSlice(allocator, ln);
             try buf.appendSlice(allocator, ",\"text\":");
-            try appendJsonStrLocal(allocator, buf, b.items);
+            try utils.appendJsonStr(buf, allocator, b.items);
             const sig = self.thinking_signatures.items[i];
             if (sig) |sv| {
                 try buf.appendSlice(allocator, ",\"signature\":");
-                try appendJsonStrLocal(allocator, buf, sv);
+                try utils.appendJsonStr(buf, allocator, sv);
             }
             if (self.thinking_redacted.items[i]) try buf.appendSlice(allocator, ",\"redacted\":true");
             try buf.append(allocator, '}');
@@ -512,11 +513,11 @@ pub const Reducer = struct {
         for (self.tool_calls.items, 0..) |tc, i| {
             if (i > 0) try buf.append(allocator, ',');
             try buf.appendSlice(allocator, "{\"id\":");
-            try appendJsonStrLocal(allocator, buf, tc.id);
+            try utils.appendJsonStr(buf, allocator, tc.id);
             try buf.appendSlice(allocator, ",\"name\":");
-            try appendJsonStrLocal(allocator, buf, tc.name);
+            try utils.appendJsonStr(buf, allocator, tc.name);
             try buf.appendSlice(allocator, ",\"args\":");
-            try appendJsonStrLocal(allocator, buf, tc.args.items);
+            try utils.appendJsonStr(buf, allocator, tc.args.items);
             try buf.append(allocator, '}');
         }
         try buf.append(allocator, ']');
@@ -712,31 +713,6 @@ pub fn pushTraceId(
 
 // ─── v1.29.0 helpers shared by Reducer.snapshotJson ────────────────
 
-fn appendJsonStrLocal(
-    allocator: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    s: []const u8,
-) !void {
-    try buf.append(allocator, '"');
-    for (s) |c| switch (c) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0x08 => try buf.appendSlice(allocator, "\\b"),
-        0x0c => try buf.appendSlice(allocator, "\\f"),
-        else => {
-            if (c < 0x20) {
-                const esc = try std.fmt.allocPrint(allocator, "\\u{x:0>4}", .{c});
-                defer allocator.free(esc);
-                try buf.appendSlice(allocator, esc);
-            } else try buf.append(allocator, c);
-        },
-    };
-    try buf.append(allocator, '"');
-}
-
 fn writeFieldStr(
     allocator: std.mem.Allocator,
     buf: *std.ArrayList(u8),
@@ -749,7 +725,7 @@ fn writeFieldStr(
     try buf.append(allocator, '"');
     try buf.appendSlice(allocator, name);
     try buf.appendSlice(allocator, "\":");
-    try appendJsonStrLocal(allocator, buf, value);
+    try utils.appendJsonStr(buf, allocator, value);
 }
 
 fn writeFieldUint(

@@ -5,6 +5,7 @@
 //! terminal `.done` or `.error_ev` event is seen.
 
 pub const types = @import("types.zig");
+pub const json_meta = @import("json_meta.zig");
 pub const errors = @import("errors.zig");
 pub const sse = @import("sse.zig");
 pub const partial_json = @import("partial_json.zig");
@@ -29,6 +30,7 @@ pub const providers = struct {
 
 test {
     _ = types;
+    _ = json_meta;
     _ = errors;
     _ = sse;
     _ = partial_json;
