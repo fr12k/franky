@@ -372,7 +372,7 @@ pub const Session = struct {
 
 // ─── validation ─────────────────────────────────────────────────
 
-const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField", "CheckBox", "Card", "ToolCall", "CodeBlock" };
+const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField", "CheckBox", "Card", "ToolCall", "CodeBlock", "Diff", "ThinkingBlock" };
 
 fn isKnownComponent(name: []const u8) bool {
     for (known_components) |k| if (std.mem.eql(u8, k, name)) return true;
@@ -406,7 +406,7 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
         if (comp_v != .string)
             return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), "component type must be a string");
         if (!isKnownComponent(comp_v.string))
-            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — catalog: Column, Row, Text, Button, TextField, CheckBox, Card, ToolCall, CodeBlock", .{comp_v.string}));
+            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — catalog: Column, Row, Text, Button, TextField, CheckBox, Card, ToolCall, CodeBlock, Diff, ThinkingBlock", .{comp_v.string}));
     }
 
     // Pass 2: structural references + per-type prop validation.
@@ -504,6 +504,24 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
             if (try validateDynamicString(a, code, try std.fmt.allocPrint(a, "{s}/code", .{path_prefix}))) |e| return e;
             if (c.object.get("lang")) |v|
                 if (try validateDynamicString(a, v, try std.fmt.allocPrint(a, "{s}/lang", .{path_prefix}))) |e| return e;
+        } else if (std.mem.eql(u8, comp, "Diff")) {
+            // Plan 4.7 franky catalog: a unified-diff view (franky's
+            // edit/write tools emit this as `details_json.diff` in the
+            // unified-diff-v1 format). `diff` is required; `path`
+            // labels the header.
+            const d = c.object.get("diff") orelse
+                return try validationError(a, "VALIDATION_FAILED", path_prefix, "Diff component requires \"diff\" (unified-diff-v1 string)");
+            if (try validateDynamicString(a, d, try std.fmt.allocPrint(a, "{s}/diff", .{path_prefix}))) |e| return e;
+            if (c.object.get("path")) |v|
+                if (try validateDynamicString(a, v, try std.fmt.allocPrint(a, "{s}/path", .{path_prefix}))) |e| return e;
+        } else if (std.mem.eql(u8, comp, "ThinkingBlock")) {
+            const t = c.object.get("text") orelse
+                return try validationError(a, "VALIDATION_FAILED", path_prefix, "ThinkingBlock component requires \"text\"");
+            if (try validateDynamicString(a, t, try std.fmt.allocPrint(a, "{s}/text", .{path_prefix}))) |e| return e;
+            if (c.object.get("collapsed")) |v| {
+                if (v != .bool)
+                    return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/collapsed", .{path_prefix}), "ThinkingBlock.collapsed must be a boolean");
+            }
         }
     }
     return null;
@@ -657,6 +675,10 @@ pub const system_prompt_block: []const u8 =
     \\- `ToolCall`: `{"id","component":"ToolCall","name":"bash","args":"...","result":"...","status":"running|done|error"}`
     \\  (a tool-invocation card; only `name` is required)
     \\- `CodeBlock`: `{"id","component":"CodeBlock","code":"...","lang":"zig"}` (`lang` optional)
+    \\- `Diff`: `{"id","component":"Diff","diff":"--- a/f\n+++ b/f\n@@ ...","path":"f"}`
+    \\  (unified-diff view; `path` optional)
+    \\- `ThinkingBlock`: `{"id","component":"ThinkingBlock","text":"...","collapsed":true}`
+    \\  (collapsible reasoning block; `collapsed` optional, default true)
     \\
     \\When the user clicks a Button, its `action.event` comes back to you as a user
     \\message (`[A2UI action] name=... context=...`) — treat it like a normal instruction.
@@ -861,6 +883,36 @@ test "applyEnvelope: ToolCall and CodeBlock validate (plan 4.7 franky catalog)" 
     const err2 = (try session.applyEnvelope(testing.allocator, noname)).?;
     defer testing.allocator.free(err2);
     try testing.expect(std.mem.indexOf(u8, err2, "requires") != null);
+}
+
+test "applyEnvelope: Diff and ThinkingBlock validate (plan 4.7)" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+    const t = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"d","component":"Diff","diff":"--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y","path":"f"},
+        \\  {"id":"th","component":"ThinkingBlock","text":"hmm","collapsed":false}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, t);
+    try testing.expect((try session.applyEnvelope(testing.allocator, t)) == null);
+
+    // diff is required for Diff; collapsed must be a bool.
+    const nodiff = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[{"id":"d","component":"Diff","path":"f"}]}}
+    );
+    defer freeCopy(testing.allocator, nodiff);
+    const err = (try session.applyEnvelope(testing.allocator, nodiff)).?;
+    defer testing.allocator.free(err);
+    try testing.expect(std.mem.indexOf(u8, err, "requires") != null);
+
+    const badcoll = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[{"id":"th","component":"ThinkingBlock","text":"x","collapsed":"yes"}]}}
+    );
+    defer freeCopy(testing.allocator, badcoll);
+    const err2 = (try session.applyEnvelope(testing.allocator, badcoll)).?;
+    defer testing.allocator.free(err2);
+    try testing.expect(std.mem.indexOf(u8, err2, "collapsed must be a boolean") != null);
 }
 
 test "applyEnvelope: @call binding is rejected" {

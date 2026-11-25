@@ -185,6 +185,58 @@ window.A2UI = (function () {
             el.textContent = resolveDynamic(def.code);
             return el;
         },
+        // Plan 4.7 franky catalog: unified-diff view. Reuses the
+        // franky-diff CSS classes from style.css (same look as the
+        // chat tool-card diff view).
+        Diff(def) {
+            const wrap = document.createElement("div");
+            wrap.className = "a2-diff";
+            if (def.path != null) {
+                const p = document.createElement("div");
+                p.className = "a2-diff-path";
+                p.textContent = resolveDynamic(def.path);
+                wrap.appendChild(p);
+            }
+            const table = document.createElement("table");
+            table.className = "a2-diff-table";
+            const tbody = document.createElement("tbody");
+            for (const line of resolveDynamic(def.diff).split("\n")) {
+                if (line.startsWith("--- ") || line.startsWith("+++ ")) continue;
+                const tr = document.createElement("tr");
+                const td = document.createElement("td");
+                if (line.startsWith("@@")) {
+                    tr.className = "a2-diff-info";
+                    td.textContent = line;
+                } else if (line.startsWith("+")) {
+                    tr.className = "a2-diff-ins";
+                    td.textContent = line;
+                } else if (line.startsWith("-")) {
+                    tr.className = "a2-diff-del";
+                    td.textContent = line;
+                } else {
+                    tr.className = "a2-diff-ctx";
+                    td.textContent = line;
+                }
+                tr.appendChild(td);
+                tbody.appendChild(tr);
+            }
+            table.appendChild(tbody);
+            wrap.appendChild(table);
+            return wrap;
+        },
+        // Plan 4.7 franky catalog: collapsible reasoning block.
+        ThinkingBlock(def) {
+            const det = document.createElement("details");
+            det.className = "a2-thinking";
+            det.open = def.collapsed === false;
+            const sum = document.createElement("summary");
+            sum.textContent = "Thinking";
+            const body = document.createElement("div");
+            body.className = "a2-thinking-body";
+            body.textContent = resolveDynamic(def.text);
+            det.append(sum, body);
+            return det;
+        },
     };
 
     function render() {

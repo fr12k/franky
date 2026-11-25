@@ -523,6 +523,9 @@ pub const Session = struct {
     /// Always initialized (cheap); only wired to endpoints + the
     /// `a2ui_render` tool when `cfg.a2ui_enabled` is set.
     a2ui_state: a2ui_mod.Session,
+    /// Per-turn thinking-delta buffer for the A2UI ThinkingBlock
+    /// projection (lazily allocated; plan 4.7).
+    a2ui_thinking: ?*A2uiThinkingBuf = null,
     /// Active `/a2ui/events` subscribers — separate pool from
     /// `subs` so A2UI clients don't compete with the chat UI.
     a2ui_subs: [max_subs]?*SseSubscriber = @splat(null),
@@ -592,6 +595,10 @@ pub const Session = struct {
                 self.allocator.free(entry.frame);
                 if (entry.html_frame) |hf| self.allocator.free(hf);
             }
+        }
+        if (self.a2ui_thinking) |b| {
+            b.deinit(self.allocator);
+            self.allocator.destroy(b);
         }
         self.a2ui_state.deinit();
     }
@@ -2684,7 +2691,23 @@ fn a2uiProjectToolEnd(
     a2ui_render_tool.jsonStringifyStr(w, tool_name orelse "tool") catch return;
     w.writeAll(",\"result\":") catch return;
     a2ui_render_tool.jsonStringifyStr(w, result_text) catch return;
-    w.print(",\"status\":\"{s}\"}}]", .{status}) catch return;
+    w.print(",\"status\":\"{s}\"}}", .{status}) catch return;
+
+    // edit/write results carry a unified diff in details_json —
+    // project it as a Diff component under the card (plan 4.7).
+    var diff_block: ?A2uiDiff = null;
+    if (ev.result.details_json) |dj|
+        diff_block = a2uiParseDiffDetails(a, dj);
+    if (diff_block) |db| {
+        w.print(",{{\"id\":\"tool_{s}_diff\",\"component\":\"Diff\",\"diff\":", .{aid}) catch return;
+        a2ui_render_tool.jsonStringifyStr(w, db.diff) catch return;
+        if (db.path) |p| {
+            w.writeAll(",\"path\":") catch return;
+            a2ui_render_tool.jsonStringifyStr(w, p) catch return;
+        }
+        w.writeAll("}") catch return;
+    }
+    w.writeAll("]") catch return;
 
     if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
         defer allocator.free(err_msg);
@@ -2801,6 +2824,87 @@ fn a2uiToolNameFor(session: *Session, allocator: std.mem.Allocator, aid: []const
         }
     }
     return null;
+}
+
+// ─── A2UI thinking / diff projections (plan 4.7) ─────────────────
+
+/// Buffers `thinking` deltas; each delta re-projects the
+/// ThinkingBlock. Cleared on turn_end. Owned by the Session.
+pub const A2uiThinkingBuf = struct {
+    text: std.ArrayList(u8) = .empty,
+    active: bool = false,
+
+    pub fn deinit(self: *A2uiThinkingBuf, allocator: std.mem.Allocator) void {
+        self.text.deinit(allocator);
+    }
+};
+
+fn a2uiProjectThinkingDelta(session: *Session, allocator: std.mem.Allocator, d: anytype) void {
+    if (session.a2ui_thinking == null) {
+        // create() leaves the memory uninitialized — assign the
+        // default field values explicitly.
+        const b = session.allocator.create(A2uiThinkingBuf) catch return;
+        b.* = .{};
+        session.a2ui_thinking = b;
+    }
+    const buf = session.a2ui_thinking.?;
+    if (!buf.active) {
+        buf.text.clearRetainingCapacity();
+        buf.active = true;
+    }
+    buf.text.appendSlice(session.allocator, d.delta) catch return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.writeAll("[{\"id\":\"thinking\",\"component\":\"ThinkingBlock\",\"text\":") catch return;
+    a2ui_render_tool.jsonStringifyStr(w, truncateUtf8(buf.text.items, 4000)) catch return;
+    w.writeAll("}]") catch return;
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.thinking", "thinking block rejected: {s}", .{err_msg});
+    }
+}
+
+fn a2uiThinkingTurnEnd(session: *Session, allocator: std.mem.Allocator) void {
+    const buf = session.a2ui_thinking orelse return;
+    if (!buf.active) return;
+    // Collapse the block once the turn ends.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.writeAll("[{\"id\":\"thinking\",\"component\":\"ThinkingBlock\",\"text\":") catch return;
+    a2ui_render_tool.jsonStringifyStr(w, truncateUtf8(buf.text.items, 4000)) catch return;
+    w.writeAll(",\"collapsed\":true}]") catch return;
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg|
+        allocator.free(err_msg);
+    buf.text.clearRetainingCapacity();
+    buf.active = false;
+}
+
+/// Extract `diff` + `path` from an edit/write tool's details_json
+/// (unified-diff-v1 format). Strings borrow from the parsed value —
+/// callers stringify before the arena dies.
+const A2uiDiff = struct { diff: []const u8, path: ?[]const u8 };
+
+fn a2uiParseDiffDetails(a: std.mem.Allocator, details_json: []const u8) ?A2uiDiff {
+    const parsed = std.json.parseFromSlice(std.json.Value, a, details_json, .{}) catch return null;
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    const diff_v = obj.get("diff") orelse return null;
+    if (diff_v != .string or diff_v.string.len == 0) return null;
+    // Tolerate a missing/legacy format (same contract as app.js),
+    // but reject formats we don't understand.
+    if (obj.get("format")) |f| {
+        if (f != .string or !std.mem.eql(u8, f.string, "unified-diff-v1")) return null;
+    }
+    const path: ?[]const u8 = if (obj.get("path")) |p| (if (p == .string) p.string else null) else null;
+    return .{ .diff = diff_v.string, .path = path };
 }
 
 /// §4.4 — handle a `permission_decision` A2UI action: resolve the
@@ -3150,6 +3254,12 @@ fn runOneTurnInternal(
             a2uiProjectToolStart(session, allocator, ev.tool_execution_start);
         if (session.cfg.a2ui_enabled and ev == .tool_execution_end)
             a2uiProjectToolEnd(session, allocator, ev.tool_execution_end);
+        // Plan 4.7 — stream thinking deltas into a ThinkingBlock,
+        // collapse it when the turn ends.
+        if (session.cfg.a2ui_enabled and ev == .message_update and ev.message_update == .thinking)
+            a2uiProjectThinkingDelta(session, allocator, ev.message_update.thinking);
+        if (session.cfg.a2ui_enabled and ev == .turn_end)
+            a2uiThinkingTurnEnd(session, allocator);
 
         // Render the HTML frame too when an htmx subscriber is connected.
         // The frame is rendered before ev.deinit frees owned strings.
@@ -6366,6 +6476,81 @@ test "proxy: A2UI tool-call projection — no model root renders unattached" {
     defer gpa.free(snap);
     try testing.expect(std.mem.indexOf(u8, snap, "\"tool_c1\"") != null);
     try testing.expect(std.mem.indexOf(u8, snap, "\"name\":\"grep\"") != null);
+}
+
+test "proxy: A2UI thinking block streams deltas and collapses on turn_end" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    a2uiProjectThinkingDelta(&ts.session, gpa, .{ .block_index = 0, .delta = "let me " });
+    a2uiProjectThinkingDelta(&ts.session, gpa, .{ .block_index = 0, .delta = "think" });
+    const snap1 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap1);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"ThinkingBlock\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "let me think") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"collapsed\"") == null);
+
+    a2uiThinkingTurnEnd(&ts.session, gpa);
+    const snap2 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"collapsed\":true") != null);
+
+    // Next turn starts fresh.
+    a2uiProjectThinkingDelta(&ts.session, gpa, .{ .block_index = 0, .delta = "new" });
+    const snap3 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap3);
+    try testing.expect(std.mem.indexOf(u8, snap3, "\"new\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap3, "let me think") == null);
+}
+
+test "proxy: A2UI diff projection from edit details_json" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    a2uiProjectToolStart(&ts.session, gpa, .{
+        .call_id = "e1",
+        .name = "edit",
+        .args_json = "{\"path\":\"a.zig\"}",
+    });
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "edited a.zig") } };
+    var result: at.ToolResult = .{
+        .content = content,
+        .details_json = try gpa.dupe(u8, "{\"edits\":1,\"format\":\"unified-diff-v1\",\"diff\":\"--- a/a.zig\\n+++ b/a.zig\\n@@ -1 +1 @@\\n-old\\n+new\",\"path\":\"a.zig\"}"),
+    };
+    defer result.deinit(gpa);
+    a2uiProjectToolEnd(&ts.session, gpa, .{ .call_id = "e1", .result = result });
+
+    const snap = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"tool_e1_diff\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"component\":\"Diff\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "@@ -1 +1 @@") != null);
+}
+
+test "proxy: a2uiParseDiffDetails rejects unknown formats and missing diffs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(a2uiParseDiffDetails(a, "{\"diff\":\"x\",\"format\":\"future-v9\"}") == null);
+    try testing.expect(a2uiParseDiffDetails(a, "{\"diff\":null,\"path\":\"f\"}") == null);
+    try testing.expect(a2uiParseDiffDetails(a, "not json") == null);
+    // Legacy shape without format is tolerated.
+    const d = a2uiParseDiffDetails(a, "{\"diff\":\"@@ -1 +1 @@\",\"path\":\"f\"}").?;
+    try testing.expectEqualStrings("@@ -1 +1 @@", d.diff);
+    try testing.expectEqualStrings("f", d.path.?);
 }
 
 test "proxy: GET /transcript returns the live transcript" {

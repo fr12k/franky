@@ -68,6 +68,15 @@
   .a2-toolcall-error .a2-toolcall-badge { color: #e57373; border-color: #e57373; }
   .a2-toolcall-name { font-weight: 600; font-size: 13px; }
   .a2-toolcall-result { max-height: 240px; overflow-y: auto; }
+  .a2-diff-path { font: 12px ui-monospace, monospace; color: var(--dim); margin-bottom: 4px; }
+  .a2-diff-table { width: 100%; border-collapse: collapse; font: 12px/1.45 ui-monospace, monospace; }
+  .a2-diff-table td { padding: 0 8px; white-space: pre-wrap; word-break: break-word; }
+  .a2-diff-info td { color: var(--dim); }
+  .a2-diff-ins td { background: rgba(123, 196, 127, 0.12); color: #7bc47f; }
+  .a2-diff-del td { background: rgba(229, 115, 115, 0.12); color: #e57373; }
+  .a2-thinking { border: 1px solid var(--border); border-radius: 6px; background: var(--panel); }
+  .a2-thinking summary { padding: 6px 10px; cursor: pointer; font-size: 12px; color: var(--dim); }
+  .a2-thinking-body { padding: 0 10px 8px; font-size: 12px; color: var(--dim); white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -259,6 +268,56 @@ const renderers = {
     if (def.lang != null) el.dataset.lang = resolveDynamic(def.lang);
     el.textContent = resolveDynamic(def.code);
     return el;
+  },
+  // Plan 4.7 franky catalog: unified-diff view.
+  Diff(def) {
+    const wrap = document.createElement("div");
+    wrap.className = "a2-diff";
+    if (def.path != null) {
+      const p = document.createElement("div");
+      p.className = "a2-diff-path";
+      p.textContent = resolveDynamic(def.path);
+      wrap.appendChild(p);
+    }
+    const table = document.createElement("table");
+    table.className = "a2-diff-table";
+    const tbody = document.createElement("tbody");
+    for (const line of resolveDynamic(def.diff).split("\n")) {
+      if (line.startsWith("--- ") || line.startsWith("+++ ")) continue;
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      if (line.startsWith("@@")) {
+        tr.className = "a2-diff-info";
+        td.textContent = line;
+      } else if (line.startsWith("+")) {
+        tr.className = "a2-diff-ins";
+        td.textContent = line;
+      } else if (line.startsWith("-")) {
+        tr.className = "a2-diff-del";
+        td.textContent = line;
+      } else {
+        tr.className = "a2-diff-ctx";
+        td.textContent = line;
+      }
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+  },
+  // Plan 4.7 franky catalog: collapsible reasoning block.
+  ThinkingBlock(def) {
+    const det = document.createElement("details");
+    det.className = "a2-thinking";
+    det.open = def.collapsed === false;
+    const sum = document.createElement("summary");
+    sum.textContent = "Thinking";
+    const body = document.createElement("div");
+    body.className = "a2-thinking-body";
+    body.textContent = resolveDynamic(def.text);
+    det.append(sum, body);
+    return det;
   },
 };
 

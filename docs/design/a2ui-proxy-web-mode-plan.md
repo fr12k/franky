@@ -320,6 +320,26 @@ Remaining scope cuts after round 4: single surface, snapshot instead of a
 replay ring, no `emit_ui` tool, no per-delta streaming text (§7.2), no
 AG-UI binding (§7.1), no `Diff`/`ThinkingBlock` catalog components yet.
 
+### 8.4 Round 5 (2026-11) — Diff + ThinkingBlock (§4.7 complete)
+
+- **`Diff` component** (`diff` unified-diff string required, `path`
+  optional): renders a colored line-based diff table. `tool_execution_end`
+  parses franky's existing `details_json` (`unified-diff-v1`, same contract
+  + format allowlist as app.js) from edit/write results and attaches a
+  `tool_<call_id>_diff` Diff component to the card.
+- **`ThinkingBlock` component** (`text` required, `collapsed` bool,
+  default true): `message_update.thinking` deltas stream into a buffered
+  ThinkingBlock (4 KB cap); `turn_end` collapses it. A new turn starts a
+  fresh buffer.
+
+The §4.7 franky catalog is now complete: Column, Row, Text, Button,
+TextField, CheckBox, Card, ToolCall, CodeBlock, Diff, ThinkingBlock.
+
+Remaining scope cuts after round 5: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no per-delta streaming text (§7.2 — the
+ThinkingBlock re-projects the full buffer per delta, which is the chatty
+variant §7.2 asks about), no AG-UI binding (§7.1).
+
 ## 7. Open questions (resolve before execution)
 
 1. Goal = **interoperability** (external A2UI clients connect to franky) or
