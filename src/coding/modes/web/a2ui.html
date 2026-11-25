@@ -51,6 +51,23 @@
   }
   .a2-card-box > .a2-card-title { margin: 0; font-size: 14px; font-weight: 600; }
   .a2-card-box > .a2-card-sub { margin: -8px 0 0; font-size: 12px; color: var(--dim); white-space: pre-wrap; }
+  .a2-code {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin: 0; overflow-x: auto;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .a2-toolcall { display: flex; flex-direction: column; gap: 8px; }
+  .a2-toolcall-head { display: flex; align-items: center; gap: 8px; }
+  .a2-toolcall-badge {
+    font-size: 11px; padding: 1px 8px; border-radius: 10px;
+    border: 1px solid var(--border); color: var(--dim);
+  }
+  .a2-toolcall-running .a2-toolcall-badge { color: var(--accent); border-color: var(--accent); }
+  .a2-toolcall-done .a2-toolcall-badge { color: #7bc47f; border-color: #7bc47f; }
+  .a2-toolcall-error .a2-toolcall-badge { color: #e57373; border-color: #e57373; }
+  .a2-toolcall-name { font-weight: 600; font-size: 13px; }
+  .a2-toolcall-result { max-height: 240px; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -204,6 +221,43 @@ const renderers = {
       el.appendChild(s);
     }
     for (const kid of def.children || []) render(kid, el);
+    return el;
+  },
+  // Plan 4.7 franky catalog: tool invocation card.
+  ToolCall(def) {
+    const el = document.createElement("div");
+    const status = typeof def.status === "string" ? def.status : "done";
+    el.className = "a2-toolcall a2-toolcall-" + status;
+    const head = document.createElement("div");
+    head.className = "a2-toolcall-head";
+    const badge = document.createElement("span");
+    badge.className = "a2-toolcall-badge";
+    badge.textContent = status === "running" ? "running" : status === "error" ? "error" : "done";
+    const name = document.createElement("span");
+    name.className = "a2-toolcall-name";
+    name.textContent = resolveDynamic(def.name);
+    head.append(badge, name);
+    el.appendChild(head);
+    if (def.args != null) {
+      const args = document.createElement("pre");
+      args.className = "a2-code a2-toolcall-args";
+      args.textContent = resolveDynamic(def.args);
+      el.appendChild(args);
+    }
+    if (def.result != null) {
+      const result = document.createElement("pre");
+      result.className = "a2-code a2-toolcall-result";
+      result.textContent = resolveDynamic(def.result);
+      el.appendChild(result);
+    }
+    return el;
+  },
+  // Plan 4.7 franky catalog: monospace code block.
+  CodeBlock(def) {
+    const el = document.createElement("pre");
+    el.className = "a2-code";
+    if (def.lang != null) el.dataset.lang = resolveDynamic(def.lang);
+    el.textContent = resolveDynamic(def.code);
     return el;
   },
 };

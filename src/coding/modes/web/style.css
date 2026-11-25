@@ -2246,3 +2246,30 @@ gap: 10px;
 }
 #a2ui-surface .a2-card-box > .a2-card-title { margin: 0; font-size: 14px; font-weight: 600; }
 #a2ui-surface .a2-card-box > .a2-card-sub { margin: -6px 0 0; font-size: 12px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+
+/* A2UI franky catalog: ToolCall + CodeBlock */
+#a2ui-surface .a2-code {
+background: var(--bg);
+border: 1px solid var(--border);
+border-radius: 6px;
+padding: 8px 10px;
+margin: 0;
+overflow-x: auto;
+font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+white-space: pre-wrap;
+word-break: break-word;
+}
+#a2ui-surface .a2-toolcall { display: flex; flex-direction: column; gap: 8px; }
+#a2ui-surface .a2-toolcall-head { display: flex; align-items: center; gap: 8px; }
+#a2ui-surface .a2-toolcall-badge {
+font-size: 11px;
+padding: 1px 8px;
+border-radius: 10px;
+border: 1px solid var(--border);
+color: var(--muted);
+}
+#a2ui-surface .a2-toolcall-running .a2-toolcall-badge { color: var(--accent); border-color: var(--accent); }
+#a2ui-surface .a2-toolcall-done .a2-toolcall-badge { color: #7bc47f; border-color: #7bc47f; }
+#a2ui-surface .a2-toolcall-error .a2-toolcall-badge { color: #e57373; border-color: #e57373; }
+#a2ui-surface .a2-toolcall-name { font-weight: 600; font-size: 13px; }
+#a2ui-surface .a2-toolcall-result { max-height: 240px; overflow-y: auto; }

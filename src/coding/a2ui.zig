@@ -202,6 +202,17 @@ pub const Session = struct {
         return self.version;
     }
 
+    /// Deep-copy of the current component adjacency list (or null
+    /// when no `updateComponents` has landed yet). Caller frees with
+    /// `freeCopy`. Used by the proxy's host-side projections to
+    /// inspect the surface (e.g. locate the "root" children list).
+    pub fn snapshotComponents(self: *Session, allocator: std.mem.Allocator) !?std.json.Value {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const s = self.state orelse return null;
+        return try deepCopy(allocator, s);
+    }
+
     /// Host-side component projection (§4.3 translator seed): inject
     /// or replace components in the surface adjacency list without
     /// going through the LLM tool path. Used by the proxy to render
@@ -361,7 +372,7 @@ pub const Session = struct {
 
 // ─── validation ─────────────────────────────────────────────────
 
-const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField", "CheckBox", "Card" };
+const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField", "CheckBox", "Card", "ToolCall", "CodeBlock" };
 
 fn isKnownComponent(name: []const u8) bool {
     for (known_components) |k| if (std.mem.eql(u8, k, name)) return true;
@@ -395,7 +406,7 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
         if (comp_v != .string)
             return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), "component type must be a string");
         if (!isKnownComponent(comp_v.string))
-            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — catalog: Column, Row, Text, Button, TextField, CheckBox, Card", .{comp_v.string}));
+            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — catalog: Column, Row, Text, Button, TextField, CheckBox, Card, ToolCall, CodeBlock", .{comp_v.string}));
     }
 
     // Pass 2: structural references + per-type prop validation.
@@ -467,6 +478,32 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
                 if (try validateDynamicString(a, t, try std.fmt.allocPrint(a, "{s}/title", .{path_prefix}))) |e| return e;
             if (c.object.get("subtitle")) |t|
                 if (try validateDynamicString(a, t, try std.fmt.allocPrint(a, "{s}/subtitle", .{path_prefix}))) |e| return e;
+        } else if (std.mem.eql(u8, comp, "ToolCall")) {
+            // Plan 4.7 franky catalog: a tool invocation card. `name` is
+            // required; the rest are optional. `status` is one of
+            // running|done|error (anything else is a validation error
+            // so a typo can't silently render as "done").
+            const n = c.object.get("name") orelse
+                return try validationError(a, "VALIDATION_FAILED", path_prefix, "ToolCall component requires \"name\"");
+            if (try validateDynamicString(a, n, try std.fmt.allocPrint(a, "{s}/name", .{path_prefix}))) |e| return e;
+            if (c.object.get("args")) |v|
+                if (try validateDynamicString(a, v, try std.fmt.allocPrint(a, "{s}/args", .{path_prefix}))) |e| return e;
+            if (c.object.get("result")) |v|
+                if (try validateDynamicString(a, v, try std.fmt.allocPrint(a, "{s}/result", .{path_prefix}))) |e| return e;
+            if (c.object.get("status")) |s| {
+                if (s != .string)
+                    return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/status", .{path_prefix}), "ToolCall.status must be a string: running | done | error");
+                if (!std.mem.eql(u8, s.string, "running") and
+                    !std.mem.eql(u8, s.string, "done") and
+                    !std.mem.eql(u8, s.string, "error"))
+                    return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/status", .{path_prefix}), "ToolCall.status must be one of: running | done | error");
+            }
+        } else if (std.mem.eql(u8, comp, "CodeBlock")) {
+            const code = c.object.get("code") orelse
+                return try validationError(a, "VALIDATION_FAILED", path_prefix, "CodeBlock component requires \"code\"");
+            if (try validateDynamicString(a, code, try std.fmt.allocPrint(a, "{s}/code", .{path_prefix}))) |e| return e;
+            if (c.object.get("lang")) |v|
+                if (try validateDynamicString(a, v, try std.fmt.allocPrint(a, "{s}/lang", .{path_prefix}))) |e| return e;
         }
     }
     return null;
@@ -617,6 +654,9 @@ pub const system_prompt_block: []const u8 =
     \\  (two-way bound: user edits update the local data model; nothing is sent until a Button action fires)
     \\- `CheckBox`: `{"id","component":"CheckBox","label":"...","checked":{"@path":"/form/flag"}}`
     \\  (two-way bound boolean; `checked` may also be a literal `true`/`false`)
+    \\- `ToolCall`: `{"id","component":"ToolCall","name":"bash","args":"...","result":"...","status":"running|done|error"}`
+    \\  (a tool-invocation card; only `name` is required)
+    \\- `CodeBlock`: `{"id","component":"CodeBlock","code":"...","lang":"zig"}` (`lang` optional)
     \\
     \\When the user clicks a Button, its `action.event` comes back to you as a user
     \\message (`[A2UI action] name=... context=...`) — treat it like a normal instruction.
@@ -785,6 +825,42 @@ test "applyEnvelope: CheckBox and Card validate" {
     const err = (try session.applyEnvelope(testing.allocator, bad)).?;
     defer testing.allocator.free(err);
     try testing.expect(std.mem.indexOf(u8, err, "CheckBox.checked") != null);
+}
+
+test "applyEnvelope: ToolCall and CodeBlock validate (plan 4.7 franky catalog)" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+    const t = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"tc","component":"ToolCall","name":"bash","args":"ls","status":"running"},
+        \\  {"id":"cb","component":"CodeBlock","code":"const x = 1;","lang":"zig"},
+        \\  {"id":"cb2","component":"CodeBlock","code":{"@path":"/snippet"}}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, t);
+    try testing.expect((try session.applyEnvelope(testing.allocator, t)) == null);
+
+    // Bad status is rejected so a typo can't silently render as done.
+    const bad = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"tc","component":"ToolCall","name":"bash","status":"runnning"}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, bad);
+    const err = (try session.applyEnvelope(testing.allocator, bad)).?;
+    defer testing.allocator.free(err);
+    try testing.expect(std.mem.indexOf(u8, err, "ToolCall.status") != null);
+
+    // name is required.
+    const noname = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"tc","component":"ToolCall"}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, noname);
+    const err2 = (try session.applyEnvelope(testing.allocator, noname)).?;
+    defer testing.allocator.free(err2);
+    try testing.expect(std.mem.indexOf(u8, err2, "requires") != null);
 }
 
 test "applyEnvelope: @call binding is rejected" {

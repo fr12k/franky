@@ -2608,6 +2608,201 @@ fn sanitizeA2uiId(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out;
 }
 
+/// Plan 4.7 — project a `tool_execution_start` event as a running
+/// ToolCall card. Ids are `tool_<call_id>`; the card attaches to the
+/// model's "root" container when one exists (upsert replaces the
+/// root def, preserving its other children) and renders as an
+/// unattached top-level component otherwise. `a2uiProjectToolEnd`
+/// updates the same card in place.
+fn a2uiProjectToolStart(
+    session: *Session,
+    allocator: std.mem.Allocator,
+    ev: anytype,
+) void {
+    const aid = sanitizeA2uiId(allocator, ev.call_id) catch return;
+    defer allocator.free(aid);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.writeAll("[") catch return;
+    w.print("{{\"id\":\"tool_{s}\",\"component\":\"ToolCall\",\"name\":", .{aid}) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, ev.name) catch return;
+    w.writeAll(",\"args\":") catch return;
+    a2ui_render_tool.jsonStringifyStr(w, truncateUtf8(ev.args_json, 300)) catch return;
+    w.writeAll(",\"status\":\"running\"}") catch return;
+
+    if (session.a2ui_state.snapshotComponents(a) catch null) |cur| {
+        if (a2uiFindRootChildList(cur)) |children| {
+            w.writeAll(",") catch return;
+            a2uiWriteRootWithChild(w, cur, children, a, aid) catch return;
+        }
+    }
+    w.writeAll("]") catch return;
+
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.tool_project", "tool card rejected: {s}", .{err_msg});
+    }
+}
+
+/// Plan 4.7 — flip a running ToolCall card to done/error and attach the
+/// (truncated) result text. Unknown call_id (card never projected)
+/// is ignored.
+fn a2uiProjectToolEnd(
+    session: *Session,
+    allocator: std.mem.Allocator,
+    ev: anytype,
+) void {
+    const aid = sanitizeA2uiId(allocator, ev.call_id) catch return;
+    defer allocator.free(aid);
+
+    // Skip when no card exists for this call (e.g. the start event
+    // predated --a2ui or projection failed).
+    const exists = blk: {
+        const cur = (session.a2ui_state.snapshotComponents(allocator) catch break :blk false) orelse break :blk false;
+        defer a2uiFreeSnapshot(allocator, cur);
+        break :blk a2uiFindComponent(cur, std.fmt.allocPrint(allocator, "tool_{s}", .{aid}) catch break :blk false, allocator) != null;
+    };
+    if (!exists) return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const status: []const u8 = if (ev.result.is_error) "error" else "done";
+    const result_text = truncateUtf8(a2uiFirstText(a, ev.result.content) orelse "", 600);
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.print("[{{\"id\":\"tool_{s}\",\"component\":\"ToolCall\",\"name\":", .{aid}) catch return;
+    const tool_name = a2uiToolNameFor(session, allocator, aid);
+    defer if (tool_name) |n| allocator.free(n);
+    a2ui_render_tool.jsonStringifyStr(w, tool_name orelse "tool") catch return;
+    w.writeAll(",\"result\":") catch return;
+    a2ui_render_tool.jsonStringifyStr(w, result_text) catch return;
+    w.print(",\"status\":\"{s}\"}}]", .{status}) catch return;
+
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.tool_project", "tool result rejected: {s}", .{err_msg});
+    }
+}
+
+/// JSON-safe truncation: cut on a byte boundary that keeps valid
+/// UTF-8 (a tool result may be megabytes; the card shows an excerpt).
+fn truncateUtf8(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    while (end > 0 and (s[end] & 0b1100_0000) == 0b1000_0000) end -= 1;
+    return s[0..end];
+}
+
+/// First text block of a tool result, arena-duped (borrowed content
+/// dies with the event).
+fn a2uiFirstText(a: std.mem.Allocator, content: []ai.types.ContentBlock) ?[]const u8 {
+    for (content) |b| {
+        switch (b) {
+            .text => |t| return a.dupe(u8, t.text) catch null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Find a component def by id in a snapshot array. `id` is freed by
+/// the caller-owned `alloc` — this helper frees its own copy.
+fn a2uiFindComponent(comps: std.json.Value, id: []const u8, alloc: std.mem.Allocator) ?std.json.Value {
+    defer alloc.free(id);
+    if (comps != .array) return null;
+    for (comps.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v == .string and std.mem.eql(u8, id_v.string, id)) return c;
+    }
+    return null;
+}
+
+/// The `children` array of the "root" component in a snapshot, or
+/// null when there is no root / it has no children list.
+fn a2uiFindRootChildList(comps: std.json.Value) ?std.json.Value {
+    if (comps != .array) return null;
+    for (comps.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v == .string and std.mem.eql(u8, id_v.string, "root")) {
+            if (c.object.get("children")) |ch| if (ch == .array) return ch;
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Serialize the root component with `aid` appended to `children`.
+/// `root` is located in `comps`; every other component is left
+/// untouched (upsert replaces only what we send).
+fn a2uiWriteRootWithChild(
+    w: *std.Io.Writer,
+    comps: std.json.Value,
+    children: std.json.Value,
+    a: std.mem.Allocator,
+    aid: []const u8,
+) !void {
+    _ = a;
+    if (comps != .array) return;
+    for (comps.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v != .string or !std.mem.eql(u8, id_v.string, "root")) continue;
+        // Skip if already attached (idempotent on duplicate start events).
+        for (children.array.items) |kid| {
+            if (kid == .string and std.mem.eql(u8, kid.string, std.fmt.allocPrint(std.heap.page_allocator, "tool_{s}", .{aid}) catch "")) return;
+        }
+        try w.writeAll("{\"id\":\"root\"");
+        var it = c.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "id") or std.mem.eql(u8, e.key_ptr.*, "children")) continue;
+            try w.print(",\"{s}\":", .{e.key_ptr.*});
+            try std.json.Stringify.value(e.value_ptr.*, .{}, w);
+        }
+        try w.writeAll(",\"children\":[");
+        for (children.array.items, 0..) |kid, i| {
+            if (i > 0) try w.writeAll(",");
+            try std.json.Stringify.value(kid, .{}, w);
+        }
+        try w.print(",\"tool_{s}\"]}}", .{aid});
+        return;
+    }
+}
+
+/// Free a snapshot returned by `snapshotComponents`.
+fn a2uiFreeSnapshot(allocator: std.mem.Allocator, v: std.json.Value) void {
+    a2ui_mod.freeCopy(allocator, v);
+}
+
+/// Recover the tool name for a card id from the current snapshot
+/// (tool_execution_end carries no name field).
+fn a2uiToolNameFor(session: *Session, allocator: std.mem.Allocator, aid: []const u8) ?[]const u8 {
+    const cur = (session.a2ui_state.snapshotComponents(allocator) catch return null) orelse return null;
+    defer a2uiFreeSnapshot(allocator, cur);
+    const id = std.fmt.allocPrint(allocator, "tool_{s}", .{aid}) catch return null;
+    defer allocator.free(id);
+    if (cur != .array) return null;
+    for (cur.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v == .string and std.mem.eql(u8, id_v.string, id)) {
+            const n = c.object.get("name") orelse return null;
+            if (n != .string) return null;
+            return allocator.dupe(u8, n.string) catch null;
+        }
+    }
+    return null;
+}
+
 /// §4.4 — handle a `permission_decision` A2UI action: resolve the
 /// pending prompt, remove the form card from the surface. Returns
 /// true when the action was consumed (caller skips the LLM turn).
@@ -2950,6 +3145,11 @@ fn runOneTurnInternal(
         // surface as an interactive form (off unless `--a2ui`).
         if (session.cfg.a2ui_enabled and ev == .tool_permission_request)
             a2uiProjectPermissionRequest(session, allocator, ev.tool_permission_request);
+        // Plan 4.7 — project tool executions as ToolCall cards.
+        if (session.cfg.a2ui_enabled and ev == .tool_execution_start)
+            a2uiProjectToolStart(session, allocator, ev.tool_execution_start);
+        if (session.cfg.a2ui_enabled and ev == .tool_execution_end)
+            a2uiProjectToolEnd(session, allocator, ev.tool_execution_end);
 
         // Render the HTML frame too when an htmx subscriber is connected.
         // The frame is rendered before ev.deinit frees owned strings.
@@ -6085,6 +6285,87 @@ test "proxy: POST /a2ui/action permission_decision without a pending prompt retu
     defer resp.deinit(gpa);
     try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 409") != null);
+}
+
+test "proxy: A2UI tool-call projection — running card flips to done with result" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    // Model-rendered root so the card attaches to the tree.
+    const seed =
+        \\{"updateComponents":{"components":[
+        \\  {"id":"root","component":"Column","children":["t"]},
+        \\  {"id":"t","component":"Text","text":"hi"}
+        \\]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, seed, .{});
+    defer parsed.deinit();
+    try testing.expect((try ts.session.a2ui_state.applyEnvelope(gpa, parsed.value)) == null);
+
+    // tool_execution_start → running card attached to root.
+    a2uiProjectToolStart(&ts.session, gpa, .{
+        .call_id = "c9",
+        .name = "bash",
+        .args_json = "{\"command\":\"ls\"}",
+    });
+    const snap1 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap1);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"tool_c9\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"status\":\"running\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"name\":\"bash\"") != null);
+    // root's children gained the card.
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"tool_c9\"]") != null);
+
+    // tool_execution_end → same card flips to done with the result.
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "build.zig src") } };
+    var result: at.ToolResult = .{ .content = content };
+    defer result.deinit(gpa);
+    a2uiProjectToolEnd(&ts.session, gpa, .{
+        .call_id = "c9",
+        .result = result,
+    });
+    const snap2 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"status\":\"done\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "build.zig src") != null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"running\"") == null);
+
+    // End for an unknown call_id is a no-op (no crash, no new card).
+    a2uiProjectToolEnd(&ts.session, gpa, .{
+        .call_id = "nope",
+        .result = result,
+    });
+    const snap3 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap3);
+    try testing.expect(std.mem.indexOf(u8, snap3, "\"tool_nope\"") == null);
+}
+
+test "proxy: A2UI tool-call projection — no model root renders unattached" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    a2uiProjectToolStart(&ts.session, gpa, .{
+        .call_id = "c1",
+        .name = "grep",
+        .args_json = "{\"pattern\":\"foo\"}",
+    });
+    const snap = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"tool_c1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"name\":\"grep\"") != null);
 }
 
 test "proxy: GET /transcript returns the live transcript" {

@@ -297,6 +297,29 @@ chat window; the response still lands in the normal conversation stream.
 This is Option A evolving toward B (§3): the chat UI now hosts generative
 UI without being replaced by it.
 
+### 8.3 Round 4 (2026-11) — franky catalog: ToolCall / CodeBlock + tool-card projection (§4.7, step 4 of §6)
+
+- **Catalog +2**: `ToolCall` (`name` required; `args`/`result` optional
+  dynamic strings; `status` one of `running|done|error` — anything else is
+  a validation error so a typo can't silently render as done) and
+  `CodeBlock` (`code` required, `lang` optional). Validated server-side,
+  rendered in both the panel (`web/a2ui.js`) and `/a2ui.html`.
+- **Tool-card projection (translator consumer #2)**:
+  `tool_execution_start` projects a running `ToolCall` card
+  (`tool_<call_id>`; args truncated to 300 chars, UTF-8-safe);
+  `tool_execution_end` flips the same card to done/error with the
+  (truncated) result text. The card attaches to the model's `"root"`
+  container when one exists (upsert preserves its other children) and
+  renders as an unattached top-level component otherwise — so tool cards
+  appear even before the model renders any UI. `a2ui.zig` gained
+  `snapshotComponents` (deep-copied adjacency list) so projections can
+  inspect the surface (locate root, check card existence, recover the
+  tool name for the end event).
+
+Remaining scope cuts after round 4: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no per-delta streaming text (§7.2), no
+AG-UI binding (§7.1), no `Diff`/`ThinkingBlock` catalog components yet.
+
 ## 7. Open questions (resolve before execution)
 
 1. Goal = **interoperability** (external A2UI clients connect to franky) or
