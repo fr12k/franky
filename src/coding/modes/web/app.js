@@ -268,6 +268,10 @@ function highlightCodeBlocks(container) {
     const designPanelBtn   = document.getElementById('design-panel-btn');
     const designPanelClose = document.getElementById('design-panel-close');
     const designPanelBody  = document.getElementById('design-panel-body');
+    // vN — A2UI surface panel (right-side drawer, --a2ui only)
+    const a2uiPanelEl    = document.getElementById('a2ui-panel');
+    const a2uiPanelBtn   = document.getElementById('a2ui-panel-btn');
+    const a2uiPanelClose = document.getElementById('a2ui-panel-close');
     // v2.7 — subagent panel (right-side drawer)
     const subagentPanelEl      = document.getElementById('subagent-panel');
     const subagentPanelBody    = document.getElementById('subagent-panel-body');
@@ -1066,6 +1070,51 @@ function highlightCodeBlocks(container) {
 
     if (designPanelBtn) designPanelBtn.addEventListener('click', dpToggle);
     if (designPanelClose) designPanelClose.addEventListener('click', dpClose);
+
+    // ── A2UI surface panel ──────────────────────────────────────────
+    // Enabled only when the proxy serves /a2ui.html (started with
+    // --a2ui). The header button stays hidden until we know; the panel
+    // auto-opens the first time the surface changes (model rendered UI
+    // or a permission card landed) and can be toggled manually after.
+    let a2uiSeen = false;
+    function a2uiToggle() {
+        if (!a2uiPanelEl) return;
+        const opening = a2uiPanelEl.hidden;
+        a2uiPanelEl.hidden = !opening;
+        if (a2uiPanelBtn) a2uiPanelBtn.classList.toggle('is-active', opening);
+        if (opening) {
+            if (isMobile() && designPanelEl && !designPanelEl.hidden) dpClose();
+            if (isMobile() && subagentPanelEl && !subagentPanelEl.hidden) closeSubagentPanel();
+            openMobileDrawer();
+        } else {
+            maybeHideBackdrop();
+        }
+    }
+    function a2uiClose() {
+        if (!a2uiPanelEl || a2uiPanelEl.hidden) return;
+        a2uiPanelEl.hidden = true;
+        if (a2uiPanelBtn) a2uiPanelBtn.classList.remove('is-active');
+        maybeHideBackdrop();
+    }
+    (function a2uiInit() {
+        if (!a2uiPanelBtn || typeof A2UI === 'undefined') return;
+        fetch('/a2ui.html', { method: 'HEAD' }).then((r) => {
+            if (!r.ok) return; // proxy started without --a2ui
+            a2uiPanelBtn.hidden = false;
+            a2uiPanelBtn.addEventListener('click', a2uiToggle);
+            if (a2uiPanelClose) a2uiPanelClose.addEventListener('click', a2uiClose);
+            A2UI.init({
+                onSurfaceUpdate: () => {
+                    // Auto-open on the first real surface change so a
+                    // permission card / fresh form doesn't go unnoticed.
+                    if (!a2uiSeen && a2uiPanelEl && a2uiPanelEl.hidden) {
+                        a2uiSeen = true;
+                        a2uiToggle();
+                    }
+                },
+            });
+        }).catch(() => { /* --a2ui off; leave the button hidden */ });
+    })();
 
     function showTurnIndicator() {
         if (turnIndicator) return;

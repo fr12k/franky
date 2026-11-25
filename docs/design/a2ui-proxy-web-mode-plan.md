@@ -283,6 +283,20 @@ Remaining scope cuts after round 2: single surface, snapshot instead of a
 replay ring, no `emit_ui` tool, no per-delta streaming text (open question
 §7.2), no AG-UI binding (open question §7.1).
 
+### 8.2 Round 3 (2026-11) — A2UI panel in the main chat window
+
+The surface no longer requires a separate tab: `index.html` embeds a
+right-side drawer (`#a2ui-panel`, header button `▦`) rendered by
+`web/a2ui.js` — the same renderer as `/a2ui.html`, namespaced as
+`window.A2UI`. `app.js` feature-detects `--a2ui` via a HEAD probe on
+`/a2ui.html` (button stays hidden when off), and the panel **auto-opens
+on the first surface change** (a rendered form or a permission card) so
+it can't be missed. Actions POST to `/a2ui/action` exactly like the
+standalone page, so form submits and permission decisions work from the
+chat window; the response still lands in the normal conversation stream.
+This is Option A evolving toward B (§3): the chat UI now hosts generative
+UI without being replaced by it.
+
 ## 7. Open questions (resolve before execution)
 
 1. Goal = **interoperability** (external A2UI clients connect to franky) or

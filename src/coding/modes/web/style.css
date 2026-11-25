@@ -2152,3 +2152,96 @@ button#send:hover:not(:disabled) {
 @media (max-width: 520px) {
     .status-line, .model-pill, .version-pill { display: none; }
 }
+
+/* ── A2UI surface panel (generative UI, --a2ui) ─────────────────── */
+aside#a2ui-panel {
+width: 320px;
+flex: 0 0 320px;
+border-left: 1px solid var(--border);
+background: var(--panel);
+display: flex;
+flex-direction: column;
+overflow: hidden;
+transition: width 120ms ease, flex-basis 120ms ease;
+}
+aside#a2ui-panel[hidden] { display: none; }
+
+button#a2ui-panel-btn {
+background: transparent;
+border: 1px solid var(--border);
+border-radius: 6px;
+color: var(--muted);
+font-size: 13px;
+padding: 2px 8px;
+cursor: pointer;
+}
+button#a2ui-panel-btn:hover { color: var(--text); border-color: var(--accent); }
+button#a2ui-panel-btn.is-active {
+color: var(--accent);
+border-color: var(--accent);
+background: rgba(47,129,247,0.1);
+}
+button#a2ui-panel-close {
+background: transparent;
+border: 0;
+color: var(--muted);
+font-size: 16px;
+cursor: pointer;
+}
+button#a2ui-panel-close:hover { color: var(--text); }
+
+#a2ui-surface {
+flex: 1 1 auto;
+overflow-y: auto;
+padding: 12px;
+display: flex;
+flex-direction: column;
+gap: 12px;
+}
+#a2ui-surface .a2-empty { color: var(--muted); text-align: center; padding: 32px 8px; }
+
+/* A2UI components (mirror of a2ui.html) */
+#a2ui-surface .a2-column { display: flex; flex-direction: column; gap: 12px; }
+#a2ui-surface .a2-row { display: flex; flex-direction: row; gap: 12px; align-items: center; flex-wrap: wrap; }
+#a2ui-surface .a2-text { margin: 0; white-space: pre-wrap; }
+#a2ui-surface .a2-card {
+background: var(--bg);
+border: 1px solid var(--border);
+border-radius: 8px;
+padding: 12px;
+}
+#a2ui-surface .a2-button {
+background: #3d5a94;
+color: #fff;
+border: 1px solid var(--accent);
+border-radius: 6px;
+padding: 7px 16px;
+font-size: 14px;
+cursor: pointer;
+}
+#a2ui-surface .a2-button:hover { background: var(--accent); }
+#a2ui-surface .a2-field { display: flex; flex-direction: column; gap: 4px; }
+#a2ui-surface .a2-field label { font-size: 12px; color: var(--muted); }
+#a2ui-surface .a2-field input {
+background: var(--bg);
+color: var(--text);
+border: 1px solid var(--border);
+border-radius: 6px;
+padding: 7px 10px;
+font-size: 14px;
+}
+#a2ui-surface .a2-field input:focus { outline: none; border-color: var(--accent); }
+#a2ui-surface .a2-check { display: flex; flex-direction: row; gap: 8px; align-items: center; }
+#a2ui-surface .a2-check label { font-size: 13px; color: var(--text); }
+#a2ui-surface .a2-check input { accent-color: var(--accent); width: 16px; height: 16px; }
+#a2ui-surface .a2-card-box {
+background: var(--bg);
+border: 1px solid var(--border);
+border-radius: 8px;
+padding: 12px;
+display: flex;
+flex-direction: column;
+gap: 10px;
+}
+#a2ui-surface .a2-card-box > .a2-card-title { margin: 0; font-size: 14px; font-weight: 600; }
+#a2ui-surface .a2-card-box > .a2-card-sub { margin: -6px 0 0; font-size: 12px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }

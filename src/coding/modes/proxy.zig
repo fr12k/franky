@@ -102,6 +102,10 @@ const web_hx_sse_js = @embedFile("web/hx-sse.min.js");
 /// A2UI PoC renderer page — served at `/a2ui.html` only when the
 /// A2UI surface is enabled (`--a2ui` / `tools.a2ui.enabled`).
 const web_a2ui_html = @embedFile("web/a2ui.html");
+/// A2UI renderer module embedded into the main chat window (the
+/// `▦` panel). Always served — app.js feature-detects `--a2ui` via
+/// a HEAD probe on /a2ui.html before initializing it.
+const web_a2ui_js = @embedFile("web/a2ui.js");
 const a2ui_mod = franky.coding.a2ui;
 
 /// Compile-time patching of the embedded `index.html`: swaps the
@@ -2187,6 +2191,10 @@ fn handleConnection(arg: ConnArg) void {
         }
         if (std.mem.eql(u8, req.path, "/app.js")) {
             respondAsset(&stream, arg.io, web_app_js, "text/javascript; charset=utf-8");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/a2ui.js")) {
+            respondAsset(&stream, arg.io, web_a2ui_js, "text/javascript; charset=utf-8");
             return;
         }
         if (std.mem.eql(u8, req.path, "/style.css")) {
