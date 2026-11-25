@@ -348,6 +348,11 @@ fn applyEnvOverrides(cfg: *cli_mod.Config, map: *const std.process.Environ.Map) 
             if (cfg.event_gap_timeout_ms == null) cfg.event_gap_timeout_ms = std.fmt.parseInt(u32, val, 10) catch null;
         }
     }
+    {
+        if (map.get("FRANKY_MCP_CODE_MODE")) |val| {
+            if (!cfg.mcp_code_mode) cfg.mcp_code_mode = val.len > 0;
+        }
+    }
 }
 
 // ─── Log level resolution ───────────────────────────────────────

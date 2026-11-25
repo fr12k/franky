@@ -1,0 +1,466 @@
+//! MCP UDS bridge — Phase 2 of `--mcp-code-mode`.
+//!
+//! A per-session Unix-domain-socket server that the sandboxed
+//! `code_exec` subprocess (via the generated `_runtime.py`) talks to.
+//! The sandbox blocks direct network access, so the UDS socket is the
+//! only channel through which model-written Python can reach external
+//! MCP servers.
+//!
+//! Security (defense in depth):
+//!   1. **Bearer token** — 32 random bytes (hex) minted per session into
+//!      `FRANKY_MCP_TOKEN`, verified with `std.crypto.timing_safe.eql`.
+//!   2. **Peer-PID verification** — `SO_PEERCRED` (Linux) /
+//!      `LOCAL_PEERPID` (macOS) checked against the `code_exec`-spawned
+//!      child PID (or a member of its process group).
+//!   3. **Permission gate** — every dispatch reconstructs the namespaced
+//!      `mcp__<server>__<tool>` name and routes it through the existing
+//!      `permissions.Store.checkDetailed`, so `--deny-tools`/`--ask-tools`
+//!      /auto-mode apply exactly as if the model called the tool directly.
+//!
+//! Stats: each call is counted in an internal `StringHashMap(BridgeStat)`
+//! (calls, errors, bytes, latency). `code_exec` appends a compact footer
+//! summarizing bridge usage so the model sees how much work happened
+//! in-sandbox without each payload entering the context window.
+
+const std = @import("std");
+const posix = std.posix;
+const at = @import("../agent/types.zig");
+const ai = @import("../ai/mod.zig");
+const mcp_client = @import("mcp/client.zig");
+const permissions = @import("security/permissions.zig");
+const jh = @import("mcp/json_helpers.zig");
+
+const log = ai.log;
+
+pub const BridgeError = error{
+    Unauthorized,
+    UnknownTool,
+    PermissionDenied,
+    OutOfMemory,
+    Io,
+};
+
+/// Per-tool aggregate stats, keyed by `mcp__<server>__<tool>`.
+pub const BridgeStat = struct {
+    calls: u64 = 0,
+    errors: u64 = 0,
+    total_ms: u64 = 0,
+    bytes: u64 = 0,
+};
+
+/// Aggregate view used by `code_exec` to render its footer.
+pub const Summary = struct {
+    calls: u64,
+    errors: u64,
+    servers: usize,
+    bytes: u64,
+};
+
+/// One registered dispatch target: the namespaced tool name plus the
+/// MCP context needed to issue the remote `tools/call`.
+const Target = struct {
+    ns_name: []const u8,
+    server: []const u8,
+    ctx: *const mcp_client.McpToolCtx,
+};
+
+pub const McpBridge = struct {
+    allocator: std.mem.Allocator,
+    socket_path: []u8,
+    token_hex: []u8,
+    token_raw: [32]u8,
+    permission_store: ?*permissions.Store,
+    /// Set by `code_exec` while a script is running; cleared on exit.
+    /// Peer-PID checks accept this pid or any pid in its process group.
+    active_child_pid: std.atomic.Value(posix.pid_t) = .init(-1),
+    server: ?std.Io.net.Server = null,
+    targets: std.StringHashMap(Target),
+    stats: std.StringHashMap(BridgeStat),
+    running: std.atomic.Value(bool) = .init(false),
+    mutex: std.Io.Mutex = .init,
+    /// Captured at `listen` so `summary`/`recordStat` can lock the
+    /// mutex without threading `io` through every call site.
+    io: ?std.Io = null,
+
+    /// Build a bridge bound to a fresh `/tmp/franky-mcp-<rand>.sock`.
+    /// Mints the session token but does NOT start listening yet —
+    /// call `listen` once the dispatch table is populated.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        permission_store: ?*permissions.Store,
+    ) !*McpBridge {
+        const self = try allocator.create(McpBridge);
+
+        var raw: [32]u8 = undefined;
+        try io.randomSecure(&raw);
+
+        const token_hex = try std.fmt.allocPrint(allocator, "{x}", .{raw});
+        errdefer allocator.free(token_hex);
+
+        // /tmp keeps the path well under macOS's 104-byte sun_path limit.
+        var rand16: [8]u8 = undefined;
+        try io.randomSecure(&rand16);
+        const socket_path = try std.fmt.allocPrint(allocator, "/tmp/franky-mcp-{x}.sock", .{rand16});
+        errdefer allocator.free(socket_path);
+
+        self.* = .{
+            .allocator = allocator,
+            .socket_path = socket_path,
+            .token_hex = token_hex,
+            .token_raw = raw,
+            .permission_store = permission_store,
+            .targets = std.StringHashMap(Target).init(allocator),
+            .stats = std.StringHashMap(BridgeStat).init(allocator),
+            .io = io,
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *McpBridge, io: std.Io) void {
+        self.shutdown(io);
+        self.targets.deinit();
+        self.stats.deinit();
+        self.allocator.free(self.socket_path);
+        self.allocator.free(self.token_hex);
+        self.allocator.destroy(self);
+    }
+
+    /// Register an MCP tool so the bridge can dispatch to it. Called once
+    /// per discovered `mcp__*` tool during session setup.
+    pub fn registerTool(self: *McpBridge, ctx: *const mcp_client.McpToolCtx) !void {
+        const ns_name = try std.fmt.allocPrint(self.allocator, "mcp__{s}__{s}", .{ ctx.server_name, ctx.tool_name });
+        try self.targets.put(ns_name, .{
+            .ns_name = ns_name,
+            .server = ctx.server_name,
+            .ctx = ctx,
+        });
+    }
+
+    /// Mark the given child pid as the authorized code_exec subprocess.
+    pub fn setActiveChild(self: *McpBridge, pid: posix.pid_t) void {
+        self.active_child_pid.store(pid, .release);
+    }
+
+    /// Clear the authorized child (called when code_exec exits).
+    pub fn clearActiveChild(self: *McpBridge) void {
+        self.active_child_pid.store(-1, .release);
+    }
+
+    /// Bind + listen on the UDS socket and set restrictive permissions.
+    pub fn listen(self: *McpBridge, io: std.Io) !void {
+        const addr = try std.Io.net.UnixAddress.init(self.socket_path);
+        self.server = try addr.listen(io, .{ .kernel_backlog = 16 });
+        // 0600 so only this user can even open the socket.
+        if (comptime @import("builtin").os.tag != .windows) {
+            _ = std.c.chmod(self.socket_path, 0o600);
+        }
+        self.running.store(true, .release);
+    }
+
+    /// Stop the accept loop and remove the socket file.
+    pub fn shutdown(self: *McpBridge, io: std.Io) void {
+        if (self.running.swap(false, .acq_rel)) {
+            if (self.server) |*s| s.deinit(io);
+            self.server = null;
+            std.Io.Dir.deleteFileAbsolute(io, self.socket_path) catch {};
+        }
+    }
+
+    /// Accept + serve connections until `shutdown` is called. Runs on its
+    /// own thread for the life of the session. Each connection is one
+    /// newline-delimited JSON request → one JSON response line.
+    pub fn serve(self: *McpBridge, io: std.Io) void {
+        while (self.running.load(.acquire)) {
+            const srv = &(self.server orelse return);
+            var stream = srv.accept(io) catch |err| {
+                if (!self.running.load(.acquire)) return; // shutting down
+                log.log(.warn, "mcp-bridge", "accept", "accept failed: {s}", .{@errorName(err)});
+                continue;
+            };
+            self.handleConnection(io, &stream) catch {};
+            stream.close(io);
+        }
+    }
+
+    /// Handle a single connection: read one JSON line, dispatch, reply.
+    fn handleConnection(self: *McpBridge, io: std.Io, stream: *std.Io.net.Stream) !void {
+        // Peer-PID check (before reading any payload).
+        if (!self.verifyPeer(stream.socket.handle)) {
+            try self.writeJsonLine(io, stream, "{\"error\":\"unauthorized peer\"}");
+            return;
+        }
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var chunk: [16384]u8 = undefined;
+        while (true) {
+            var slices = [_][]u8{chunk[0..]};
+            const n = stream.read(io, &slices) catch |err| {
+                if (err == error.EndOfStream) break;
+                return err;
+            };
+            if (n == 0) break;
+            try buf.appendSlice(self.allocator, chunk[0..n]);
+            if (std.mem.indexOfScalar(u8, buf.items, '\n') != null) break;
+            if (buf.items.len > 1 << 20) return error.Io; // 1 MiB request cap
+        }
+        const line = std.mem.trim(u8, buf.items, " \t\r\n");
+        if (line.len == 0) return;
+
+        const resp = self.dispatch(io, line) catch |err| blk: {
+            const msg: []const u8 = switch (err) {
+                BridgeError.Unauthorized => "unauthorized token",
+                BridgeError.UnknownTool => "unknown tool",
+                BridgeError.PermissionDenied => "permission denied",
+                BridgeError.OutOfMemory => return err,
+                else => @errorName(err),
+            };
+            break :blk try self.errorJson(msg);
+        };
+        defer self.allocator.free(resp);
+        try self.writeJsonLine(io, stream, resp);
+    }
+
+    /// Parse + authorize + route one request frame. Returns an owned JSON
+    /// response line (without trailing newline).
+    fn dispatch(self: *McpBridge, io: std.Io, line: []const u8) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, aa, line, .{}) catch
+            return try self.errorJson("invalid json");
+        if (parsed != .object) return try self.errorJson("request not an object");
+        const obj = parsed.object;
+
+        // 1. Bearer token.
+        const tok = if (obj.get("token")) |t| (if (t == .string) t.string else "") else "";
+        if (!self.checkToken(tok)) return try self.errorJson("unauthorized token");
+
+        const server = if (obj.get("server")) |s| (if (s == .string) s.string else "") else "";
+        const tool = if (obj.get("tool")) |s| (if (s == .string) s.string else "") else "";
+        var args_buf: std.ArrayList(u8) = .empty;
+        if (obj.get("args")) |a| jh.renderJson(&args_buf, aa, a) catch {};
+        const args: []const u8 = if (args_buf.items.len > 0) args_buf.items else "{}";
+
+        const ns_name = try std.fmt.allocPrint(aa, "mcp__{s}__{s}", .{ server, tool });
+
+        // 2. Permission gate — same path as a direct tool call.
+        if (self.permission_store) |store| {
+            const dd = store.checkDetailed(ns_name, args);
+            switch (dd.decision) {
+                .auto_deny => return try self.errorJson(dd.reason orelse dd.rule_name orelse "permission denied"),
+                // `ask` cannot prompt mid-sandbox (no TTY / no RPC round-trip
+                // from inside the isolated child), so we fail closed and tell
+                // the model to allow the tool up-front.
+                .ask => return try self.errorJson("tool requires approval; allow it via --allow-tools before running"),
+                .auto_allow => {},
+            }
+        }
+
+        // 3. Resolve + dispatch.
+        const target = self.targets.get(ns_name) orelse return try self.errorJson("unknown tool");
+        const start = ai.stream.nowMillis();
+
+        var cancel: ai.stream.Cancel = .{};
+        const result = mcp_client.callTool(target.ctx, self.allocator, io, args, &cancel) catch |err| {
+            self.recordStat(ns_name, true, elapsed(start), 0);
+            return try self.errorJson(@errorName(err));
+        };
+
+        // Serialize the ToolResult content blocks to a JSON array.
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try resultToJson(&payload, self.allocator, result);
+        self.recordStat(ns_name, result.is_error, elapsed(start), payload.items.len);
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"result\":");
+        try out.appendSlice(self.allocator, payload.items);
+        try out.appendSlice(self.allocator, "}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn errorJson(self: *McpBridge, msg: []const u8) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, "{\"error\":");
+        try jh.appendJsonStr(&buf, self.allocator, msg);
+        try buf.appendSlice(self.allocator, "}");
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    fn checkToken(self: *McpBridge, tok_hex: []const u8) bool {
+        if (tok_hex.len != self.token_hex.len) return false;
+        // Decode the provided hex then timing-safe compare against raw.
+        var provided: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&provided, tok_hex) catch return false;
+        return std.crypto.timing_safe.eql([32]u8, provided, self.token_raw);
+    }
+
+    /// Verify the connecting peer belongs to the active code_exec child
+    /// (or its process group). Best-effort across platforms; when the
+    /// platform offers no peer-cred mechanism we fail closed unless no
+    /// child has been registered (unit-test / fallback path).
+    fn verifyPeer(self: *McpBridge, handle: posix.fd_t) bool {
+        const active = self.active_child_pid.load(.acquire);
+        const peer = peerPid(handle) orelse {
+            // No peer-cred support — allow only when nothing registered.
+            return active < 0;
+        };
+        if (active < 0) return true; // no child registered → permissive (tests)
+        if (peer == active) return true;
+        return sameProcessGroup(peer, active);
+    }
+
+    fn recordStat(self: *McpBridge, ns_name: []const u8, is_error: bool, ms: u64, bytes: u64) void {
+        const io = self.io orelse return;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const gop = self.stats.getOrPut(ns_name) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.calls += 1;
+        if (is_error) gop.value_ptr.errors += 1;
+        gop.value_ptr.total_ms += ms;
+        gop.value_ptr.bytes += bytes;
+    }
+
+    /// Aggregate summary for the `code_exec` footer.
+    pub fn summary(self: *McpBridge) Summary {
+        if (self.io) |io| {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            return self.summaryLocked();
+        }
+        return self.summaryLocked();
+    }
+
+    fn summaryLocked(self: *McpBridge) Summary {
+        var s: Summary = .{ .calls = 0, .errors = 0, .servers = 0, .bytes = 0 };
+        var it = self.stats.iterator();
+        while (it.next()) |e| {
+            s.calls += e.value_ptr.calls;
+            s.errors += e.value_ptr.errors;
+            s.bytes += e.value_ptr.bytes;
+        }
+        s.servers = self.targets.count();
+        return s;
+    }
+
+    fn writeJsonLine(self: *McpBridge, io: std.Io, stream: *std.Io.net.Stream, line: []const u8) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, line);
+        try buf.append(self.allocator, '\n');
+        var wbuf: [8192]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        try w.interface.writeAll(buf.items);
+        try w.interface.flush();
+    }
+};
+
+fn elapsed(start_ms: i64) u64 {
+    const now = ai.stream.nowMillis();
+    return if (now > start_ms) @intCast(now - start_ms) else 0;
+}
+
+/// Platform peer-pid lookup. Returns null when unsupported.
+fn peerPid(handle: posix.fd_t) ?posix.pid_t {
+    const os_tag = @import("builtin").os.tag;
+    switch (os_tag) {
+        .linux => {
+            const ucred = extern struct { pid: i32, uid: u32, gid: u32 };
+            var cred: ucred = undefined;
+            var len: std.os.linux.socklen_t = @sizeOf(ucred);
+            const rc = std.os.linux.getsockopt(handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.PEERCRED, @ptrCast(&cred), &len);
+            if (std.os.linux.E.init(rc) != .SUCCESS) return null;
+            return cred.pid;
+        },
+        .macos => {
+            var pid: posix.pid_t = 0;
+            var len: std.c.socklen_t = @sizeOf(posix.pid_t);
+            const LOCAL_PEERPID: u32 = 0x002;
+            if (std.c.getsockopt(handle, 0, LOCAL_PEERPID, &pid, &len) != 0) return null;
+            return pid;
+        },
+        else => return null,
+    }
+}
+
+/// True when `peer` shares a process group with `active` (children the
+/// script spawns inherit the group). Fails closed to false.
+fn sameProcessGroup(peer: posix.pid_t, active: posix.pid_t) bool {
+    if (@import("builtin").os.tag == .windows) return false;
+    const peer_pgid = std.c.getpgid(peer);
+    const active_pgid = std.c.getpgid(active);
+    if (peer_pgid < 0 or active_pgid < 0) return false;
+    return peer_pgid == active_pgid;
+}
+
+/// Serialize a `ToolResult`'s content blocks to a JSON array of
+/// `{type, text}` / `{type, mimeType, data}` objects.
+fn resultToJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, result: at.ToolResult) !void {
+    try buf.append(allocator, '[');
+    for (result.content, 0..) |cb, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        switch (cb) {
+            .text => |t| {
+                try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+                try jh.appendJsonStr(buf, allocator, t.text);
+                try buf.append(allocator, '}');
+            },
+            .image => |im| {
+                try buf.appendSlice(allocator, "{\"type\":\"image\",\"mimeType\":");
+                try jh.appendJsonStr(buf, allocator, im.mime_type);
+                try buf.appendSlice(allocator, ",\"data\":");
+                try jh.appendJsonStr(buf, allocator, im.data);
+                try buf.append(allocator, '}');
+            },
+            else => {
+                try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":\"\"}");
+            },
+        }
+    }
+    try buf.append(allocator, ']');
+}
+
+// ─── tests ─────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "token check is timing-safe and length-checked" {
+    var threaded = @import("../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = @import("../global_allocator.zig").gpa;
+
+    const bridge = try McpBridge.init(gpa, io, null);
+    defer bridge.deinit(io);
+
+    // Build the correct hex from raw.
+    const good = try std.fmt.allocPrint(gpa, "{x}", .{bridge.token_raw});
+    defer gpa.free(good);
+    try testing.expect(bridge.checkToken(good));
+    try testing.expect(!bridge.checkToken("deadbeef"));
+    try testing.expect(!bridge.checkToken(""));
+}
+
+test "stats aggregate across calls" {
+    var threaded = @import("../test_helpers.zig").threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = @import("../global_allocator.zig").gpa;
+
+    const bridge = try McpBridge.init(gpa, io, null);
+    defer bridge.deinit(io);
+
+    bridge.recordStat("mcp__a__t1", false, 5, 100);
+    bridge.recordStat("mcp__a__t1", true, 7, 40);
+    bridge.recordStat("mcp__b__t2", false, 3, 200);
+    const s = bridge.summary();
+    try testing.expectEqual(@as(u64, 3), s.calls);
+    try testing.expectEqual(@as(u64, 1), s.errors);
+    try testing.expectEqual(@as(u64, 340), s.bytes);
+}

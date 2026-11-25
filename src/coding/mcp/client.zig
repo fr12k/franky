@@ -240,7 +240,20 @@ fn executeMcpTool(
     _ = call_id;
     _ = on_update;
     const ctx: *McpToolCtx = @ptrCast(@alignCast(tool.ctx.?));
+    return callTool(ctx, allocator, io, args_json, cancel);
+}
 
+/// Send a `tools/call` for a single MCP tool context and translate the
+/// response into a franky `ToolResult`. Split out from `executeMcpTool`
+/// so the `--mcp-code-mode` UDS bridge (`mcp_bridge.zig`) can dispatch
+/// calls without an `AgentTool` wrapper.
+pub fn callTool(
+    ctx: *const McpToolCtx,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args_json: []const u8,
+    cancel: *stream_mod.Cancel,
+) anyerror!at.ToolResult {
     // Build the tools/call request. Validate args_json — if it's
     // not a valid JSON object, fall back to {}.
     const safe_args: []const u8 = blk: {
