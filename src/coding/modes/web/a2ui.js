@@ -224,6 +224,15 @@ window.A2UI = (function () {
             wrap.appendChild(table);
             return wrap;
         },
+        // Plan 7.2: text bound to a data path, grown by appendDataModel
+        // deltas (append semantics). Renders like Text; the path binding
+        // re-resolves on every render (each delta triggers one).
+        StreamingText(def) {
+            const el = document.createElement("p");
+            el.className = "a2-text a2-streaming";
+            el.textContent = resolveDynamic({ "@path": def.path });
+            return el;
+        },
         // Plan 4.7 franky catalog: collapsible reasoning block.
         ThinkingBlock(def) {
             const det = document.createElement("details");
@@ -351,6 +360,17 @@ window.A2UI = (function () {
             render(); // re-resolve @path bindings
             return;
         }
+        if (env.appendDataModel) {
+            // Plan 7.2: append delta to the string at path (O(delta)).
+            const a = env.appendDataModel;
+            if (typeof a.path === "string" && typeof a.delta === "string") {
+                if (state.dataModel == null || typeof state.dataModel !== "object") state.dataModel = {};
+                const cur = pointerGet(state.dataModel, a.path);
+                pointerSet(state.dataModel, a.path, (cur == null ? "" : String(cur)) + a.delta);
+                render();
+            }
+            return;
+        }
         if (env.deleteSurface) {
             state.components = [];
             state.dataModel = null;
@@ -367,7 +387,7 @@ window.A2UI = (function () {
             state.version = snap.version || 0;
             render();
         });
-        for (const kind of ["a2ui_updateComponents", "a2ui_updateDataModel", "a2ui_deleteSurface", "a2ui_createSurface"]) {
+        for (const kind of ["a2ui_updateComponents", "a2ui_updateDataModel", "a2ui_appendDataModel", "a2ui_deleteSurface", "a2ui_createSurface"]) {
             es.addEventListener(kind, (e) => applyEnvelope(JSON.parse(e.data)));
         }
         // EventSource auto-reconnects and resends Last-Event-ID; the

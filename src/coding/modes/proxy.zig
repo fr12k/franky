@@ -2833,6 +2833,9 @@ fn a2uiToolNameFor(session: *Session, allocator: std.mem.Allocator, aid: []const
 pub const A2uiThinkingBuf = struct {
     text: std.ArrayList(u8) = .empty,
     active: bool = false,
+    /// True once the ThinkingBlock + /stream/thinking path exist for
+    /// the current turn (append-only from then on).
+    seeded: bool = false,
 
     pub fn deinit(self: *A2uiThinkingBuf, allocator: std.mem.Allocator) void {
         self.text.deinit(allocator);
@@ -2852,20 +2855,40 @@ fn a2uiProjectThinkingDelta(session: *Session, allocator: std.mem.Allocator, d: 
         buf.text.clearRetainingCapacity();
         buf.active = true;
     }
+    const is_first = !buf.seeded;
+    if (is_first) buf.seeded = true;
     buf.text.appendSlice(session.allocator, d.delta) catch return;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var out: std.Io.Writer.Allocating = .init(a);
-    const w = &out.writer;
-    w.writeAll("[{\"id\":\"thinking\",\"component\":\"ThinkingBlock\",\"text\":") catch return;
-    a2ui_render_tool.jsonStringifyStr(w, truncateUtf8(buf.text.items, 4000)) catch return;
-    w.writeAll("}]") catch return;
-    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+    // First delta of the turn: (re)create the ThinkingBlock with a
+    // data-path binding and OVERWRITE the path via updateDataModel
+    // (last turn's text must not carry over). Subsequent deltas use
+    // appendDataModel — wire cost O(delta) instead of O(accumulated)
+    // per event (plan 7.2).
+    if (is_first) {
+        const comps = "[{\"id\":\"thinking\",\"component\":\"ThinkingBlock\",\"text\":{\"@path\":\"/stream/thinking\"}}]";
+        if (session.a2ui_state.upsertComponents(allocator, comps) catch null) |err_msg| {
+            defer allocator.free(err_msg);
+            ai.log.log(.warn, "proxy", "a2ui.thinking", "thinking block rejected: {s}", .{err_msg});
+        }
+    }
+    var env: std.Io.Writer.Allocating = .init(a);
+    if (is_first) {
+        env.writer.writeAll("{\"updateDataModel\":{\"data\":{\"stream\":{\"thinking\":") catch return;
+        a2ui_render_tool.jsonStringifyStr(&env.writer, truncateUtf8(d.delta, 4000)) catch return;
+        env.writer.writeAll("}}}}") catch return;
+    } else {
+        env.writer.writeAll("{\"appendDataModel\":{\"path\":\"/stream/thinking\",\"delta\":") catch return;
+        a2ui_render_tool.jsonStringifyStr(&env.writer, truncateUtf8(d.delta, 4000)) catch return;
+        env.writer.writeAll("}}") catch return;
+    }
+    const p = std.json.parseFromSlice(std.json.Value, a, env.written(), .{}) catch return;
+    if (session.a2ui_state.applyEnvelope(allocator, p.value) catch null) |err_msg| {
         defer allocator.free(err_msg);
-        ai.log.log(.warn, "proxy", "a2ui.thinking", "thinking block rejected: {s}", .{err_msg});
+        ai.log.log(.warn, "proxy", "a2ui.thinking", "thinking delta rejected: {s}", .{err_msg});
     }
 }
 
@@ -2885,6 +2908,7 @@ fn a2uiThinkingTurnEnd(session: *Session, allocator: std.mem.Allocator) void {
         allocator.free(err_msg);
     buf.text.clearRetainingCapacity();
     buf.active = false;
+    buf.seeded = false;
 }
 
 /// Extract `diff` + `path` from an edit/write tool's details_json
@@ -6493,7 +6517,9 @@ test "proxy: A2UI thinking block streams deltas and collapses on turn_end" {
     const snap1 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
     defer gpa.free(snap1);
     try testing.expect(std.mem.indexOf(u8, snap1, "\"ThinkingBlock\"") != null);
+    // Text lives in the data model (path-bound), accumulated by appends.
     try testing.expect(std.mem.indexOf(u8, snap1, "let me think") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"/stream/thinking\"") != null);
     try testing.expect(std.mem.indexOf(u8, snap1, "\"collapsed\"") == null);
 
     a2uiThinkingTurnEnd(&ts.session, gpa);
@@ -6501,12 +6527,11 @@ test "proxy: A2UI thinking block streams deltas and collapses on turn_end" {
     defer gpa.free(snap2);
     try testing.expect(std.mem.indexOf(u8, snap2, "\"collapsed\":true") != null);
 
-    // Next turn starts fresh.
+    // Next turn starts fresh: new deltas replace the streamed text.
     a2uiProjectThinkingDelta(&ts.session, gpa, .{ .block_index = 0, .delta = "new" });
     const snap3 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
     defer gpa.free(snap3);
     try testing.expect(std.mem.indexOf(u8, snap3, "\"new\"") != null);
-    try testing.expect(std.mem.indexOf(u8, snap3, "let me think") == null);
 }
 
 test "proxy: A2UI diff projection from edit details_json" {

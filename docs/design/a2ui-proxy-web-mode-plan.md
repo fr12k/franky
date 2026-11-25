@@ -340,6 +340,24 @@ replay ring, no `emit_ui` tool, no per-delta streaming text (§7.2 — the
 ThinkingBlock re-projects the full buffer per delta, which is the chatty
 variant §7.2 asks about), no AG-UI binding (§7.1).
 
+### 8.5 Round 6 (2026-11) — StreamingText + appendDataModel (§7.2)
+
+Resolves open question §7.2 in favor of a franky-catalog streaming
+component over per-delta `updateDataModel` replaces:
+
+- **`StreamingText` component** — text bound to an absolute data-model
+  path (`path` required, validated as a `/...` JSON pointer).
+- **`appendDataModel` envelope** (franky extension): `{"path", "delta"}`
+  appends the delta string to the path server-side (RFC 6901 escapes
+  honored) and broadcasts verbatim; renderers apply the same append. Each
+  streaming event now costs O(delta) instead of O(accumulated).
+- **ThinkingBlock re-wired**: the first thinking delta of a turn seeds
+  `/stream/thinking` via `updateDataModel` (overwrite, so last turn's text
+  can't carry over); subsequent deltas stream via `appendDataModel`.
+
+Remaining scope cuts after round 6: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no AG-UI binding (§7.1).
+
 ## 7. Open questions (resolve before execution)
 
 1. Goal = **interoperability** (external A2UI clients connect to franky) or

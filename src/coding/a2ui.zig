@@ -146,6 +146,35 @@ pub const Session = struct {
             return null;
         }
 
+        if (obj.get("appendDataModel")) |adm| {
+            // Plan 7.2 franky extension: append `delta` (a string) to
+            // the string at `path` (RFC 6901) in the surface data
+            // model, creating it when missing. Broadcast verbatim —
+            // the renderer applies the same append, so streaming text
+            // costs O(delta) per event instead of O(accumulated).
+            if (adm != .object) return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel", "appendDataModel must be an object");
+            if (adm.object.get("surfaceId")) |sid| {
+                if (sid != .string or !std.mem.eql(u8, sid.string, surface_id))
+                    return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/surfaceId", "unknown surfaceId (PoC supports \"main\" only)");
+            }
+            const path_v = adm.object.get("path") orelse
+                return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/path", "missing path (JSON pointer to a string)");
+            if (path_v != .string or path_v.string.len == 0 or path_v.string[0] != '/')
+                return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/path", "path must be an absolute JSON pointer (\"/...\")");
+            const delta_v = adm.object.get("delta") orelse
+                return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/delta", "missing delta string");
+            if (delta_v != .string)
+                return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/delta", "delta must be a string");
+
+            self.mutex.lockUncancelable(self.io);
+            try pointerAppendString(self.allocator, &self.data_model, path_v.string, delta_v.string);
+            self.version += 1;
+            const ver = self.version;
+            self.mutex.unlock(self.io);
+            try self.broadcast(allocator, "appendDataModel", env, ver);
+            return null;
+        }
+
         if (obj.get("deleteSurface")) |_| {
             self.mutex.lockUncancelable(self.io);
             if (self.state) |*s| {
@@ -161,7 +190,7 @@ pub const Session = struct {
             return null;
         }
 
-        return try validationError(allocator, "VALIDATION_FAILED", "/", "envelope must contain exactly one of createSurface, updateComponents, updateDataModel, deleteSurface");
+        return try validationError(allocator, "VALIDATION_FAILED", "/", "envelope must contain exactly one of createSurface, updateComponents, updateDataModel, appendDataModel, deleteSurface");
     }
 
     // ── renderer-side snapshots ───────────────────────────────────
@@ -372,7 +401,7 @@ pub const Session = struct {
 
 // ─── validation ─────────────────────────────────────────────────
 
-const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField", "CheckBox", "Card", "ToolCall", "CodeBlock", "Diff", "ThinkingBlock" };
+const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField", "CheckBox", "Card", "ToolCall", "CodeBlock", "Diff", "ThinkingBlock", "StreamingText" };
 
 fn isKnownComponent(name: []const u8) bool {
     for (known_components) |k| if (std.mem.eql(u8, k, name)) return true;
@@ -406,7 +435,7 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
         if (comp_v != .string)
             return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), "component type must be a string");
         if (!isKnownComponent(comp_v.string))
-            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — catalog: Column, Row, Text, Button, TextField, CheckBox, Card, ToolCall, CodeBlock, Diff, ThinkingBlock", .{comp_v.string}));
+            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — catalog: Column, Row, Text, Button, TextField, CheckBox, Card, ToolCall, CodeBlock, Diff, ThinkingBlock, StreamingText", .{comp_v.string}));
     }
 
     // Pass 2: structural references + per-type prop validation.
@@ -522,6 +551,14 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
                 if (v != .bool)
                     return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/collapsed", .{path_prefix}), "ThinkingBlock.collapsed must be a boolean");
             }
+        } else if (std.mem.eql(u8, comp, "StreamingText")) {
+            // Plan 7.2: text bound to a data-model path, grown by
+            // appendDataModel deltas (append semantics — the
+            // alternative to chatty per-delta full-string replaces).
+            const p = c.object.get("path") orelse
+                return try validationError(a, "VALIDATION_FAILED", path_prefix, "StreamingText component requires \"path\" (a data-model JSON pointer the renderer binds to)");
+            if (p != .string or p.string.len == 0 or p.string[0] != '/')
+                return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/path", .{path_prefix}), "StreamingText.path must be an absolute JSON pointer (\"/...\")");
         }
     }
     return null;
@@ -605,6 +642,84 @@ pub fn freeCopy(allocator: std.mem.Allocator, v: std.json.Value) void {
     }
 }
 
+/// Append `delta` to the string at RFC 6901 `path` inside `*root`,
+/// creating intermediate objects and the leaf string as needed.
+/// `~0`/`~1` unescaping per RFC 6901. Errors on a type mismatch
+/// (existing non-string leaf, numeric segment into a non-array).
+fn pointerAppendString(allocator: std.mem.Allocator, root: *std.json.Value, path: []const u8, delta: []const u8) !void {
+    if (root.* != .object) {
+        freeCopy(allocator, root.*);
+        root.* = .{ .object = .{} };
+    }
+    var cur: *std.json.Value = root;
+    var it = std.mem.splitScalar(u8, path[1..], '/');
+    var last_seg: []const u8 = "";
+    var segs: [64][]const u8 = undefined;
+    var n: usize = 0;
+    while (it.next()) |raw| {
+        if (n >= segs.len) return error.PathTooDeep;
+        segs[n] = raw;
+        n += 1;
+    }
+    if (n == 0) return error.InvalidPath;
+    last_seg = segs[n - 1];
+    for (segs[0 .. n - 1]) |raw| {
+        const seg = try unescapeSegment(allocator, raw);
+        defer allocator.free(seg);
+        if (cur.* != .object) return error.InvalidPath;
+        const duped = try allocator.dupe(u8, seg);
+        const gop = try cur.object.getOrPut(allocator, duped);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .object = .{} };
+        } else {
+            allocator.free(duped); // getOrPut kept the existing key
+            if (gop.value_ptr.* != .object) return error.InvalidPath;
+        }
+        cur = gop.value_ptr;
+    }
+    const seg = try unescapeSegment(allocator, last_seg);
+    defer allocator.free(seg);
+    if (cur.* != .object) return error.InvalidPath;
+    const duped_key = try allocator.dupe(u8, seg);
+    const gop = try cur.object.getOrPut(allocator, duped_key);
+    if (gop.found_existing) {
+        allocator.free(duped_key);
+        if (gop.value_ptr.* != .string) return error.TypeMismatch;
+        const joined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ gop.value_ptr.string, delta });
+        allocator.free(gop.value_ptr.string);
+        gop.value_ptr.* = .{ .string = joined };
+    } else {
+        gop.value_ptr.* = .{ .string = try allocator.dupe(u8, delta) };
+    }
+}
+
+fn unescapeSegment(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    // Unescape in place, then shrink so the caller frees the correct
+    // length (safe allocators check the freed slice length against
+    // the allocation size).
+    const buf = try allocator.dupe(u8, raw);
+    var i: usize = 0;
+    var w: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] == '~' and i + 1 < buf.len) {
+            if (buf[i + 1] == '0') {
+                buf[w] = '~';
+                i += 1;
+            } else if (buf[i + 1] == '1') {
+                buf[w] = '/';
+                i += 1;
+            } else {
+                buf[w] = buf[i];
+            }
+        } else {
+            buf[w] = buf[i];
+        }
+        w += 1;
+    }
+    if (w == buf.len) return buf;
+    return try allocator.realloc(buf, w);
+}
+
 /// Deep-merge `src` into `*dst` (spec updateDataModel semantics:
 /// objects merge recursively, everything else replaces). `dst`
 /// ownership stays with the caller; merged-in values are deep copies.
@@ -679,6 +794,14 @@ pub const system_prompt_block: []const u8 =
     \\  (unified-diff view; `path` optional)
     \\- `ThinkingBlock`: `{"id","component":"ThinkingBlock","text":"...","collapsed":true}`
     \\  (collapsible reasoning block; `collapsed` optional, default true)
+    \\- `StreamingText`: `{"id","component":"StreamingText","path":"/stream/msg"}`
+    \\  (text bound to a data-model path; grow it with `appendDataModel`)
+    \\
+    \\`appendDataModel` (franky extension for streaming): 
+    \\`{"appendDataModel":{"path":"/stream/msg","delta":"..."}}` appends `delta` to
+    \\the string at `path` (created when missing). Prefer it over repeated
+    \\`updateDataModel` for token-by-token text — each event costs O(delta)
+    \\instead of O(accumulated).
     \\
     \\When the user clicks a Button, its `action.event` comes back to you as a user
     \\message (`[A2UI action] name=... context=...`) — treat it like a normal instruction.
@@ -913,6 +1036,66 @@ test "applyEnvelope: Diff and ThinkingBlock validate (plan 4.7)" {
     const err2 = (try session.applyEnvelope(testing.allocator, badcoll)).?;
     defer testing.allocator.free(err2);
     try testing.expect(std.mem.indexOf(u8, err2, "collapsed must be a boolean") != null);
+}
+
+test "applyEnvelope: StreamingText validates path; appendDataModel grows the string (plan 7.2)" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+
+    // Component requires an absolute path.
+    const bad = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[{"id":"s","component":"StreamingText","path":"noslash"}]}}
+    );
+    defer freeCopy(testing.allocator, bad);
+    const e0 = (try session.applyEnvelope(testing.allocator, bad)).?;
+    defer testing.allocator.free(e0);
+    try testing.expect(std.mem.indexOf(u8, e0, "absolute JSON pointer") != null);
+
+    const comp = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"root","component":"Column","children":["s"]},
+        \\  {"id":"s","component":"StreamingText","path":"/stream/msg"}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, comp);
+    try testing.expect((try session.applyEnvelope(testing.allocator, comp)) == null);
+
+    // Appends accumulate; intermediate objects are created.
+    const d1 = try parse(testing.allocator, "{\"appendDataModel\":{\"path\":\"/stream/msg\",\"delta\":\"Hello, \"}}");
+    defer freeCopy(testing.allocator, d1);
+    try testing.expect((try session.applyEnvelope(testing.allocator, d1)) == null);
+    const d2 = try parse(testing.allocator, "{\"appendDataModel\":{\"path\":\"/stream/msg\",\"delta\":\"world\"}}");
+    defer freeCopy(testing.allocator, d2);
+    try testing.expect((try session.applyEnvelope(testing.allocator, d2)) == null);
+
+    const snap = try session.renderSnapshotJson(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "Hello, world") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"StreamingText\"") != null);
+
+    // Bad shapes are rejected without mutation.
+    const nod = try parse(testing.allocator, "{\"appendDataModel\":{\"path\":\"/stream/msg\"}}");
+    defer freeCopy(testing.allocator, nod);
+    const e1 = (try session.applyEnvelope(testing.allocator, nod)).?;
+    defer testing.allocator.free(e1);
+    try testing.expect(std.mem.indexOf(u8, e1, "missing delta") != null);
+    const notstr = try parse(testing.allocator, "{\"appendDataModel\":{\"path\":\"/stream/msg\",\"delta\":42}}");
+    defer freeCopy(testing.allocator, notstr);
+    const e2 = (try session.applyEnvelope(testing.allocator, notstr)).?;
+    defer testing.allocator.free(e2);
+    try testing.expect(std.mem.indexOf(u8, e2, "delta must be a string") != null);
+}
+
+test "pointerAppendString: RFC 6901 escapes" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+    const d = try parse(testing.allocator, "{\"appendDataModel\":{\"path\":\"/a~0b/c~1d\",\"delta\":\"x\"}}");
+    defer freeCopy(testing.allocator, d);
+    try testing.expect((try session.applyEnvelope(testing.allocator, d)) == null);
+    const snap = try session.renderSnapshotJson(testing.allocator);
+    defer testing.allocator.free(snap);
+    // ~0 → ~ and ~1 → / in key names.
+    try testing.expect(std.mem.indexOf(u8, snap, "\"a~b\":{\"c/d\":\"x\"}") != null);
 }
 
 test "applyEnvelope: @call binding is rejected" {
