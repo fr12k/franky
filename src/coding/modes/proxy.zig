@@ -2684,7 +2684,9 @@ fn a2uiProjectToolEnd(
     const exists = blk: {
         const cur = (session.a2ui_state.snapshotComponents(allocator) catch break :blk false) orelse break :blk false;
         defer a2uiFreeSnapshot(allocator, cur);
-        break :blk a2uiFindComponent(cur, std.fmt.allocPrint(allocator, "tool_{s}", .{aid}) catch break :blk false, allocator) != null;
+        const id = std.fmt.allocPrint(allocator, "tool_{s}", .{aid}) catch break :blk false;
+        defer allocator.free(id);
+        break :blk a2uiFindComponent(cur, id) != null;
     };
     if (!exists) return;
 
@@ -2748,10 +2750,8 @@ fn a2uiFirstText(a: std.mem.Allocator, content: []ai.types.ContentBlock) ?[]cons
     return null;
 }
 
-/// Find a component def by id in a snapshot array. `id` is freed by
-/// the caller-owned `alloc` — this helper frees its own copy.
-fn a2uiFindComponent(comps: std.json.Value, id: []const u8, alloc: std.mem.Allocator) ?std.json.Value {
-    defer alloc.free(id);
+/// Find a component def by id in a snapshot array. `id` is borrowed.
+fn a2uiFindComponent(comps: std.json.Value, id: []const u8) ?std.json.Value {
     if (comps != .array) return null;
     for (comps.array.items) |c| {
         if (c != .object) continue;
@@ -2786,15 +2786,18 @@ fn a2uiWriteRootWithChild(
     a: std.mem.Allocator,
     aid: []const u8,
 ) !void {
-    _ = a;
     if (comps != .array) return;
+    // "tool_<aid>" once, on the caller's allocator (was a leaking
+    // page_allocator allocPrint inside the loop).
+    const child_id = try std.fmt.allocPrint(a, "tool_{s}", .{aid});
+    defer a.free(child_id);
     for (comps.array.items) |c| {
         if (c != .object) continue;
         const id_v = c.object.get("id") orelse continue;
         if (id_v != .string or !std.mem.eql(u8, id_v.string, "root")) continue;
         // Skip if already attached (idempotent on duplicate start events).
         for (children.array.items) |kid| {
-            if (kid == .string and std.mem.eql(u8, kid.string, std.fmt.allocPrint(std.heap.page_allocator, "tool_{s}", .{aid}) catch "")) return;
+            if (kid == .string and std.mem.eql(u8, kid.string, child_id)) return;
         }
         try w.writeAll("{\"id\":\"root\"");
         var it = c.object.iterator();
