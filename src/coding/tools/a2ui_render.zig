@@ -82,6 +82,9 @@ fn execute(
     // the model can fix + retry (spec §prompt-generate-validate loop).
     for (msgs.array.items, 0..) |env, i| {
         if (try session.applyEnvelope(allocator, env)) |err_json| {
+            // applyEnvelope's error strings are caller-owned (see
+            // a2ui.zig applyEnvelope doc) — free after formatting.
+            defer allocator.free(err_json);
             const msg = try std.fmt.allocPrint(allocator, "message {d} failed validation: {s}", .{ i, err_json });
             return common.toolError(allocator, "a2ui_validation", msg);
         }
