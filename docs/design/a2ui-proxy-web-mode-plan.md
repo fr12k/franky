@@ -1,0 +1,401 @@
+# A2UI support in franky proxy web mode — implementation plan
+
+Status: **PoC implemented** (2026-07). Plan below kept for context; see §8 for what actually shipped.
+
+## 1. A2UI v1.0 in a nutshell
+
+A2UI (Agent-to-User Interface, a2ui.org, current spec **v1.0**, Nov 2025, updated Jun 2026)
+is an open JSON-based streaming protocol for *generative UI*. The agent declaratively
+describes UI surfaces; the client renders them with **native catalog components** — no
+untrusted code executes client-side.
+
+### Agent → Renderer stream (unidirectional, JSONL/SSE-friendly)
+
+Every message validates against the `agent_to_renderer` envelope, exactly one key:
+
+| Message | Purpose |
+|---|---|
+| `createSurface` | Initialize a surface (`surfaceId`, `catalogId`, optional `sendDataModel`) |
+| `updateComponents` | Adjacency-list component definitions (`id`, `component`, `children`/`child`, props with `@path`/`@call` dynamic bindings) |
+| `updateDataModel` | Populate/patch the reactive data model (RFC 6901 JSON Pointer paths) |
+| `deleteSurface` | Tear down a surface |
+| `callRendererFunction` / `agentFunctionResponse` | Optional bidirectional function RPC (new in v1.0) |
+
+### Renderer → Agent
+
+- `action` messages: `name`, `surfaceId`, `sourceComponentId`, `timestamp`,
+  resolved `context` (with `@path` bindings resolved renderer-side).
+- Validation errors (`UNALLOWED_PARENT`, `UNALLOWED_CHILD`, `EXPRESSION_ERROR`, …).
+- Optional `rendererFunctionResponse`.
+
+### Key model traits
+
+- **Adjacency-list UI tree** — flat component list referencing children by ID;
+  streaming-friendly (progressive rendering as messages arrive).
+- **Data binding** via JSON Pointers: absolute `/path`, or relative inside template
+  scopes (container `children: {path, componentId}` creates a child scope per item).
+- **Two-way binding is renderer-local** — inputs mutate the local model immediately;
+  nothing reaches the agent until an `action` fires.
+- **Basic Catalog** (`Text`, `Button`, `Row`, `Column`, `List`, `TextField`,
+  `CheckBox`, `Card`, …) with swappable custom catalogs; catalogs must use
+  `ComponentId` / `ChildList` schema refs so validators can check structural links.
+- **Transport-decoupled** — official bindings: AG-UI, A2A, MCP; any HTTP/SSE/WS
+  channel is allowed.
+
+Spec references (pin locally before implementation):
+
+- https://a2ui.org/specification/v1.0-a2ui.md
+- https://a2ui.org/specification/v1.0/schemas/ (`agent_to_renderer.json`,
+  `renderer_to_agent.json`, `common_types.json`, `catalogs/basic/catalog.json`)
+- https://a2ui.org/specification/v1.0-basic-catalog-implementation-guide.md
+
+## 2. franky proxy mode — current state
+
+`src/coding/modes/proxy.zig` already provides:
+
+- `GET /events` — SSE stream of internal `AgentEvent`s
+  (`event: <kind>\ndata: <json>`), replay ring + htmx hx-sse HTML variant (`src/coding/sse.zig`).
+- `POST /prompt`, `POST /command` (slash dispatch), `POST /abort`,
+  `GET /transcript`, `GET /health`.
+- Built-in web UI embedded via `@embedFile` (`src/coding/modes/web/`: index.html,
+  app.js, style.css, htmx, prism).
+- Single-session model; `AgentEvent` union (`turn_start`, `message_update` deltas,
+  `tool_execution_*`, `tool_permission_request`, `provider_retry`, …) fanned out to
+  all subscribers.
+
+So the agentic plumbing (sessions, tools, SSE fan-out, replay, slash commands,
+permission gate) exists with a *custom* chat UI. Missing for A2UI: the **protocol
+layer** — A2UI envelopes, surface/component/data-model state, `action` intake, and
+an A2UI renderer client.
+
+## 3. Architecture options
+
+- **Option A — sidecar endpoint (recommended, minimal risk).** Add
+  `GET /a2ui/events` + `POST /a2ui/action` alongside the existing API. Existing web
+  UI and SSE stream untouched; A2UI is an additional projection.
+- **Option B — replace the built-in web UI with an A2UI renderer.** Bigger long-term
+  win (whole UI becomes generative: permission prompts, tool cards, forms), but
+  requires building/porting a full JS A2UI renderer and migrating every UI feature.
+
+Plan assumes **A, structured so it can evolve into B**.
+
+## 4. Work items
+
+### 4.1 A2UI protocol module (`src/coding/a2ui/`)
+
+- Zig types mirroring the v1.0 schemas: envelope union
+  (`createSurface | updateComponents | updateDataModel | deleteSurface |
+  callRendererFunction | agentFunctionResponse`), `Component`, `ChildList`,
+  `DynamicString`/`DynamicBoolean` (`@path`/`@call`), inbound action/error messages.
+- Pin the official JSON Schemas into `docs/spec/a2ui/`; add tests validating emitted
+  envelopes against the schema (or against the spec's golden JSONL examples).
+
+### 4.2 Surface/session manager (`a2ui/surfaces.zig`)
+
+- Surface registry: `surfaceId` → { adjacency list, data-model tree, catalogId }.
+- Server-side data-model store with JSON-Pointer set/merge (needed to resolve
+  `@path` when composing updates and to honor `sendDataModel` metadata).
+- Progressive-streaming buffer: queue `updateComponents`/`updateDataModel` deltas
+  per surface; serialize onto SSE.
+
+### 4.3 Translator: `AgentEvent` → A2UI (`a2ui/translate.zig`)
+
+The core design work. Initial mapping:
+
+| franky `AgentEvent` | A2UI emission |
+|---|---|
+| session start | `createSurface{surfaceId:"chat", catalogId:basic}` + `updateComponents` for chat shell (List of message cards, TextField + Send Button bound to `/input`) |
+| `message_start` / `message_update` (text delta) | `updateDataModel` appending to `/messages/<i>/text` (renderer `Text` bound via `@path` updates reactively) |
+| `tool_execution_start` / `_end` | `updateComponents` adding a tool-card component (custom catalog: `ToolCall`, `CodeBlock`, `Diff`) + `updateDataModel` with args/result |
+| `tool_permission_request` | `updateComponents` rendering a permission form (Buttons `allow_once` / `allow_always` / `deny`, `action.event.context` carries `call_id`) |
+| `turn_end` / `agent_error` | `updateDataModel` status field (`/turnState = idle|error`) |
+
+### 4.4 Inbound action handling
+
+- `POST /a2ui/action`: parse `renderer_to_agent` envelope; route by `action.name`:
+  - `send_prompt` → same path as `POST /prompt`.
+  - `permission_decision` → `permissions.PermissionPrompter.resolve(...)`.
+  - `abort` → `session.cancel`.
+- Slash commands: agent actions from a command-palette component, or keep
+  `POST /command` as-is.
+
+### 4.5 Transport endpoint (`proxy.zig` additions)
+
+- `GET /a2ui/events`: SSE with JSONL A2UI envelopes in `data:` frames. Reuse
+  `sse.zig` fan-out + replay ring so reloads rehydrate.
+- Later: implement the **AG-UI binding** for interop with the off-the-shelf A2UI
+  ecosystem (CopilotKit playground, A2UI Composer).
+
+### 4.6 Client renderer
+
+- **6a (fast):** embed the official A2UI Lit/web-components renderer like the current
+  `htmx.min.js` assets; surfaces mount in a container div; existing chat panel
+  coexists during migration.
+- **6b (full control):** bespoke minimal JS renderer (basic catalog + 3–5
+  franky-specific components). Zero dependency, sized to franky; much more work.
+
+### 4.7 Custom franky catalog (likely needed)
+
+Basic catalog lacks `CodeBlock`, `Diff`, `ToolCall`, `ThinkingBlock`. Define
+`franky_catalog.json` extending basic, following catalog rules (`ComponentId` /
+`ChildList` refs, `allowedParents` / `allowedChildren`).
+
+### 4.8 Security & scope notes
+
+- Proxy is unauthenticated and currently binds `0.0.0.0` — unchanged by A2UI; keep
+  the documented guidance (TLS-terminating proxy with auth in front).
+- A2UI's "no untrusted code" property aligns with franky's sandbox posture: custom
+  catalog components are static renderer code, never model-generated.
+
+## 4.9 How the model uses A2UI components (clarified)
+
+The spec's canonical usage is a **prompt–generate–validate loop**, not tool calling:
+
+1. **Prompt**: system prompt includes the A2UI JSON schema **including the component
+   catalog**, plus examples of valid A2UI JSONL.
+2. **Generate**: the model emits A2UI messages (`createSurface`, `updateComponents`,
+   `updateDataModel`, …) as ordinary text/structured output.
+3. **Validate**: the host validates against the schema; failures go back to the
+   model as a standardized `error` message (`VALIDATION_FAILED` /
+   `UNALLOWED_PARENT` / `UNALLOWED_CHILD` + JSON-pointer `path`) so it self-corrects.
+
+Key details:
+
+- Catalogs carry an **`instructions`** field — Markdown design rules explicitly
+  meant to *guide LLMs generating layouts*. The catalog file is designed to be
+  injected into the prompt (schema + design guidance in one artifact). Google also
+  ships this as agent skills (`npx skills add a2ui-project/a2ui`).
+- A2UI **functions** (`functionCall`, `callRendererFunction`, `callAgentFunction`,
+  `formatString`, validators like `required`/`email`) are **renderer/agent RPCs,
+  not LLM tools**. The model only *references* them in generated JSON; they never
+  go through the LLM tool-calling API.
+- Exposing `emit_a2ui` as a **real LLM tool** is an optional host-side delivery
+  mechanism (API-enforced structure, fewer malformed outputs), but costs a tool
+  slot and round-trips; the spec's reference loop is plain generation + validation.
+
+Consequence for franky — two distinct paths:
+
+- **Translator path (Option A, §3):** franky's Zig code maps `AgentEvent`s → A2UI
+  deterministically. **The model never sees A2UI; no prompt changes.** Cheap,
+  reliable MVP. UI is generative from the client's view but hard-coded agent-side.
+- **True generative UI (endgame):** the model itself emits A2UI ("show a form to
+  configure X", custom dashboards). Requires:
+  1. Inject franky catalog JSON + `instructions` + examples into the system prompt
+     — conditionally: only in proxy mode, and only when the renderer advertised
+     `supportedCatalogIds`.
+  2. Validation step in franky before forwarding model output to `/a2ui/events`,
+     feeding the spec's standard `error` message back into the conversation.
+  3. Optionally an `emit_ui` tool (envelope schema as input schema) for
+     API-enforced structure instead of free generation.
+
+## 5. Effort estimate
+
+| Item | Size |
+|---|---|
+| 4.1 Schema types + validation tests | S–M (2–3 d) |
+| 4.2 Surface/data-model manager | M (3–4 d) |
+| 4.3 Event translator (core) | M–L (4–6 d, iterative) |
+| 4.4 Action inbound + permission bridge | S (1–2 d) |
+| 4.5 SSE endpoint wiring (reuse sse.zig) | S (1 d) |
+| 4.6a Official renderer embed | S (1–2 d) |
+| 4.6b Custom renderer | L (1–2 wk) |
+| 4.7 Custom catalog | S (1 d) |
+
+**MVP** (Option A + 6a + basic catalog only; chat text streaming + prompt/abort +
+permission form): ~2 weeks.
+**Full parity** with current web UI (tool cards, diffs, transcript rehydrate, slash
+palette, cost display): ~4–6 weeks.
+
+## 6. Suggested sequencing
+
+1. 4.1 + 4.5 skeleton: emit a hard-coded `createSurface` + static form; render it
+   with the official renderer (proves transport + renderer choice end-to-end).
+2. 4.2 + 4.3 for the text-streaming path (prompt → streamed message).
+3. 4.4 actions incl. permission bridge (closes the interactive loop).
+4. 4.7 custom catalog for tool/diff cards; migrate remaining UI features.
+5. (Optional, post-MVP) True generative UI per §4.9: conditional catalog
+   injection into the system prompt, output validation with `error` feedback loop,
+   optional `emit_ui` tool.
+
+## 8. PoC — what shipped
+
+Flag + settings gated, **off by default**: `--a2ui` / `--no-a2ui` CLI flags,
+`tools.a2ui.enabled` in settings.json. Files:
+
+- `src/coding/a2ui.zig` — A2UI session state (surface components + data model),
+  envelope validation (PoC basic catalog: Column, Row, Text, Button, TextField;
+  `@path` bindings; `@call`/template ChildLists rejected), deep-merge data model,
+  SSE broadcast, system-prompt block. Unit-tested.
+- `src/coding/tools/a2ui_render.zig` — `a2ui_render` tool: applies an array of
+  envelopes in order; validation failures return the spec's standard error
+  format (`VALIDATION_FAILED` / `UNALLOWED_*` / `EXPRESSION_ERROR` + JSON
+  pointer path) as tool errors so the model self-corrects. Unit-tested
+  (execute-path e2e: valid → state; invalid → tool error).
+- `src/coding/modes/web/a2ui.html` — self-contained vanilla-JS renderer page
+  (`/a2ui.html`): adjacency-list rendering, RFC 6901 `@path` resolution,
+  renderer-local two-way binding, Button actions → `POST /a2ui/action`,
+  EventSource with snapshot catch-up.
+- `src/coding/modes/proxy.zig` — endpoints (only when enabled):
+  `GET /a2ui.html`, `GET /a2ui/events` (SSE; synthetic `a2ui_snapshot` frame on
+  connect / stale Last-Event-ID), `POST /a2ui/action` (appends
+  `[A2UI action] name=… context=…` as a user message and runs a normal turn).
+  Tool registration + system-prompt injection happen at session init.
+  `FRANKY_FAUX_LOG_TOOLS=1` makes the faux provider log offered tools for e2e.
+
+Verified end-to-end with the faux provider: endpoints gated correctly (404 /
+200), `a2ui_render` appears in the model's tool list + A2UI block in the
+system prompt, `/a2ui/action` round-trips into the transcript and produces an
+agent turn, invalid action payloads → 400.
+
+PoC scope cuts (vs. full plan): one fixed surface `"main"` (createSurface
+optional/idempotent), snapshot instead of a replay ring, no `emit_ui`
+structured-output tool (the model emits via the regular tool-call channel).
+
+### 8.1 Round 2 (2026-11) — permission-form integration (§4.4) + translator seed (§4.3)
+
+- **Permission forms (§4.4 closed).** `tool_permission_request` events are
+  projected into the A2UI surface as a host-injected `Card`
+  (`a2uiProjectPermissionRequest` in `proxy.zig`): tool name + raw args as
+  title/subtitle, a "Remember this decision" `CheckBox` (two-way bound to
+  `/perm/<call_id>/remember`), and Allow/Deny `Button`s firing the reserved
+  `permission_decision` action. `POST /a2ui/action` intercepts
+  `permission_decision` and resolves the pending prompt via
+  `PermissionPrompter.resolve` (`allow_once`/`always_allow`/`deny_once`/
+  `always_deny` from decision+remember) — the action never reaches the LLM.
+  After resolving, the card is removed from the surface. Proxy-level tests
+  cover the full round-trip (request → card → decision → resolution +
+  card cleanup) and the no-pending-prompt 409 path.
+- **Host-side projection API (§4.3 seed).** `a2ui.zig` gained
+  `upsertComponents` (validate + merge into the adjacency list by id) and
+  `removeComponents` (drop ids, prune dangling child references), both
+  broadcast as regular `updateComponents` envelopes. This is the mechanism
+  the future `AgentEvent` → A2UI translator will use; the permission
+  projection is its first consumer.
+- **Catalog: +`CheckBox`, +`Card`** (validation + vanilla-JS rendering,
+  two-way boolean binding for `checked`).
+- **Renderer convergence.** `updateComponents` is now upsert-by-id on both
+  server (`upsertComponents`) and renderer (was full-replace), so
+  host-injected UI survives the model's full-tree re-renders; components
+  not reachable from `root` (e.g. permission cards) render after the
+  model tree. Snapshots now carry `surfaceId`.
+
+Remaining scope cuts after round 2: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no per-delta streaming text (open question
+§7.2), no AG-UI binding (open question §7.1).
+
+### 8.2 Round 3 (2026-11) — A2UI panel in the main chat window
+
+The surface no longer requires a separate tab: `index.html` embeds a
+right-side drawer (`#a2ui-panel`, header button `▦`) rendered by
+`web/a2ui.js` — the same renderer as `/a2ui.html`, namespaced as
+`window.A2UI`. `app.js` feature-detects `--a2ui` via a HEAD probe on
+`/a2ui.html` (button stays hidden when off), and the panel **auto-opens
+on the first surface change** (a rendered form or a permission card) so
+it can't be missed. Actions POST to `/a2ui/action` exactly like the
+standalone page, so form submits and permission decisions work from the
+chat window; the response still lands in the normal conversation stream.
+This is Option A evolving toward B (§3): the chat UI now hosts generative
+UI without being replaced by it.
+
+### 8.3 Round 4 (2026-11) — franky catalog: ToolCall / CodeBlock + tool-card projection (§4.7, step 4 of §6)
+
+- **Catalog +2**: `ToolCall` (`name` required; `args`/`result` optional
+  dynamic strings; `status` one of `running|done|error` — anything else is
+  a validation error so a typo can't silently render as done) and
+  `CodeBlock` (`code` required, `lang` optional). Validated server-side,
+  rendered in both the panel (`web/a2ui.js`) and `/a2ui.html`.
+- **Tool-card projection (translator consumer #2)**:
+  `tool_execution_start` projects a running `ToolCall` card
+  (`tool_<call_id>`; args truncated to 300 chars, UTF-8-safe);
+  `tool_execution_end` flips the same card to done/error with the
+  (truncated) result text. The card attaches to the model's `"root"`
+  container when one exists (upsert preserves its other children) and
+  renders as an unattached top-level component otherwise — so tool cards
+  appear even before the model renders any UI. `a2ui.zig` gained
+  `snapshotComponents` (deep-copied adjacency list) so projections can
+  inspect the surface (locate root, check card existence, recover the
+  tool name for the end event).
+
+Remaining scope cuts after round 4: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no per-delta streaming text (§7.2), no
+AG-UI binding (§7.1), no `Diff`/`ThinkingBlock` catalog components yet.
+
+### 8.4 Round 5 (2026-11) — Diff + ThinkingBlock (§4.7 complete)
+
+- **`Diff` component** (`diff` unified-diff string required, `path`
+  optional): renders a colored line-based diff table. `tool_execution_end`
+  parses franky's existing `details_json` (`unified-diff-v1`, same contract
+  + format allowlist as app.js) from edit/write results and attaches a
+  `tool_<call_id>_diff` Diff component to the card.
+- **`ThinkingBlock` component** (`text` required, `collapsed` bool,
+  default true): `message_update.thinking` deltas stream into a buffered
+  ThinkingBlock (4 KB cap); `turn_end` collapses it. A new turn starts a
+  fresh buffer.
+
+The §4.7 franky catalog is now complete: Column, Row, Text, Button,
+TextField, CheckBox, Card, ToolCall, CodeBlock, Diff, ThinkingBlock.
+
+Remaining scope cuts after round 5: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no per-delta streaming text (§7.2 — the
+ThinkingBlock re-projects the full buffer per delta, which is the chatty
+variant §7.2 asks about), no AG-UI binding (§7.1).
+
+### 8.5 Round 6 (2026-11) — StreamingText + appendDataModel (§7.2)
+
+Resolves open question §7.2 in favor of a franky-catalog streaming
+component over per-delta `updateDataModel` replaces:
+
+- **`StreamingText` component** — text bound to an absolute data-model
+  path (`path` required, validated as a `/...` JSON pointer).
+- **`appendDataModel` envelope** (franky extension): `{"path", "delta"}`
+  appends the delta string to the path server-side (RFC 6901 escapes
+  honored) and broadcasts verbatim; renderers apply the same append. Each
+  streaming event now costs O(delta) instead of O(accumulated).
+- **ThinkingBlock re-wired**: the first thinking delta of a turn seeds
+  `/stream/thinking` via `updateDataModel` (overwrite, so last turn's text
+  can't carry over); subsequent deltas stream via `appendDataModel`.
+
+Remaining scope cuts after round 6: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no AG-UI binding (§7.1).
+
+### 8.6 Round 7 (2026-11) — multi-surface + replay ring (§4.2)
+
+- **Multi-surface registry**: `Session.state`/`data_model` →
+  `surfaces: surfaceId → {components, data_model}`. `"main"` is created
+  lazily (existing single-surface callers unchanged); any other
+  `surfaceId` in any envelope creates/uses its own surface —
+  `createSurface` is now an explicit idempotent registration,
+  `deleteSurface` clears only the named surface, data models are
+  per-surface. `renderSnapshotAllJson` serializes the whole registry;
+  `renderSnapshotJson` keeps the `"main"`-only shape for the current
+  renderer.
+- **Replay ring** (1024 frames): every accepted envelope is stored
+  fully-stamped in a ring keyed by `version % capacity`.
+  `/a2ui/events` reconnect with a `Last-Event-ID` inside the ring replays
+  the missed envelopes in order; too-old ids fall back to a full
+  snapshot. (The renderer's existing upsert/merge logic applies replayed
+  envelopes idempotently, so replay and snapshot converge to the same
+  state.)
+- AG-UI binding (§7.1) is **decided against** — franky is its own
+  renderer; external-client interop is out of scope.
+
+Remaining scope cuts after round 7: no `emit_ui` tool. The §7 open
+questions are now all resolved (7.1 no AG-UI; 7.2 StreamingText; 7.3
+bespoke renderer; 7.4 golden-fixture validation; 7.5 generative UI via
+the `a2ui_render` tool).
+
+## 7. Open questions (resolve before execution)
+
+1. Goal = **interoperability** (external A2UI clients connect to franky) or
+   **replacing franky's web UI** with generative UI? Decides A vs B and whether the
+   AG-UI binding matters.
+2. Streaming text via per-delta `updateDataModel` is chattier than current SSE text
+   deltas — acceptable, or add a franky-catalog `StreamingText` component with
+   append semantics?
+3. Renderer choice: official Lit components vs. bespoke minimal JS renderer?
+4. JSON-Schema validation in Zig: acceptable dependency, or validate only against
+   golden fixtures in tests?
+5. Translator-only (model never sees A2UI) vs. true generative UI (model emits
+   A2UI per §4.9)? The translator MVP doesn't foreclose either, but the prompt
+   token cost of catalog injection and the validation-feedback loop design depend
+   on the answer.

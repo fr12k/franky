@@ -317,6 +317,16 @@ pub const Config = struct {
     /// to disable.
     memory_nudge: bool = true,
 
+    /// v3.x — `--a2ui` / `--no-a2ui` — enable/disable the A2UI
+    /// generative-UI surface (proxy mode only, PoC). Default OFF.
+    /// When enabled, the proxy serves `/a2ui.html` + `GET /a2ui/events`
+    /// + `POST /a2ui/action`, registers the `a2ui_render` tool, and
+    /// appends the A2UI instructions to the system prompt so the model
+    /// can emit `createSurface` / `updateComponents` / `updateDataModel`
+    /// messages (spec: https://a2ui.org/specification/v1.0-a2ui/).
+    /// settings.json `tools.a2ui.enabled` overlays the default.
+    a2ui_enabled: bool = false,
+
     /// Concatenated positional args — the user's prompt.
     prompt: []const u8 = "",
 
@@ -605,6 +615,14 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
         cfg.memory_nudge = false;
         return true;
     }
+    if (std.mem.eql(u8, name, "--a2ui")) {
+        cfg.a2ui_enabled = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--no-a2ui")) {
+        cfg.a2ui_enabled = false;
+        return true;
+    }
     return false;
 }
 
@@ -845,6 +863,8 @@ pub const usage_text: []const u8 =
     \\  --no-memory                  Disable persistent memory tools
     \\  --memory-nudge               Nudge agent to save memory before finish_task (default on)
     \\  --no-memory-nudge            Disable memory save nudge
+    \\  --a2ui                       Enable A2UI generative-UI surface (proxy mode; PoC)
+    \\  --no-a2ui                    Disable A2UI generative-UI surface (default)
     \\  --image PATH                 Attach an image file to the initial prompt
     \\                               (repeatable; png/jpg/gif/webp/bmp).
     \\  --image-stdin                Read a binary image from stdin and attach it

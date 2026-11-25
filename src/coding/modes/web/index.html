@@ -42,6 +42,7 @@ build: __FRANKY_DATE__">v__FRANKY_VERSION__</span>
             </span>
         </span>
         <button id="design-panel-btn" type="button" title="Design documents panel">📐</button>
+        <button id="a2ui-panel-btn" type="button" title="A2UI surface (generative UI)" hidden>▦</button>
         <button id="sa-panel-btn" type="button" hidden title="Show sub-agent activity">⚙</button>
         <button id="abort-btn" type="button" aria-label="Abort the current turn gracefully" title="Abort (graceful interrupt)">⏹ Abort</button>
         <button id="help-toggle" type="button" aria-label="Show help" title="Help (?)">?</button>
@@ -98,6 +99,13 @@ build: __FRANKY_DATE__">v__FRANKY_VERSION__</span>
                 </form>
             </div>
         </div>
+        <aside id="a2ui-panel" aria-label="A2UI surface" hidden>
+            <div class="dp-head">
+                <span class="dp-title">A2UI surface <code>main</code></span>
+                <button id="a2ui-panel-close" type="button" aria-label="Close A2UI panel">×</button>
+            </div>
+            <div id="a2ui-surface" class="a2ui-surface"></div>
+        </aside>
         <aside id="design-panel" aria-label="Design documents" hidden>
             <div class="dp-head">
                 <span class="dp-title">Design docs</span>
@@ -131,6 +139,7 @@ build: __FRANKY_DATE__">v__FRANKY_VERSION__</span>
         </div>
     </div>
     <script src="/prism.js"></script>
+    <script src="/a2ui.js"></script>
     <script src="/app.js"></script>
 </body>
 </html>

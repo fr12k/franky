@@ -101,6 +101,11 @@ pub const Settings = struct {
     /// memory save nudge guardrail. `null` = no setting (CLI default on).
     memory_nudge: ?bool = null,
 
+    /// v3.x — `tools.a2ui.enabled` — settings-layer toggle for the
+    /// A2UI generative-UI surface (proxy mode; PoC). `null` = no
+    /// setting (CLI default OFF applies).
+    a2ui_enabled: ?bool = null,
+
     /// `permissions.ask_all` — settings-layer default for the
     /// "ask before every tool call" toggle. CLI `--ask-tools all`
     /// still wins.
@@ -393,6 +398,12 @@ fn applyToolsSection(settings: *Settings, obj: std.json.ObjectMap) !void {
             }
             if (utils.jsonBool(mem_v, "nudge")) |b| {
                 settings.memory_nudge = b;
+            }
+        }
+        // v3.x — tools.a2ui.enabled
+        if (utils.jsonObj(tools_v, "a2ui")) |a2ui_v| {
+            if (utils.jsonBool(a2ui_v, "enabled")) |b| {
+                settings.a2ui_enabled = b;
             }
         }
     }

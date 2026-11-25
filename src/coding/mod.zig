@@ -19,7 +19,10 @@ pub const tools = struct {
     pub const memory_save = @import("tools/memory_save.zig");
     pub const memory_delete = @import("tools/memory_delete.zig");
     pub const memory_list = @import("tools/memory_list.zig");
+    pub const a2ui_render = @import("tools/a2ui_render.zig");
 };
+
+pub const a2ui = @import("a2ui.zig");
 
 pub const modes = struct {
     pub const print = @import("modes/print.zig");

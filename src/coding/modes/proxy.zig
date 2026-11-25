@@ -71,6 +71,7 @@ const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const review_mod = @import("../review.zig");
 const sse_mod = @import("../sse.zig");
+const a2ui_render_tool = @import("../tools/a2ui_render.zig");
 const compression_mod = franky.coding.compression;
 const config_mod = franky.coding.config.resolver;
 const memory_mod = franky.coding.memory;
@@ -98,6 +99,14 @@ const web_prism_js = @embedFile("web/prism.js");
 const web_prism_css = @embedFile("web/prism-tomorrow.css");
 const web_htmx_js = @embedFile("web/htmx.min.js");
 const web_hx_sse_js = @embedFile("web/hx-sse.min.js");
+/// A2UI PoC renderer page — served at `/a2ui.html` only when the
+/// A2UI surface is enabled (`--a2ui` / `tools.a2ui.enabled`).
+const web_a2ui_html = @embedFile("web/a2ui.html");
+/// A2UI renderer module embedded into the main chat window (the
+/// `▦` panel). Always served — app.js feature-detects `--a2ui` via
+/// a HEAD probe on /a2ui.html before initializing it.
+const web_a2ui_js = @embedFile("web/a2ui.js");
+const a2ui_mod = franky.coding.a2ui;
 
 /// Compile-time patching of the embedded `index.html`: swaps the
 /// `__FRANKY_VERSION__` / `__FRANKY_COMMIT__` / `__FRANKY_DATE__`
@@ -109,9 +118,11 @@ fn patchVersion(html: []const u8) []const u8 {
     return replaceSentinel(
         replaceSentinel(
             replaceSentinel(html, "__FRANKY_VERSION__", franky.version),
-            "__FRANKY_COMMIT__", franky.commit,
+            "__FRANKY_COMMIT__",
+            franky.commit,
         ),
-        "__FRANKY_DATE__", franky.build_date,
+        "__FRANKY_DATE__",
+        franky.build_date,
     );
 }
 
@@ -278,7 +289,6 @@ pub fn run(
     }
 }
 
-
 /// Accept loop — blocks accepting HTTP connections and dispatching
 /// them to handleConnection. Made public so --mode worker can spawn
 /// it in a background thread with zero code duplication.
@@ -316,7 +326,6 @@ pub fn runAcceptLoop(
         session.broadcastEvent(allocator, "event: close\ndata: {}\n\n");
     }
 }
-
 
 // ─── session ─────────────────────────────────────────────────────
 
@@ -510,6 +519,17 @@ pub const Session = struct {
     /// and crashing on a freed session pointer in ReleaseFast mode.
     pending_retry_worker: ?std.Thread = null,
 
+    /// v3.x — A2UI PoC state (surface components + data model).
+    /// Always initialized (cheap); only wired to endpoints + the
+    /// `a2ui_render` tool when `cfg.a2ui_enabled` is set.
+    a2ui_state: a2ui_mod.Session,
+    /// Per-turn thinking-delta buffer for the A2UI ThinkingBlock
+    /// projection (lazily allocated; plan 4.7).
+    a2ui_thinking: ?*A2uiThinkingBuf = null,
+    /// Active `/a2ui/events` subscribers — separate pool from
+    /// `subs` so A2UI clients don't compete with the chat UI.
+    a2ui_subs: [max_subs]?*SseSubscriber = @splat(null),
+
     /// Active `/events` subscribers. Capped at `max_subs` so a
     /// runaway client doesn't unbounded-allocate the listener.
     subs: [max_subs]?*SseSubscriber = @splat(null),
@@ -575,6 +595,36 @@ pub const Session = struct {
                 self.allocator.free(entry.frame);
                 if (entry.html_frame) |hf| self.allocator.free(hf);
             }
+        }
+        if (self.a2ui_thinking) |b| {
+            b.deinit(self.allocator);
+            self.allocator.destroy(b);
+        }
+        self.a2ui_state.deinit();
+    }
+
+    /// A2UI broadcast trampoline — `a2ui_mod.Session.BroadcastFn`
+    /// with `userdata` cast back to the proxy `Session`. Copies the
+    /// frame onto the session allocator, fans it out to
+    /// `/a2ui/events` subscribers under `events_mutex`, then frees.
+    fn a2uiBroadcastTrampoline(userdata: *anyopaque, frame: []const u8) void {
+        const self: *Session = @ptrCast(@alignCast(userdata));
+        const copy = self.allocator.dupe(u8, frame) catch return;
+        defer self.allocator.free(copy);
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
+        for (self.a2ui_subs[0..]) |maybe| {
+            const sub = maybe orelse continue;
+            if (sub.closed.load(.acquire)) continue;
+            var buf: [256]u8 = undefined;
+            var w = sub.stream.writer(sub.io, &buf);
+            w.interface.writeAll(copy) catch {
+                sub.close();
+                continue;
+            };
+            w.interface.flush() catch {
+                sub.close();
+            };
         }
     }
 
@@ -796,6 +846,17 @@ pub fn initSession(
         print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
         print_mode.applyRetrySettingsOverlay(cfg, &settings);
         max_full_tool_results = settings.max_full_tool_results orelse 0; // v2.16 — pre-render the review config block for system-prompt injection.
+        // v3.x — A2UI settings overlay (`tools.a2ui.enabled`). CLI
+        // `--a2ui` / `--no-a2ui` wins when explicitly passed; settings
+        // flips the default otherwise. Since `a2ui_enabled` defaults
+        // to false and `--a2ui` sets true, "settings only when not
+        // already enabled by CLI" gives the right precedence for the
+        // common case; `--no-a2ui` is indistinguishable from the
+        // default (both false), so an explicit `--no-a2ui` cannot
+        // override a `true` setting — acceptable for the PoC.
+        if (settings.a2ui_enabled) |v| {
+            if (!cfg.a2ui_enabled) cfg.a2ui_enabled = v;
+        }
         // Only populate when profiles are configured so the block is non-empty.
         if (settings.review_profiles.len > 0) {
             const ca = cfg.arena.allocator();
@@ -872,6 +933,7 @@ pub fn initSession(
         .max_full_tool_results = max_full_tool_results,
         .tool_usage = std.StringHashMap(u32).init(allocator),
         .ccr_store = compression_mod.CcrSessionStore.init(allocator, io),
+        .a2ui_state = a2ui_mod.Session.init(allocator, io),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.compression_ctx.ccr_store = &session.ccr_store;
@@ -962,14 +1024,21 @@ pub fn initSession(
     {
         const ra_mcp = session.role_arena.allocator();
         session.tools = try config_mod.discoverMcpTools(
-            ra_mcp, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+            ra_mcp,
+            io,
+            cfg,
+            session.environ_map,
+            session.tools,
+            &session.mcp_client,
         );
     }
     // v3.x — auto-mode MCP pre-filter: remove destructive MCP tools.
     if (permission_store.auto_enabled) {
         const ra_pf = session.role_arena.allocator();
         session.tools = try config_mod.filterMcpToolsForAutoMode(
-            ra_pf, session.tools, &permission_store,
+            ra_pf,
+            session.tools,
+            &permission_store,
         );
     }
     // No resume_loaded cleanup — SessionState.init() handled
@@ -1119,7 +1188,26 @@ pub fn initSession(
         session.tools = final_tools;
     }
 
-    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+    // v3.x — A2UI PoC wiring (off by default; `--a2ui` /
+    // `tools.a2ui.enabled`). Appends the `a2ui_render` tool, points
+    // the A2UI session state at the SSE broadcast trampoline, and
+    // extends the system prompt with the A2UI instructions.
+    if (cfg.a2ui_enabled) {
+        const ra = session.role_arena.allocator();
+        const extended = try ra.alloc(at.AgentTool, session.tools.len + 1);
+        @memcpy(extended[0..session.tools.len], session.tools);
+        extended[session.tools.len] = tools_mod.a2ui_render.tool(&session.a2ui_state);
+        session.tools = extended;
+
+        session.a2ui_state.setBroadcast(@ptrCast(session), Session.a2uiBroadcastTrampoline);
+
+        const base_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+        defer allocator.free(base_prompt);
+        const trimmed = std.mem.trimEnd(u8, base_prompt, &std.ascii.whitespace);
+        session.system_prompt = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ trimmed, a2ui_mod.system_prompt_block });
+    } else {
+        session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+    }
 }
 
 // ─── §J + v1.7.3: server-side slash command registry ───────────
@@ -1310,7 +1398,6 @@ fn skillsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!voi
     try ctx.output.appendSlice(ctx.allocator, text);
     try ctx.output.appendSlice(ctx.allocator, "```\n");
 }
-
 
 fn costHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
     const px = proxySlashCtx(ctx);
@@ -1888,6 +1975,23 @@ fn computeTitle(transcript: *const agent.loop.Transcript) []const u8 {
 }
 
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
+    // Diagnostic hook for the A2UI PoC: when
+    // `FRANKY_FAUX_LOG_TOOLS=1`, log the tool names the model was
+    // offered so e2e runs can assert `a2ui_render` is registered.
+    const em: ?*const std.process.Environ.Map = ctx.options.environ_map;
+    const flag: ?[]const u8 = if (em) |m| m.get("FRANKY_FAUX_LOG_TOOLS") else null;
+    if (flag) |v| {
+        if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+            var names: std.ArrayList(u8) = .empty;
+            defer names.deinit(ctx.allocator);
+            for (ctx.context.tools, 0..) |t, i| {
+                if (i > 0) names.appendSlice(ctx.allocator, ",") catch {};
+                names.appendSlice(ctx.allocator, t.name) catch {};
+            }
+            const has_a2ui_prompt = std.mem.indexOf(u8, ctx.context.system_prompt, "A2UI") != null;
+            ai.log.log(.info, "proxy", "faux.tools", "tools=[{s}] a2ui_prompt={}", .{ names.items, has_a2ui_prompt });
+        }
+    }
     const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try fp.runSync(ctx.io, ctx.context, ctx.out);
 }
@@ -1960,10 +2064,16 @@ fn handleConnection(arg: ConnArg) void {
         return;
     };
     const headers = hdr_buf[0..hdr_len.consumed];
-    const req = sse_mod.parseRequest(headers) orelse {
+    var req = sse_mod.parseRequest(headers) orelse {
         sse_mod.respondStatus(&stream, arg.io, 400, "Bad Request");
         return;
     };
+    // HEAD is GET minus the body (RFC 9110). Normalizing here
+    // keeps read-only endpoints probeable — the A2UI feature-detect in
+    // app.js HEADs /a2ui.html — without touching every route. The SSE
+    // routes below are matched before any static asset, so a HEAD
+    // probe can never hijack a stream.
+    if (std.mem.eql(u8, req.method, "HEAD")) req.method = "GET";
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/health")) {
         sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true}");
@@ -2048,6 +2158,22 @@ fn handleConnection(arg: ConnArg) void {
             return;
         }
     }
+    // ── A2UI PoC endpoints (only when enabled) ───────────────────
+    if (arg.session.cfg.a2ui_enabled) {
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/a2ui/events")) {
+            runA2uiSseStream(arg.session, &stream, arg.io, req.last_event_id orelse 0);
+            return;
+        }
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/a2ui/action")) {
+            const carry = hdr_buf[hdr_len.consumed..hdr_len.total];
+            respondA2uiAction(arg.session, &stream, arg.io, arg.allocator, req, carry);
+            return;
+        }
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/a2ui.html")) {
+            respondAsset(&stream, arg.io, web_a2ui_html, "text/html; charset=utf-8");
+            return;
+        }
+    }
     if (std.mem.eql(u8, req.method, "GET") and (std.mem.eql(u8, req.path, "/events") or std.mem.startsWith(u8, req.path, "/events?"))) {
         // Detect ?html=1 to switch the SSE stream to htmx hx-sse mode
         // (HTML frames with OOB swaps instead of JSON).
@@ -2078,6 +2204,10 @@ fn handleConnection(arg: ConnArg) void {
         }
         if (std.mem.eql(u8, req.path, "/app.js")) {
             respondAsset(&stream, arg.io, web_app_js, "text/javascript; charset=utf-8");
+            return;
+        }
+        if (std.mem.eql(u8, req.path, "/a2ui.js")) {
+            respondAsset(&stream, arg.io, web_a2ui_js, "text/javascript; charset=utf-8");
             return;
         }
         if (std.mem.eql(u8, req.path, "/style.css")) {
@@ -2242,6 +2372,653 @@ fn writeReplayGap(
     ) catch return;
     defer allocator.free(frame);
     writeReplayFrame(sub, frame);
+}
+
+// ─── A2UI PoC: /a2ui/events + /a2ui/action ───────────────────────
+
+/// SSE stream of A2UI envelopes. On connect (or when the client's
+/// `Last-Event-ID` is behind the current surface version) sends a
+/// synthetic `a2ui_snapshot` frame with the full surface state —
+/// the surface is fully described by the latest
+/// `updateComponents`/`updateDataModel`, so a snapshot is always a
+/// sufficient catch-up (no replay ring needed for the PoC).
+fn runA2uiSseStream(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    last_event_id: u64,
+) void {
+    const preamble =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "\r\n" ++
+        ": connected\n\n";
+    var pre_buf: [256]u8 = undefined;
+    var pw = stream.writer(io, &pre_buf);
+    pw.interface.writeAll(preamble) catch return;
+    pw.interface.flush() catch return;
+
+    var sub = SseSubscriber{ .stream = stream.*, .io = io };
+
+    // Catch-up + register under events_mutex so a broadcast can't
+    // slip between the catch-up and the live registration. Plan 4.2:
+    // a Last-Event-ID that still falls inside the replay ring replays
+    // the missed envelopes; anything older gets a full snapshot.
+    {
+        session.events_mutex.lockUncancelable(io);
+        defer session.events_mutex.unlock(io);
+
+        if (session.a2ui_state.currentVersion() > last_event_id) {
+            var replay: std.Io.Writer.Allocating = .init(session.allocator);
+            defer replay.deinit();
+            const covered = session.a2ui_state.replaySince(last_event_id, &replay) catch false;
+            if (covered and replay.written().len > 0) {
+                var wb: [256]u8 = undefined;
+                var w = stream.writer(io, &wb);
+                w.interface.writeAll(replay.written()) catch return;
+                w.interface.flush() catch return;
+            } else if (!covered or last_event_id == 0) {
+                const snap = session.a2ui_state.renderSnapshotJson(session.allocator) catch null;
+                if (snap) |s| {
+                    defer session.allocator.free(s);
+                    var out: std.Io.Writer.Allocating = .init(session.allocator);
+                    defer out.deinit();
+                    out.writer.print("id: {d}\nevent: a2ui_snapshot\ndata: {s}\n\n", .{ session.a2ui_state.currentVersion(), s }) catch {};
+                    var wb: [256]u8 = undefined;
+                    var w = stream.writer(io, &wb);
+                    w.interface.writeAll(out.written()) catch return;
+                    w.interface.flush() catch return;
+                }
+            }
+        }
+
+        // Register in the dedicated A2UI pool.
+        var added = false;
+        for (session.a2ui_subs[0..], 0..) |s, i| {
+            if (s == null) {
+                session.a2ui_subs[i] = &sub;
+                added = true;
+                break;
+            }
+        }
+        if (!added) {
+            const msg = "event: error\ndata: {\"kind\":\"error\",\"message\":\"too many A2UI subscribers\"}\n\n";
+            var eb: [256]u8 = undefined;
+            var ew = stream.writer(io, &eb);
+            ew.interface.writeAll(msg) catch {};
+            ew.interface.flush() catch {};
+            return;
+        }
+    }
+    defer {
+        session.events_mutex.lockUncancelable(io);
+        defer session.events_mutex.unlock(io);
+        for (session.a2ui_subs[0..], 0..) |s, i| {
+            if (s == &sub) {
+                session.a2ui_subs[i] = null;
+                break;
+            }
+        }
+    }
+
+    // Block until the client disconnects.
+    var sink: [512]u8 = undefined;
+    var r = stream.reader(io, &.{});
+    while (!sub.closed.load(.acquire)) {
+        var vecs: [1][]u8 = .{&sink};
+        const n = r.interface.readVec(&vecs) catch break;
+        if (n == 0) break;
+    }
+}
+
+/// `POST /a2ui/action` — renderer→agent `action` message. Appends a
+/// synthetic user message to the transcript and runs a normal agent
+/// turn, single-flighted on `run_mutex` like `/prompt`.
+fn respondA2uiAction(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    req: sse_mod.Request,
+    carry: []const u8,
+) void {
+    const max_body: usize = 64 * 1024;
+    const want = if (req.content_length) |cl| @min(cl, max_body) else max_body;
+
+    var body_buf: std.ArrayList(u8) = .empty;
+    defer body_buf.deinit(allocator);
+    body_buf.appendSlice(allocator, carry[0..@min(carry.len, want)]) catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    if (body_buf.items.len < want) {
+        var r = stream.reader(io, &.{});
+        var chunk: [4096]u8 = undefined;
+        while (body_buf.items.len < want) {
+            const remaining = want - body_buf.items.len;
+            var vecs: [1][]u8 = .{chunk[0..@min(chunk.len, remaining)]};
+            const n = r.interface.readVec(&vecs) catch break;
+            if (n == 0) break;
+            body_buf.appendSlice(allocator, chunk[0..n]) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, a, body_buf.items, .{}) catch {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"invalid JSON\"}");
+        return;
+    };
+    const action = blk: {
+        if (parsed.value != .object) break :blk null;
+        break :blk parsed.value.object.get("action");
+    } orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"missing \\\"action\\\" object\"}");
+        return;
+    };
+    if (action != .object) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"action must be an object\"}");
+        return;
+    }
+    const name_v = action.object.get("name") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"action.name is required\"}");
+        return;
+    };
+    if (name_v != .string or name_v.string.len == 0) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"action.name must be a non-empty string\"}");
+        return;
+    }
+
+    // §4.4 — `permission_decision` actions are consumed by the
+    // permission gate, not forwarded to the model.
+    if (std.mem.eql(u8, name_v.string, "permission_decision")) {
+        if (a2uiHandlePermissionDecision(session, stream, io, allocator, action)) return;
+        return; // unreachable today: the handler always responds
+    }
+
+    // Build the transcript-facing text: action name + userMessage +
+    // resolved context (already resolved renderer-side per spec).
+    var msg: std.Io.Writer.Allocating = .init(a);
+    msg.writer.print("[A2UI action] name={s}", .{name_v.string}) catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    if (action.object.get("userMessage")) |um| {
+        if (um == .string and um.string.len > 0)
+            msg.writer.print(" userMessage=\"{s}\"", .{um.string}) catch {};
+    }
+    if (action.object.get("context")) |ctx_v| {
+        msg.writer.writeAll(" context=") catch {};
+        std.json.Stringify.value(ctx_v, .{}, &msg.writer) catch {};
+    }
+    const text = msg.written();
+
+    session.run_mutex.lockUncancelable(io);
+    defer session.run_mutex.unlock(io);
+
+    sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
+    runOneTurn(session, allocator, io, text);
+}
+
+/// §4.4 — render a `tool_permission_request` as an A2UI form. The
+/// card is host-injected via `upsertComponents` (no LLM involvement);
+/// its Buttons fire the reserved `permission_decision` action which
+/// `respondA2uiAction` routes to `PermissionPrompter.resolve`. Ids
+/// are prefixed `perm_<call_id>_` so concurrent prompts and model UI
+/// can't collide; `respondA2uiAction` removes the card after a
+/// decision lands.
+fn a2uiProjectPermissionRequest(
+    session: *Session,
+    allocator: std.mem.Allocator,
+    req: anytype,
+) void {
+    const aid = sanitizeA2uiId(allocator, req.call_id) catch return;
+    defer allocator.free(aid);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.writeAll("[") catch return;
+    w.print("{{\"id\":\"perm_{s}\",\"component\":\"Card\",\"title\":\"Permission required: {s}\",\"subtitle\":", .{ aid, req.tool_name }) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, req.args_json) catch return;
+    w.print(",\"children\":[\"perm_{s}_remember\",\"perm_{s}_row\"]}}", .{ aid, aid }) catch return;
+    w.print(",{{\"id\":\"perm_{s}_remember\",\"component\":\"CheckBox\",\"label\":\"Remember this decision for future requests\",\"checked\":{{\"@path\":\"/perm/{s}/remember\"}}}}", .{ aid, aid }) catch return;
+    w.print(",{{\"id\":\"perm_{s}_row\",\"component\":\"Row\",\"children\":[\"perm_{s}_allow\",\"perm_{s}_deny\"]}}", .{ aid, aid, aid }) catch return;
+    w.print(",{{\"id\":\"perm_{s}_allow\",\"component\":\"Button\",\"label\":\"Allow\",\"action\":{{\"event\":{{\"name\":\"permission_decision\",\"userMessage\":\"Allow {s}\",\"context\":{{\"call_id\":", .{ aid, req.tool_name }) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, req.call_id) catch return;
+    w.print(",\"decision\":\"allow\",\"remember\":{{\"@path\":\"/perm/{s}/remember\"}}}}}}}}}}", .{aid}) catch return;
+    w.print(",{{\"id\":\"perm_{s}_deny\",\"component\":\"Button\",\"label\":\"Deny\",\"action\":{{\"event\":{{\"name\":\"permission_decision\",\"userMessage\":\"Deny {s}\",\"context\":{{\"call_id\":", .{ aid, req.tool_name }) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, req.call_id) catch return;
+    w.print(",\"decision\":\"deny\",\"remember\":{{\"@path\":\"/perm/{s}/remember\"}}}}}}}}}}", .{aid}) catch return;
+    w.writeAll("]") catch return;
+
+    // A validation failure here is a programming error (the batch is
+    // constructed above), not user input — log and move on rather
+    // than blocking the permission gate.
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.perm_project", "permission form rejected: {s}", .{err_msg});
+    }
+}
+
+/// Component ids are embedded in data-model paths (`/perm/<id>/…`),
+/// where `/` and `~` are RFC 6901 escapes — replace them (and other
+/// non-alphanumerics) so generated ids stay single path segments.
+fn sanitizeA2uiId(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, s);
+    for (out) |*ch| {
+        const ok = (ch.* >= 'a' and ch.* <= 'z') or
+            (ch.* >= 'A' and ch.* <= 'Z') or
+            (ch.* >= '0' and ch.* <= '9') or
+            ch.* == '-' or ch.* == '_';
+        if (!ok) ch.* = '_';
+    }
+    return out;
+}
+
+/// Plan 4.7 — project a `tool_execution_start` event as a running
+/// ToolCall card. Ids are `tool_<call_id>`; the card attaches to the
+/// model's "root" container when one exists (upsert replaces the
+/// root def, preserving its other children) and renders as an
+/// unattached top-level component otherwise. `a2uiProjectToolEnd`
+/// updates the same card in place.
+fn a2uiProjectToolStart(
+    session: *Session,
+    allocator: std.mem.Allocator,
+    ev: anytype,
+) void {
+    const aid = sanitizeA2uiId(allocator, ev.call_id) catch return;
+    defer allocator.free(aid);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.writeAll("[") catch return;
+    w.print("{{\"id\":\"tool_{s}\",\"component\":\"ToolCall\",\"name\":", .{aid}) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, ev.name) catch return;
+    w.writeAll(",\"args\":") catch return;
+    a2ui_render_tool.jsonStringifyStr(w, truncateUtf8(ev.args_json, 300)) catch return;
+    w.writeAll(",\"status\":\"running\"}") catch return;
+
+    if (session.a2ui_state.snapshotComponents(a) catch null) |cur| {
+        if (a2uiFindRootChildList(cur)) |children| {
+            w.writeAll(",") catch return;
+            a2uiWriteRootWithChild(w, cur, children, a, aid) catch return;
+        }
+    }
+    w.writeAll("]") catch return;
+
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.tool_project", "tool card rejected: {s}", .{err_msg});
+    }
+}
+
+/// Plan 4.7 — flip a running ToolCall card to done/error and attach the
+/// (truncated) result text. Unknown call_id (card never projected)
+/// is ignored.
+fn a2uiProjectToolEnd(
+    session: *Session,
+    allocator: std.mem.Allocator,
+    ev: anytype,
+) void {
+    const aid = sanitizeA2uiId(allocator, ev.call_id) catch return;
+    defer allocator.free(aid);
+
+    // Skip when no card exists for this call (e.g. the start event
+    // predated --a2ui or projection failed).
+    const exists = blk: {
+        const cur = (session.a2ui_state.snapshotComponents(allocator) catch break :blk false) orelse break :blk false;
+        defer a2uiFreeSnapshot(allocator, cur);
+        break :blk a2uiFindComponent(cur, std.fmt.allocPrint(allocator, "tool_{s}", .{aid}) catch break :blk false, allocator) != null;
+    };
+    if (!exists) return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const status: []const u8 = if (ev.result.is_error) "error" else "done";
+    const result_text = truncateUtf8(a2uiFirstText(a, ev.result.content) orelse "", 600);
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.print("[{{\"id\":\"tool_{s}\",\"component\":\"ToolCall\",\"name\":", .{aid}) catch return;
+    const tool_name = a2uiToolNameFor(session, allocator, aid);
+    defer if (tool_name) |n| allocator.free(n);
+    a2ui_render_tool.jsonStringifyStr(w, tool_name orelse "tool") catch return;
+    w.writeAll(",\"result\":") catch return;
+    a2ui_render_tool.jsonStringifyStr(w, result_text) catch return;
+    w.print(",\"status\":\"{s}\"}}", .{status}) catch return;
+
+    // edit/write results carry a unified diff in details_json —
+    // project it as a Diff component under the card (plan 4.7).
+    var diff_block: ?A2uiDiff = null;
+    if (ev.result.details_json) |dj|
+        diff_block = a2uiParseDiffDetails(a, dj);
+    if (diff_block) |db| {
+        w.print(",{{\"id\":\"tool_{s}_diff\",\"component\":\"Diff\",\"diff\":", .{aid}) catch return;
+        a2ui_render_tool.jsonStringifyStr(w, db.diff) catch return;
+        if (db.path) |p| {
+            w.writeAll(",\"path\":") catch return;
+            a2ui_render_tool.jsonStringifyStr(w, p) catch return;
+        }
+        w.writeAll("}") catch return;
+    }
+    w.writeAll("]") catch return;
+
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.tool_project", "tool result rejected: {s}", .{err_msg});
+    }
+}
+
+/// JSON-safe truncation: cut on a byte boundary that keeps valid
+/// UTF-8 (a tool result may be megabytes; the card shows an excerpt).
+fn truncateUtf8(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    while (end > 0 and (s[end] & 0b1100_0000) == 0b1000_0000) end -= 1;
+    return s[0..end];
+}
+
+/// First text block of a tool result, arena-duped (borrowed content
+/// dies with the event).
+fn a2uiFirstText(a: std.mem.Allocator, content: []ai.types.ContentBlock) ?[]const u8 {
+    for (content) |b| {
+        switch (b) {
+            .text => |t| return a.dupe(u8, t.text) catch null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Find a component def by id in a snapshot array. `id` is freed by
+/// the caller-owned `alloc` — this helper frees its own copy.
+fn a2uiFindComponent(comps: std.json.Value, id: []const u8, alloc: std.mem.Allocator) ?std.json.Value {
+    defer alloc.free(id);
+    if (comps != .array) return null;
+    for (comps.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v == .string and std.mem.eql(u8, id_v.string, id)) return c;
+    }
+    return null;
+}
+
+/// The `children` array of the "root" component in a snapshot, or
+/// null when there is no root / it has no children list.
+fn a2uiFindRootChildList(comps: std.json.Value) ?std.json.Value {
+    if (comps != .array) return null;
+    for (comps.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v == .string and std.mem.eql(u8, id_v.string, "root")) {
+            if (c.object.get("children")) |ch| if (ch == .array) return ch;
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Serialize the root component with `aid` appended to `children`.
+/// `root` is located in `comps`; every other component is left
+/// untouched (upsert replaces only what we send).
+fn a2uiWriteRootWithChild(
+    w: *std.Io.Writer,
+    comps: std.json.Value,
+    children: std.json.Value,
+    a: std.mem.Allocator,
+    aid: []const u8,
+) !void {
+    _ = a;
+    if (comps != .array) return;
+    for (comps.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v != .string or !std.mem.eql(u8, id_v.string, "root")) continue;
+        // Skip if already attached (idempotent on duplicate start events).
+        for (children.array.items) |kid| {
+            if (kid == .string and std.mem.eql(u8, kid.string, std.fmt.allocPrint(std.heap.page_allocator, "tool_{s}", .{aid}) catch "")) return;
+        }
+        try w.writeAll("{\"id\":\"root\"");
+        var it = c.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "id") or std.mem.eql(u8, e.key_ptr.*, "children")) continue;
+            try w.print(",\"{s}\":", .{e.key_ptr.*});
+            try std.json.Stringify.value(e.value_ptr.*, .{}, w);
+        }
+        try w.writeAll(",\"children\":[");
+        for (children.array.items, 0..) |kid, i| {
+            if (i > 0) try w.writeAll(",");
+            try std.json.Stringify.value(kid, .{}, w);
+        }
+        try w.print(",\"tool_{s}\"]}}", .{aid});
+        return;
+    }
+}
+
+/// Free a snapshot returned by `snapshotComponents`.
+fn a2uiFreeSnapshot(allocator: std.mem.Allocator, v: std.json.Value) void {
+    a2ui_mod.freeCopy(allocator, v);
+}
+
+/// Recover the tool name for a card id from the current snapshot
+/// (tool_execution_end carries no name field).
+fn a2uiToolNameFor(session: *Session, allocator: std.mem.Allocator, aid: []const u8) ?[]const u8 {
+    const cur = (session.a2ui_state.snapshotComponents(allocator) catch return null) orelse return null;
+    defer a2uiFreeSnapshot(allocator, cur);
+    const id = std.fmt.allocPrint(allocator, "tool_{s}", .{aid}) catch return null;
+    defer allocator.free(id);
+    if (cur != .array) return null;
+    for (cur.array.items) |c| {
+        if (c != .object) continue;
+        const id_v = c.object.get("id") orelse continue;
+        if (id_v == .string and std.mem.eql(u8, id_v.string, id)) {
+            const n = c.object.get("name") orelse return null;
+            if (n != .string) return null;
+            return allocator.dupe(u8, n.string) catch null;
+        }
+    }
+    return null;
+}
+
+// ─── A2UI thinking / diff projections (plan 4.7) ─────────────────
+
+/// Buffers `thinking` deltas; each delta re-projects the
+/// ThinkingBlock. Cleared on turn_end. Owned by the Session.
+pub const A2uiThinkingBuf = struct {
+    text: std.ArrayList(u8) = .empty,
+    active: bool = false,
+    /// True once the ThinkingBlock + /stream/thinking path exist for
+    /// the current turn (append-only from then on).
+    seeded: bool = false,
+
+    pub fn deinit(self: *A2uiThinkingBuf, allocator: std.mem.Allocator) void {
+        self.text.deinit(allocator);
+    }
+};
+
+fn a2uiProjectThinkingDelta(session: *Session, allocator: std.mem.Allocator, d: anytype) void {
+    if (session.a2ui_thinking == null) {
+        // create() leaves the memory uninitialized — assign the
+        // default field values explicitly.
+        const b = session.allocator.create(A2uiThinkingBuf) catch return;
+        b.* = .{};
+        session.a2ui_thinking = b;
+    }
+    const buf = session.a2ui_thinking.?;
+    if (!buf.active) {
+        buf.text.clearRetainingCapacity();
+        buf.active = true;
+    }
+    const is_first = !buf.seeded;
+    if (is_first) buf.seeded = true;
+    buf.text.appendSlice(session.allocator, d.delta) catch return;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // First delta of the turn: (re)create the ThinkingBlock with a
+    // data-path binding and OVERWRITE the path via updateDataModel
+    // (last turn's text must not carry over). Subsequent deltas use
+    // appendDataModel — wire cost O(delta) instead of O(accumulated)
+    // per event (plan 7.2).
+    if (is_first) {
+        const comps = "[{\"id\":\"thinking\",\"component\":\"ThinkingBlock\",\"text\":{\"@path\":\"/stream/thinking\"}}]";
+        if (session.a2ui_state.upsertComponents(allocator, comps) catch null) |err_msg| {
+            defer allocator.free(err_msg);
+            ai.log.log(.warn, "proxy", "a2ui.thinking", "thinking block rejected: {s}", .{err_msg});
+        }
+    }
+    var env: std.Io.Writer.Allocating = .init(a);
+    if (is_first) {
+        env.writer.writeAll("{\"updateDataModel\":{\"data\":{\"stream\":{\"thinking\":") catch return;
+        a2ui_render_tool.jsonStringifyStr(&env.writer, truncateUtf8(d.delta, 4000)) catch return;
+        env.writer.writeAll("}}}}") catch return;
+    } else {
+        env.writer.writeAll("{\"appendDataModel\":{\"path\":\"/stream/thinking\",\"delta\":") catch return;
+        a2ui_render_tool.jsonStringifyStr(&env.writer, truncateUtf8(d.delta, 4000)) catch return;
+        env.writer.writeAll("}}") catch return;
+    }
+    const p = std.json.parseFromSlice(std.json.Value, a, env.written(), .{}) catch return;
+    if (session.a2ui_state.applyEnvelope(allocator, p.value) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.thinking", "thinking delta rejected: {s}", .{err_msg});
+    }
+}
+
+fn a2uiThinkingTurnEnd(session: *Session, allocator: std.mem.Allocator) void {
+    const buf = session.a2ui_thinking orelse return;
+    if (!buf.active) return;
+    // Collapse the block once the turn ends.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.writeAll("[{\"id\":\"thinking\",\"component\":\"ThinkingBlock\",\"text\":") catch return;
+    a2ui_render_tool.jsonStringifyStr(w, truncateUtf8(buf.text.items, 4000)) catch return;
+    w.writeAll(",\"collapsed\":true}]") catch return;
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg|
+        allocator.free(err_msg);
+    buf.text.clearRetainingCapacity();
+    buf.active = false;
+    buf.seeded = false;
+}
+
+/// Extract `diff` + `path` from an edit/write tool's details_json
+/// (unified-diff-v1 format). Strings borrow from the parsed value —
+/// callers stringify before the arena dies.
+const A2uiDiff = struct { diff: []const u8, path: ?[]const u8 };
+
+fn a2uiParseDiffDetails(a: std.mem.Allocator, details_json: []const u8) ?A2uiDiff {
+    const parsed = std.json.parseFromSlice(std.json.Value, a, details_json, .{}) catch return null;
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    const diff_v = obj.get("diff") orelse return null;
+    if (diff_v != .string or diff_v.string.len == 0) return null;
+    // Tolerate a missing/legacy format (same contract as app.js),
+    // but reject formats we don't understand.
+    if (obj.get("format")) |f| {
+        if (f != .string or !std.mem.eql(u8, f.string, "unified-diff-v1")) return null;
+    }
+    const path: ?[]const u8 = if (obj.get("path")) |p| (if (p == .string) p.string else null) else null;
+    return .{ .diff = diff_v.string, .path = path };
+}
+
+/// §4.4 — handle a `permission_decision` A2UI action: resolve the
+/// pending prompt, remove the form card from the surface. Returns
+/// true when the action was consumed (caller skips the LLM turn).
+fn a2uiHandlePermissionDecision(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    action: std.json.Value,
+) bool {
+    const ctx = action.object.get("context") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"permission_decision requires a context object\"}");
+        return true;
+    };
+    if (ctx != .object) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context must be an object\"}");
+        return true;
+    }
+    const call_id_v = ctx.object.get("call_id") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.call_id is required\"}");
+        return true;
+    };
+    const decision_v = ctx.object.get("decision") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.decision is required\"}");
+        return true;
+    };
+    if (call_id_v != .string or decision_v != .string) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.call_id / context.decision must be strings\"}");
+        return true;
+    }
+    const remember = if (ctx.object.get("remember")) |r| r == .bool and r.bool else false;
+    const allow = std.mem.eql(u8, decision_v.string, "allow");
+    const resolution_str: []const u8 = if (allow)
+        (if (remember) "always_allow" else "allow_once")
+    else if (std.mem.eql(u8, decision_v.string, "deny"))
+        (if (remember) "always_deny" else "deny_once")
+    else {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.decision must be \\\"allow\\\" or \\\"deny\\\"\"}");
+        return true;
+    };
+    const resolution = permissions_mod.Resolution.fromString(resolution_str).?;
+
+    session.resolve_mutex.lockUncancelable(io);
+    defer session.resolve_mutex.unlock(io);
+
+    const prompter = session.current_prompter orelse {
+        sse_mod.respondJson(stream, io, 409, "{\"ok\":false,\"error\":\"no in-flight permission request\"}");
+        return true;
+    };
+    prompter.resolve(call_id_v.string, resolution) catch {
+        sse_mod.respondJson(stream, io, 404, "{\"ok\":false,\"error\":\"stale or unknown call_id\"}");
+        return true;
+    };
+    sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
+
+    // Best-effort cleanup of the form card. Recompute the id the
+    // same way `a2uiProjectPermissionRequest` did.
+    const aid = sanitizeA2uiId(allocator, call_id_v.string) catch return true;
+    defer allocator.free(aid);
+    const ids = [_][]const u8{
+        std.fmt.allocPrint(allocator, "perm_{s}", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_remember", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_row", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_allow", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_deny", .{aid}) catch return true,
+    };
+    defer for (ids) |x| allocator.free(x);
+    session.a2ui_state.removeComponents(allocator, &ids) catch {};
+    return true;
+}
+
+test "sanitizeA2uiId replaces RFC 6901 / non-alphanumeric characters" {
+    const t = @import("std").testing;
+    const out = try sanitizeA2uiId(t.allocator, "call/a~b c-d_e");
+    defer t.allocator.free(out);
+    try t.expectEqualStrings("call_a_b_c-d_e", out);
 }
 
 // ─── /prompt ─────────────────────────────────────────────────────
@@ -2504,6 +3281,22 @@ fn runOneTurnInternal(
             continue;
         };
         defer allocator.free(frame);
+        // §4.4 — project tool-permission requests into the A2UI
+        // surface as an interactive form (off unless `--a2ui`).
+        if (session.cfg.a2ui_enabled and ev == .tool_permission_request)
+            a2uiProjectPermissionRequest(session, allocator, ev.tool_permission_request);
+        // Plan 4.7 — project tool executions as ToolCall cards.
+        if (session.cfg.a2ui_enabled and ev == .tool_execution_start)
+            a2uiProjectToolStart(session, allocator, ev.tool_execution_start);
+        if (session.cfg.a2ui_enabled and ev == .tool_execution_end)
+            a2uiProjectToolEnd(session, allocator, ev.tool_execution_end);
+        // Plan 4.7 — stream thinking deltas into a ThinkingBlock,
+        // collapse it when the turn ends.
+        if (session.cfg.a2ui_enabled and ev == .message_update and ev.message_update == .thinking)
+            a2uiProjectThinkingDelta(session, allocator, ev.message_update.thinking);
+        if (session.cfg.a2ui_enabled and ev == .turn_end)
+            a2uiThinkingTurnEnd(session, allocator);
+
         // Render the HTML frame too when an htmx subscriber is connected.
         // The frame is rendered before ev.deinit frees owned strings.
         if (session.hasHtmlSubscriber()) {
@@ -2762,7 +3555,6 @@ fn writeMessageForUi(
     try buf.append(allocator, '}');
 }
 
-
 // ─── §H.4 + v1.7.0: session-management routes ───────────────────
 
 /// `GET /session` — return the active session's id + the count of
@@ -2860,7 +3652,7 @@ fn respondUsage(
     var cum_output: u64 = 0;
     for (session.transcript.messages.items) |m| {
         if (m.usage) |u| {
-            cum_input = u.input;  // last wins — API reports total context
+            cum_input = u.input; // last wins — API reports total context
             cum_output += u.output;
         }
     }
@@ -4052,6 +4844,7 @@ fn initSessionForTestWithDir(
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .tool_usage = std.StringHashMap(u32).init(allocator),
         .ccr_store = compression_mod.CcrSessionStore.init(allocator, io),
+        .a2ui_state = a2ui_mod.Session.init(allocator, io),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.compression_ctx.ccr_store = &session.ccr_store;
@@ -5509,6 +6302,294 @@ test "proxy: POST /permission/resolve with a wired prompter succeeds + wakes the
     try testing.expectEqual(permissions_mod.Resolution.allow_once, worker.result.?);
 }
 
+test "proxy: POST /a2ui/action permission_decision resolves the pending prompt + clears the card" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return;
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    // Seed the surface with a root so the injected card attaches.
+    const seed =
+        \\{"updateComponents":{"components":[
+        \\  {"id":"root","component":"Column","children":["t"]},
+        \\  {"id":"t","component":"Text","text":"hi"}
+        \\]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, seed, .{});
+    defer parsed.deinit();
+    try testing.expect((try ts.session.a2ui_state.applyEnvelope(gpa, parsed.value)) == null);
+
+    // Wire a prompter + suspended worker like the /permission/resolve
+    // test. NOTE: heap-allocate the prompter — it is freed AFTER the
+    // worker thread joins (deinit zeroes the struct, and a resolved
+    // worker may still be signaling its condition variable while the
+    // main thread unwinds; the join order makes that safe).
+    var ch = try agent.loop.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
+    defer ch.deinit();
+    const prompter = try gpa.create(permissions_mod.PermissionPrompter);
+    prompter.* = permissions_mod.PermissionPrompter.init(gpa, io, &ch);
+    ts.session.current_prompter = prompter;
+    defer ts.session.current_prompter = null;
+    var worker_joined = false;
+    defer if (!worker_joined) {
+        prompter.deinit();
+        gpa.destroy(prompter);
+    };
+
+    const Worker = struct {
+        result: ?permissions_mod.Resolution = null,
+        prompter: *permissions_mod.PermissionPrompter,
+
+        fn run(self: *@This()) void {
+            self.result = self.prompter.requestAndWait("bash", "c1", "{\"command\":\"git status\"}") catch null;
+        }
+    };
+    var worker = Worker{ .prompter = prompter };
+    const wt = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+
+    var ev = ch.next(io).?;
+    try testing.expect(ev == .tool_permission_request);
+    const req_ev = ev.tool_permission_request;
+    // Project the event into the A2UI surface (what the runOneTurn
+    // drain loop does in production).
+    a2uiProjectPermissionRequest(&ts.session, gpa, req_ev);
+    ev.deinit(gpa);
+
+    const snap1 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap1);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"perm_c1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "permission_decision") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "Remember this decision") != null);
+
+    // User clicks "Allow" with the remember checkbox ticked.
+    const body =
+        \\{"version":"1.0","action":{"name":"permission_decision","surfaceId":"main",
+        \\ "sourceComponentId":"perm_c1_allow","timestamp":"2026-11-25T00:00:00Z",
+        \\ "context":{"call_id":"c1","decision":"allow","remember":true}}}
+    ;
+    const req = try std.fmt.allocPrint(
+        gpa,
+        "POST /a2ui/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer gpa.free(req);
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
+    wt.join();
+    // Worker finished — safe to tear the prompter down now (no
+    // pending slots, no one signaling).
+    worker_joined = true;
+    prompter.deinit();
+    gpa.destroy(prompter);
+
+    try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
+    try testing.expectEqual(permissions_mod.Resolution.always_allow, worker.result.?);
+
+    // The permission card was removed; the model UI survived.
+    const snap2 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"perm_c1\"") == null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"hi\"") != null);
+    // No LLM turn ran — the action was consumed by the gate.
+    try testing.expectEqual(@as(usize, 0), ts.session.transcript.messages.items.len);
+}
+
+test "proxy: POST /a2ui/action permission_decision without a pending prompt returns 409" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return;
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    const body =
+        \\{"version":"1.0","action":{"name":"permission_decision","surfaceId":"main",
+        \\ "context":{"call_id":"nope","decision":"deny","remember":false}}}
+    ;
+    const req = try std.fmt.allocPrint(
+        gpa,
+        "POST /a2ui/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer gpa.free(req);
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 409") != null);
+}
+
+test "proxy: A2UI tool-call projection — running card flips to done with result" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    // Model-rendered root so the card attaches to the tree.
+    const seed =
+        \\{"updateComponents":{"components":[
+        \\  {"id":"root","component":"Column","children":["t"]},
+        \\  {"id":"t","component":"Text","text":"hi"}
+        \\]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, seed, .{});
+    defer parsed.deinit();
+    try testing.expect((try ts.session.a2ui_state.applyEnvelope(gpa, parsed.value)) == null);
+
+    // tool_execution_start → running card attached to root.
+    a2uiProjectToolStart(&ts.session, gpa, .{
+        .call_id = "c9",
+        .name = "bash",
+        .args_json = "{\"command\":\"ls\"}",
+    });
+    const snap1 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap1);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"tool_c9\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"status\":\"running\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"name\":\"bash\"") != null);
+    // root's children gained the card.
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"tool_c9\"]") != null);
+
+    // tool_execution_end → same card flips to done with the result.
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "build.zig src") } };
+    var result: at.ToolResult = .{ .content = content };
+    defer result.deinit(gpa);
+    a2uiProjectToolEnd(&ts.session, gpa, .{
+        .call_id = "c9",
+        .result = result,
+    });
+    const snap2 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"status\":\"done\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "build.zig src") != null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"running\"") == null);
+
+    // End for an unknown call_id is a no-op (no crash, no new card).
+    a2uiProjectToolEnd(&ts.session, gpa, .{
+        .call_id = "nope",
+        .result = result,
+    });
+    const snap3 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap3);
+    try testing.expect(std.mem.indexOf(u8, snap3, "\"tool_nope\"") == null);
+}
+
+test "proxy: A2UI tool-call projection — no model root renders unattached" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    a2uiProjectToolStart(&ts.session, gpa, .{
+        .call_id = "c1",
+        .name = "grep",
+        .args_json = "{\"pattern\":\"foo\"}",
+    });
+    const snap = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"tool_c1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"name\":\"grep\"") != null);
+}
+
+test "proxy: A2UI thinking block streams deltas and collapses on turn_end" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    a2uiProjectThinkingDelta(&ts.session, gpa, .{ .block_index = 0, .delta = "let me " });
+    a2uiProjectThinkingDelta(&ts.session, gpa, .{ .block_index = 0, .delta = "think" });
+    const snap1 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap1);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"ThinkingBlock\"") != null);
+    // Text lives in the data model (path-bound), accumulated by appends.
+    try testing.expect(std.mem.indexOf(u8, snap1, "let me think") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"/stream/thinking\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"collapsed\"") == null);
+
+    a2uiThinkingTurnEnd(&ts.session, gpa);
+    const snap2 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"collapsed\":true") != null);
+
+    // Next turn starts fresh: new deltas replace the streamed text.
+    a2uiProjectThinkingDelta(&ts.session, gpa, .{ .block_index = 0, .delta = "new" });
+    const snap3 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap3);
+    try testing.expect(std.mem.indexOf(u8, snap3, "\"new\"") != null);
+}
+
+test "proxy: A2UI diff projection from edit details_json" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    a2uiProjectToolStart(&ts.session, gpa, .{
+        .call_id = "e1",
+        .name = "edit",
+        .args_json = "{\"path\":\"a.zig\"}",
+    });
+    const content = try gpa.alloc(ai.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try gpa.dupe(u8, "edited a.zig") } };
+    var result: at.ToolResult = .{
+        .content = content,
+        .details_json = try gpa.dupe(u8, "{\"edits\":1,\"format\":\"unified-diff-v1\",\"diff\":\"--- a/a.zig\\n+++ b/a.zig\\n@@ -1 +1 @@\\n-old\\n+new\",\"path\":\"a.zig\"}"),
+    };
+    defer result.deinit(gpa);
+    a2uiProjectToolEnd(&ts.session, gpa, .{ .call_id = "e1", .result = result });
+
+    const snap = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"tool_e1_diff\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"component\":\"Diff\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "@@ -1 +1 @@") != null);
+}
+
+test "proxy: a2uiParseDiffDetails rejects unknown formats and missing diffs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(a2uiParseDiffDetails(a, "{\"diff\":\"x\",\"format\":\"future-v9\"}") == null);
+    try testing.expect(a2uiParseDiffDetails(a, "{\"diff\":null,\"path\":\"f\"}") == null);
+    try testing.expect(a2uiParseDiffDetails(a, "not json") == null);
+    // Legacy shape without format is tolerated.
+    const d = a2uiParseDiffDetails(a, "{\"diff\":\"@@ -1 +1 @@\",\"path\":\"f\"}").?;
+    try testing.expectEqualStrings("@@ -1 +1 @@", d.diff);
+    try testing.expectEqualStrings("f", d.path.?);
+}
+
 test "proxy: GET /transcript returns the live transcript" {
     var threaded = test_h.threadedIo();
     defer threaded.deinit();
@@ -5546,6 +6627,33 @@ test "proxy: GET /style.css serves the web UI stylesheet" {
         .expect_substr = ".message-user",
         .expect_content_type = "text/css",
     });
+}
+
+test "proxy: GET /a2ui.js serves the A2UI panel renderer" {
+    try runStaticAssetCase(.{
+        .request_path = "/a2ui.js",
+        .expect_substr = "window.A2UI",
+        .expect_content_type = "text/javascript",
+    });
+}
+
+test "proxy: HEAD is routed like GET (A2UI feature-detect probe)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return;
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
 }
 
 test "proxy: GET /events writes SSE preamble" {
