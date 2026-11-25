@@ -98,6 +98,10 @@ const web_prism_js = @embedFile("web/prism.js");
 const web_prism_css = @embedFile("web/prism-tomorrow.css");
 const web_htmx_js = @embedFile("web/htmx.min.js");
 const web_hx_sse_js = @embedFile("web/hx-sse.min.js");
+/// A2UI PoC renderer page — served at `/a2ui.html` only when the
+/// A2UI surface is enabled (`--a2ui` / `tools.a2ui.enabled`).
+const web_a2ui_html = @embedFile("web/a2ui.html");
+const a2ui_mod = franky.coding.a2ui;
 
 /// Compile-time patching of the embedded `index.html`: swaps the
 /// `__FRANKY_VERSION__` / `__FRANKY_COMMIT__` / `__FRANKY_DATE__`
@@ -510,6 +514,14 @@ pub const Session = struct {
     /// and crashing on a freed session pointer in ReleaseFast mode.
     pending_retry_worker: ?std.Thread = null,
 
+    /// v3.x — A2UI PoC state (surface components + data model).
+    /// Always initialized (cheap); only wired to endpoints + the
+    /// `a2ui_render` tool when `cfg.a2ui_enabled` is set.
+    a2ui_state: a2ui_mod.Session,
+    /// Active `/a2ui/events` subscribers — separate pool from
+    /// `subs` so A2UI clients don't compete with the chat UI.
+    a2ui_subs: [max_subs]?*SseSubscriber = @splat(null),
+
     /// Active `/events` subscribers. Capped at `max_subs` so a
     /// runaway client doesn't unbounded-allocate the listener.
     subs: [max_subs]?*SseSubscriber = @splat(null),
@@ -575,6 +587,32 @@ pub const Session = struct {
                 self.allocator.free(entry.frame);
                 if (entry.html_frame) |hf| self.allocator.free(hf);
             }
+        }
+        self.a2ui_state.deinit();
+    }
+
+    /// A2UI broadcast trampoline — `a2ui_mod.Session.BroadcastFn`
+    /// with `userdata` cast back to the proxy `Session`. Copies the
+    /// frame onto the session allocator, fans it out to
+    /// `/a2ui/events` subscribers under `events_mutex`, then frees.
+    fn a2uiBroadcastTrampoline(userdata: *anyopaque, frame: []const u8) void {
+        const self: *Session = @ptrCast(@alignCast(userdata));
+        const copy = self.allocator.dupe(u8, frame) catch return;
+        defer self.allocator.free(copy);
+        self.events_mutex.lockUncancelable(self.io);
+        defer self.events_mutex.unlock(self.io);
+        for (self.a2ui_subs[0..]) |maybe| {
+            const sub = maybe orelse continue;
+            if (sub.closed.load(.acquire)) continue;
+            var buf: [256]u8 = undefined;
+            var w = sub.stream.writer(sub.io, &buf);
+            w.interface.writeAll(copy) catch {
+                sub.close();
+                continue;
+            };
+            w.interface.flush() catch {
+                sub.close();
+            };
         }
     }
 
@@ -796,6 +834,17 @@ pub fn initSession(
         print_mode.applyMaxTurnsSettingsOverlay(cfg, &settings);
         print_mode.applyRetrySettingsOverlay(cfg, &settings);
         max_full_tool_results = settings.max_full_tool_results orelse 0; // v2.16 — pre-render the review config block for system-prompt injection.
+        // v3.x — A2UI settings overlay (`tools.a2ui.enabled`). CLI
+        // `--a2ui` / `--no-a2ui` wins when explicitly passed; settings
+        // flips the default otherwise. Since `a2ui_enabled` defaults
+        // to false and `--a2ui` sets true, "settings only when not
+        // already enabled by CLI" gives the right precedence for the
+        // common case; `--no-a2ui` is indistinguishable from the
+        // default (both false), so an explicit `--no-a2ui` cannot
+        // override a `true` setting — acceptable for the PoC.
+        if (settings.a2ui_enabled) |v| {
+            if (!cfg.a2ui_enabled) cfg.a2ui_enabled = v;
+        }
         // Only populate when profiles are configured so the block is non-empty.
         if (settings.review_profiles.len > 0) {
             const ca = cfg.arena.allocator();
@@ -872,6 +921,7 @@ pub fn initSession(
         .max_full_tool_results = max_full_tool_results,
         .tool_usage = std.StringHashMap(u32).init(allocator),
         .ccr_store = compression_mod.CcrSessionStore.init(allocator, io),
+        .a2ui_state = a2ui_mod.Session.init(allocator, io),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.compression_ctx.ccr_store = &session.ccr_store;
@@ -1119,7 +1169,26 @@ pub fn initSession(
         session.tools = final_tools;
     }
 
-    session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+    // v3.x — A2UI PoC wiring (off by default; `--a2ui` /
+    // `tools.a2ui.enabled`). Appends the `a2ui_render` tool, points
+    // the A2UI session state at the SSE broadcast trampoline, and
+    // extends the system prompt with the A2UI instructions.
+    if (cfg.a2ui_enabled) {
+        const ra = session.role_arena.allocator();
+        const extended = try ra.alloc(at.AgentTool, session.tools.len + 1);
+        @memcpy(extended[0..session.tools.len], session.tools);
+        extended[session.tools.len] = tools_mod.a2ui_render.tool(&session.a2ui_state);
+        session.tools = extended;
+
+        session.a2ui_state.setBroadcast(@ptrCast(session), Session.a2uiBroadcastTrampoline);
+
+        const base_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+        defer allocator.free(base_prompt);
+        const trimmed = std.mem.trimEnd(u8, base_prompt, &std.ascii.whitespace);
+        session.system_prompt = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ trimmed, a2ui_mod.system_prompt_block });
+    } else {
+        session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+    }
 }
 
 // ─── §J + v1.7.3: server-side slash command registry ───────────
@@ -1888,6 +1957,23 @@ fn computeTitle(transcript: *const agent.loop.Transcript) []const u8 {
 }
 
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
+    // Diagnostic hook for the A2UI PoC: when
+    // `FRANKY_FAUX_LOG_TOOLS=1`, log the tool names the model was
+    // offered so e2e runs can assert `a2ui_render` is registered.
+    const em: ?*const std.process.Environ.Map = ctx.options.environ_map;
+    const flag: ?[]const u8 = if (em) |m| m.get("FRANKY_FAUX_LOG_TOOLS") else null;
+    if (flag) |v| {
+        if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+            var names: std.ArrayList(u8) = .empty;
+            defer names.deinit(ctx.allocator);
+            for (ctx.context.tools, 0..) |t, i| {
+                if (i > 0) names.appendSlice(ctx.allocator, ",") catch {};
+                names.appendSlice(ctx.allocator, t.name) catch {};
+            }
+            const has_a2ui_prompt = std.mem.indexOf(u8, ctx.context.system_prompt, "A2UI") != null;
+            ai.log.log(.info, "proxy", "faux.tools", "tools=[{s}] a2ui_prompt={}", .{ names.items, has_a2ui_prompt });
+        }
+    }
     const fp: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try fp.runSync(ctx.io, ctx.context, ctx.out);
 }
@@ -2045,6 +2131,22 @@ fn handleConnection(arg: ConnArg) void {
         if (req.path.len > head_len + tail_len) {
             const id = req.path[head_len .. req.path.len - tail_len];
             respondSessionTranscript(arg.session, &stream, arg.io, arg.allocator, id);
+            return;
+        }
+    }
+    // ── A2UI PoC endpoints (only when enabled) ───────────────────
+    if (arg.session.cfg.a2ui_enabled) {
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/a2ui/events")) {
+            runA2uiSseStream(arg.session, &stream, arg.io, req.last_event_id orelse 0);
+            return;
+        }
+        if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/a2ui/action")) {
+            const carry = hdr_buf[hdr_len.consumed..hdr_len.total];
+            respondA2uiAction(arg.session, &stream, arg.io, arg.allocator, req, carry);
+            return;
+        }
+        if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/a2ui.html")) {
+            respondAsset(&stream, arg.io, web_a2ui_html, "text/html; charset=utf-8");
             return;
         }
     }
@@ -2242,6 +2344,181 @@ fn writeReplayGap(
     ) catch return;
     defer allocator.free(frame);
     writeReplayFrame(sub, frame);
+}
+
+// ─── A2UI PoC: /a2ui/events + /a2ui/action ───────────────────────
+
+/// SSE stream of A2UI envelopes. On connect (or when the client's
+/// `Last-Event-ID` is behind the current surface version) sends a
+/// synthetic `a2ui_snapshot` frame with the full surface state —
+/// the surface is fully described by the latest
+/// `updateComponents`/`updateDataModel`, so a snapshot is always a
+/// sufficient catch-up (no replay ring needed for the PoC).
+fn runA2uiSseStream(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    last_event_id: u64,
+) void {
+    const preamble =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "\r\n" ++
+        ": connected\n\n";
+    var pre_buf: [256]u8 = undefined;
+    var pw = stream.writer(io, &pre_buf);
+    pw.interface.writeAll(preamble) catch return;
+    pw.interface.flush() catch return;
+
+    var sub = SseSubscriber{ .stream = stream.*, .io = io };
+
+    // Snapshot + register under events_mutex so a broadcast can't
+    // slip between the snapshot and the live registration.
+    {
+        session.events_mutex.lockUncancelable(io);
+        defer session.events_mutex.unlock(io);
+
+        if (session.a2ui_state.currentVersion() > last_event_id) {
+            const snap = session.a2ui_state.renderSnapshotJson(session.allocator) catch null;
+            if (snap) |s| {
+                defer session.allocator.free(s);
+                var out: std.Io.Writer.Allocating = .init(session.allocator);
+                defer out.deinit();
+                out.writer.print("id: {d}\nevent: a2ui_snapshot\ndata: {s}\n\n", .{ session.a2ui_state.currentVersion(), s }) catch {};
+                var wb: [256]u8 = undefined;
+                var w = stream.writer(io, &wb);
+                w.interface.writeAll(out.written()) catch return;
+                w.interface.flush() catch return;
+            }
+        }
+
+        // Register in the dedicated A2UI pool.
+        var added = false;
+        for (session.a2ui_subs[0..], 0..) |s, i| {
+            if (s == null) {
+                session.a2ui_subs[i] = &sub;
+                added = true;
+                break;
+            }
+        }
+        if (!added) {
+            const msg = "event: error\ndata: {\"kind\":\"error\",\"message\":\"too many A2UI subscribers\"}\n\n";
+            var eb: [256]u8 = undefined;
+            var ew = stream.writer(io, &eb);
+            ew.interface.writeAll(msg) catch {};
+            ew.interface.flush() catch {};
+            return;
+        }
+    }
+    defer {
+        session.events_mutex.lockUncancelable(io);
+        defer session.events_mutex.unlock(io);
+        for (session.a2ui_subs[0..], 0..) |s, i| {
+            if (s == &sub) {
+                session.a2ui_subs[i] = null;
+                break;
+            }
+        }
+    }
+
+    // Block until the client disconnects.
+    var sink: [512]u8 = undefined;
+    var r = stream.reader(io, &.{});
+    while (!sub.closed.load(.acquire)) {
+        var vecs: [1][]u8 = .{&sink};
+        const n = r.interface.readVec(&vecs) catch break;
+        if (n == 0) break;
+    }
+}
+
+/// `POST /a2ui/action` — renderer→agent `action` message. Appends a
+/// synthetic user message to the transcript and runs a normal agent
+/// turn, single-flighted on `run_mutex` like `/prompt`.
+fn respondA2uiAction(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    req: sse_mod.Request,
+    carry: []const u8,
+) void {
+    const max_body: usize = 64 * 1024;
+    const want = if (req.content_length) |cl| @min(cl, max_body) else max_body;
+
+    var body_buf: std.ArrayList(u8) = .empty;
+    defer body_buf.deinit(allocator);
+    body_buf.appendSlice(allocator, carry[0..@min(carry.len, want)]) catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    if (body_buf.items.len < want) {
+        var r = stream.reader(io, &.{});
+        var chunk: [4096]u8 = undefined;
+        while (body_buf.items.len < want) {
+            const remaining = want - body_buf.items.len;
+            var vecs: [1][]u8 = .{chunk[0..@min(chunk.len, remaining)]};
+            const n = r.interface.readVec(&vecs) catch break;
+            if (n == 0) break;
+            body_buf.appendSlice(allocator, chunk[0..n]) catch {
+                sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+                return;
+            };
+        }
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, a, body_buf.items, .{}) catch {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"invalid JSON\"}");
+        return;
+    };
+    const action = blk: {
+        if (parsed.value != .object) break :blk null;
+        break :blk parsed.value.object.get("action");
+    } orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"missing \\\"action\\\" object\"}");
+        return;
+    };
+    if (action != .object) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"action must be an object\"}");
+        return;
+    }
+    const name_v = action.object.get("name") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"action.name is required\"}");
+        return;
+    };
+    if (name_v != .string or name_v.string.len == 0) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"action.name must be a non-empty string\"}");
+        return;
+    }
+
+    // Build the transcript-facing text: action name + userMessage +
+    // resolved context (already resolved renderer-side per spec).
+    var msg: std.Io.Writer.Allocating = .init(a);
+    msg.writer.print("[A2UI action] name={s}", .{name_v.string}) catch {
+        sse_mod.respondStatus(stream, io, 500, "Internal Server Error");
+        return;
+    };
+    if (action.object.get("userMessage")) |um| {
+        if (um == .string and um.string.len > 0)
+            msg.writer.print(" userMessage=\"{s}\"", .{um.string}) catch {};
+    }
+    if (action.object.get("context")) |ctx_v| {
+        msg.writer.writeAll(" context=") catch {};
+        std.json.Stringify.value(ctx_v, .{}, &msg.writer) catch {};
+    }
+    const text = msg.written();
+
+    session.run_mutex.lockUncancelable(io);
+    defer session.run_mutex.unlock(io);
+
+    sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
+    runOneTurn(session, allocator, io, text);
 }
 
 // ─── /prompt ─────────────────────────────────────────────────────
@@ -4052,6 +4329,7 @@ fn initSessionForTestWithDir(
         .bash_state = tools_mod.bash.SessionBashState.init(allocator),
         .tool_usage = std.StringHashMap(u32).init(allocator),
         .ccr_store = compression_mod.CcrSessionStore.init(allocator, io),
+        .a2ui_state = a2ui_mod.Session.init(allocator, io),
     };
     session.ccr_ctx = .{ .store = &session.ccr_store, .stats = &session.compression_stats };
     session.compression_ctx.ccr_store = &session.ccr_store;

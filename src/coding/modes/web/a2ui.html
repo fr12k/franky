@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>franky — A2UI surface</title>
+<style>
+  :root {
+    --bg: #1e1f24; --panel: #26272e; --border: #3a3b44;
+    --fg: #e4e4e9; --dim: #9a9aa5; --accent: #6d9eeb; --accent-dim: #3d5a94;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  #conn { font-size: 12px; color: var(--dim); }
+  #conn.live { color: #7bc47f; }
+  #conn.down { color: #e57373; }
+  #surface { max-width: 720px; margin: 0 auto; }
+  .empty { color: var(--dim); text-align: center; padding: 64px 0; }
+  /* A2UI components */
+  .a2-column { display: flex; flex-direction: column; gap: 12px; }
+  .a2-row { display: flex; flex-direction: row; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .a2-text { margin: 0; white-space: pre-wrap; }
+  .a2-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  .a2-button {
+    background: var(--accent-dim); color: #fff; border: 1px solid var(--accent);
+    border-radius: 6px; padding: 7px 16px; font-size: 14px; cursor: pointer;
+  }
+  .a2-button:hover { background: var(--accent); }
+  .a2-field { display: flex; flex-direction: column; gap: 4px; }
+  .a2-field label { font-size: 12px; color: var(--dim); }
+  .a2-field input {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font-size: 14px;
+  }
+  .a2-field input:focus { outline: none; border-color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>franky · A2UI surface <code>main</code></h1>
+  <span id="conn">connecting…</span>
+</header>
+<div id="surface"><div class="empty">No UI yet — ask the agent to render something (e.g. “show me a form”).</div></div>
+
+<script>
+"use strict";
+// ── A2UI PoC renderer ─────────────────────────────────────────────
+// Consumes franky's /a2ui/events SSE stream (A2UI v1.0 envelopes) and
+// renders the Basic-catalog subset: Column, Row, Text, Button,
+// TextField. Data bindings: {"@path": "/json/pointer"} against the
+// surface data model (RFC 6901). Two-way binding is local per spec;
+// state goes back to the agent only via Button actions
+// (POST /a2ui/action → appended to the agent transcript).
+
+const state = { components: [], dataModel: null, version: 0 };
+const surfaceEl = document.getElementById("surface");
+const connEl = document.getElementById("conn");
+
+// ── JSON Pointer (RFC 6901) ───────────────────────────────────────
+function pointerGet(obj, path) {
+  if (!path || path === "/") return obj;
+  let cur = obj;
+  for (const raw of path.split("/").slice(1)) {
+    const seg = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = Array.isArray(cur) ? cur[Number(seg)] : cur[seg];
+  }
+  return cur;
+}
+function pointerSet(obj, path, value) {
+  const segs = path.split("/").slice(1).map(s => s.replace(/~1/g, "/").replace(/~0/g, "~"));
+  if (segs.length === 0) return value;
+  let cur = obj;
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (cur[segs[i]] == null || typeof cur[segs[i]] !== "object") cur[segs[i]] = {};
+    cur = cur[segs[i]];
+  }
+  cur[segs[segs.length - 1]] = value;
+  return obj;
+}
+
+function resolveDynamic(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "object" && typeof v["@path"] === "string") {
+    const r = pointerGet(state.dataModel, v["@path"]);
+    if (r == null) return "";
+    return typeof r === "object" ? JSON.stringify(r) : String(r);
+  }
+  return String(v);
+}
+// Resolve an action context: {"k": {"@path": "/..."}} → {"k": value}
+function resolveContext(ctx) {
+  const out = {};
+  for (const [k, v] of Object.entries(ctx || {})) {
+    out[k] = (v && typeof v === "object" && typeof v["@path"] === "string")
+      ? pointerGet(state.dataModel, v["@path"]) : v;
+  }
+  return out;
+}
+
+// ── component renderers ───────────────────────────────────────────
+const renderers = {
+  Column(def, render) {
+    const el = document.createElement("div");
+    el.className = "a2-column a2-card";
+    for (const kid of def.children || []) render(kid, el);
+    return el;
+  },
+  Row(def, render) {
+    const el = document.createElement("div");
+    el.className = "a2-row";
+    for (const kid of def.children || []) render(kid, el);
+    return el;
+  },
+  Text(def) {
+    const el = document.createElement("p");
+    el.className = "a2-text";
+    el.textContent = resolveDynamic(def.text);
+    return el;
+  },
+  Button(def) {
+    const el = document.createElement("button");
+    el.className = "a2-button";
+    el.textContent = resolveDynamic(def.label);
+    el.addEventListener("click", () => fireAction(def));
+    return el;
+  },
+  TextField(def) {
+    const wrap = document.createElement("div");
+    wrap.className = "a2-field";
+    const label = document.createElement("label");
+    label.textContent = resolveDynamic(def.label);
+    const input = document.createElement("input");
+    input.type = "text";
+    const binding = def.value && def.value["@path"];
+    if (binding) {
+      const cur = pointerGet(state.dataModel, binding);
+      input.value = cur == null ? "" : String(cur);
+      // Two-way binding, renderer-local per spec.
+      input.addEventListener("input", () => {
+        if (state.dataModel == null || typeof state.dataModel !== "object") state.dataModel = {};
+        pointerSet(state.dataModel, binding, input.value);
+      });
+    }
+    wrap.append(label, input);
+    return wrap;
+  },
+};
+
+function render() {
+  surfaceEl.textContent = "";
+  if (!state.components.length) {
+    const d = document.createElement("div");
+    d.className = "empty";
+    d.textContent = "No UI yet — ask the agent to render something (e.g. “show me a form”).";
+    surfaceEl.appendChild(d);
+    return;
+  }
+  const byId = new Map(state.components.map(c => [c.id, c]));
+  const renderInto = (id, parent) => {
+    const def = byId.get(id);
+    if (!def) return;
+    const r = renderers[def.component];
+    if (!r) {
+      const w = document.createElement("div");
+      w.className = "a2-text";
+      w.textContent = `[unsupported component: ${def.component}]`;
+      parent.appendChild(w);
+      return;
+    }
+    parent.appendChild(r(def, renderInto));
+  };
+  renderInto("root", surfaceEl);
+}
+
+// ── actions → agent ───────────────────────────────────────────────
+async function fireAction(def) {
+  const ev = (def.action && def.action.event) || {};
+  const payload = {
+    version: "1.0",
+    action: {
+      name: ev.name || "unknown",
+      surfaceId: "main",
+      sourceComponentId: def.id,
+      timestamp: new Date().toISOString(),
+      userMessage: resolveDynamic(ev.userMessage) || undefined,
+      context: resolveContext(ev.context),
+    },
+  };
+  try {
+    await fetch("/a2ui/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.error("action POST failed", e);
+  }
+}
+
+// ── envelopes ─────────────────────────────────────────────────────
+function deepMerge(dst, src) {
+  for (const [k, v] of Object.entries(src || {})) {
+    if (v && typeof v === "object" && !Array.isArray(v) &&
+        dst[k] && typeof dst[k] === "object" && !Array.isArray(dst[k])) {
+      deepMerge(dst[k], v);
+    } else {
+      dst[k] = v;
+    }
+  }
+  return dst;
+}
+
+function applyEnvelope(env) {
+  if (env.createSurface) return; // surface is implicit in the PoC
+  if (env.updateComponents) {
+    state.components = env.updateComponents.components || [];
+    render();
+    return;
+  }
+  if (env.updateDataModel) {
+    if (state.dataModel == null || typeof state.dataModel !== "object") state.dataModel = {};
+    deepMerge(state.dataModel, env.updateDataModel.data || {});
+    render(); // re-resolve @path bindings
+    return;
+  }
+  if (env.deleteSurface) {
+    state.components = [];
+    state.dataModel = null;
+    render();
+  }
+}
+
+// ── SSE wiring with reconnect + snapshot catch-up ─────────────────
+let es = null;
+function connect() {
+  es = new EventSource("/a2ui/events");
+  es.addEventListener("a2ui_snapshot", (e) => {
+    const snap = JSON.parse(e.data);
+    state.components = snap.components || [];
+    state.dataModel = snap.dataModel;
+    state.version = snap.version || 0;
+    render();
+  });
+  for (const kind of ["a2ui_updateComponents", "a2ui_updateDataModel", "a2ui_deleteSurface", "a2ui_createSurface"]) {
+    es.addEventListener(kind, (e) => applyEnvelope(JSON.parse(e.data)));
+  }
+  es.onopen = () => { connEl.textContent = "live"; connEl.className = "live"; };
+  es.onerror = () => { connEl.textContent = "reconnecting…"; connEl.className = "down"; };
+  // EventSource auto-reconnects and resends Last-Event-ID; the server
+  // answers a stale id with a fresh snapshot.
+}
+connect();
+</script>
+</body>
+</html>
