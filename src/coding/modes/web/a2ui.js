@@ -358,6 +358,7 @@ window.A2UI = (function () {
             if (state.dataModel == null || typeof state.dataModel !== "object") state.dataModel = {};
             deepMerge(state.dataModel, env.updateDataModel.data || {});
             render(); // re-resolve @path bindings
+            if (onUpdate) onUpdate();
             return;
         }
         if (env.appendDataModel) {
@@ -368,6 +369,7 @@ window.A2UI = (function () {
                 const cur = pointerGet(state.dataModel, a.path);
                 pointerSet(state.dataModel, a.path, (cur == null ? "" : String(cur)) + a.delta);
                 render();
+                if (onUpdate) onUpdate();
             }
             return;
         }
