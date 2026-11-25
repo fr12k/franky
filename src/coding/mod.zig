@@ -20,6 +20,7 @@ pub const tools = struct {
     pub const memory_delete = @import("tools/memory_delete.zig");
     pub const memory_list = @import("tools/memory_list.zig");
     pub const a2ui_render = @import("tools/a2ui_render.zig");
+    pub const code_exec = @import("tools/code_exec.zig");
 };
 
 pub const a2ui = @import("a2ui.zig");
@@ -109,6 +110,7 @@ test {
     _ = tools.workspace;
     _ = tools.common;
     _ = tools.truncate;
+    _ = tools.code_exec;
     _ = modes.print;
     _ = modes.rpc;
     _ = modes.proxy;
