@@ -358,6 +358,32 @@ component over per-delta `updateDataModel` replaces:
 Remaining scope cuts after round 6: single surface, snapshot instead of a
 replay ring, no `emit_ui` tool, no AG-UI binding (§7.1).
 
+### 8.6 Round 7 (2026-11) — multi-surface + replay ring (§4.2)
+
+- **Multi-surface registry**: `Session.state`/`data_model` →
+  `surfaces: surfaceId → {components, data_model}`. `"main"` is created
+  lazily (existing single-surface callers unchanged); any other
+  `surfaceId` in any envelope creates/uses its own surface —
+  `createSurface` is now an explicit idempotent registration,
+  `deleteSurface` clears only the named surface, data models are
+  per-surface. `renderSnapshotAllJson` serializes the whole registry;
+  `renderSnapshotJson` keeps the `"main"`-only shape for the current
+  renderer.
+- **Replay ring** (1024 frames): every accepted envelope is stored
+  fully-stamped in a ring keyed by `version % capacity`.
+  `/a2ui/events` reconnect with a `Last-Event-ID` inside the ring replays
+  the missed envelopes in order; too-old ids fall back to a full
+  snapshot. (The renderer's existing upsert/merge logic applies replayed
+  envelopes idempotently, so replay and snapshot converge to the same
+  state.)
+- AG-UI binding (§7.1) is **decided against** — franky is its own
+  renderer; external-client interop is out of scope.
+
+Remaining scope cuts after round 7: no `emit_ui` tool. The §7 open
+questions are now all resolved (7.1 no AG-UI; 7.2 StreamingText; 7.3
+bespoke renderer; 7.4 golden-fixture validation; 7.5 generative UI via
+the `a2ui_render` tool).
+
 ## 7. Open questions (resolve before execution)
 
 1. Goal = **interoperability** (external A2UI clients connect to franky) or

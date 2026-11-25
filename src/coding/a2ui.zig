@@ -30,22 +30,50 @@ const std = @import("std");
 
 pub const surface_id = "main";
 
+/// Plan 4.2 — replay ring capacity for `/a2ui/events` reconnects.
+/// Each accepted envelope is stored serialized so a stale
+/// `Last-Event-ID` can be replayed; older than the ring falls back
+/// to a full snapshot.
+pub const replay_ring_capacity: usize = 1024;
+
 /// Callback the session uses to fan a fully-rendered SSE frame out to
 /// `/a2ui/events` subscribers. `userdata` is the proxy `Session`.
 pub const BroadcastFn = *const fn (userdata: *anyopaque, frame: []const u8) void;
 
+/// Plan 4.2 — one A2UI surface: its component adjacency list +
+/// reactive data model. Keyed by surfaceId in `Session.surfaces`.
+const Surface = struct {
+    /// Raw `components` array from the most recent accepted
+    /// `updateComponents` batch. `null` until the first batch.
+    state: ?std.json.Value = null,
+    /// Deep-merged `updateDataModel` payloads.
+    data_model: std.json.Value = .null,
+
+    fn deinit(self: *Surface, allocator: std.mem.Allocator) void {
+        if (self.state) |*s| freeCopy(allocator, s.*);
+        freeCopy(allocator, self.data_model);
+    }
+};
+
+/// One replay-ring entry: the fully-stamped SSE frame
+/// (`id:/event:/data:`) for an accepted envelope.
+const ReplayFrame = struct {
+    id: u64,
+    frame: []u8,
+};
+
 pub const Session = struct {
     allocator: std.mem.Allocator,
-    /// Component adjacency list for the surface — the raw `components`
-    /// array from the most recent accepted `updateComponents` batch.
-    /// `null` until the first batch arrives. Owned (deep-copied).
-    state: ?std.json.Value = null,
-    /// Surface data model — deep-merged `updateDataModel` payloads.
-    /// Owned (deep-copied).
-    data_model: std.json.Value = .null,
+    /// Plan 4.2 — surface registry. `"main"` is created lazily on
+    /// first use so existing callers (single-surface PoC) keep
+    /// working without an explicit createSurface.
+    surfaces: std.StringHashMapUnmanaged(Surface) = .empty,
     /// Monotonic version, bumped on every accepted mutation. Used as
     /// the SSE event id for `Last-Event-ID` reconnects.
     version: u64 = 0,
+    /// Plan 4.2 — replay ring of recent stamped frames keyed by
+    /// `id % replay_ring_capacity`.
+    replay_ring: [replay_ring_capacity]?ReplayFrame = @splat(null),
     mutex: std.Io.Mutex = .init,
     broadcast_fn: ?BroadcastFn = null,
     broadcast_userdata: ?*anyopaque = null,
@@ -58,8 +86,29 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
-        if (self.state) |*s| freeCopy(self.allocator, s.*);
-        freeCopy(self.allocator, self.data_model);
+        var it = self.surfaces.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit(self.allocator);
+        }
+        self.surfaces.deinit(self.allocator);
+        for (self.replay_ring[0..]) |maybe| {
+            if (maybe) |f| self.allocator.free(f.frame);
+        }
+    }
+
+    /// Fetch or create the surface for `sid`. Caller holds the mutex.
+    /// getOrPut does NOT consume the key on found_existing, so the
+    /// dupe is freed on that path (same pattern as mergeJson).
+    fn surfaceLocked(self: *Session, sid: []const u8) !*Surface {
+        const duped = try self.allocator.dupe(u8, sid);
+        const gop = try self.surfaces.getOrPut(self.allocator, duped);
+        if (gop.found_existing) {
+            self.allocator.free(duped);
+        } else {
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
     }
 
     pub fn setBroadcast(self: *Session, userdata: *anyopaque, f: BroadcastFn) void {
@@ -92,22 +141,27 @@ pub const Session = struct {
         const obj = env.object;
 
         if (obj.get("createSurface")) |cs| {
-            // Idempotent in the PoC — the surface is implicit. Validate
-            // the shape so the model gets feedback on malformed input.
+            // Plan 4.2 — surfaces are created lazily; createSurface is
+            // an explicit (idempotent) registration + shape validation.
             if (cs != .object) return try validationError(allocator, "VALIDATION_FAILED", "/createSurface", "createSurface must be an object");
-            if (cs.object.get("surfaceId")) |sid| {
-                if (sid != .string or !std.mem.eql(u8, sid.string, surface_id))
-                    return try validationError(allocator, "VALIDATION_FAILED", "/createSurface/surfaceId", "PoC supports exactly one surface with surfaceId \"main\"");
-            }
-            return null; // nothing to mutate; no broadcast needed
+            const sid: []const u8 = if (cs.object.get("surfaceId")) |v| blk: {
+                if (v != .string or v.string.len == 0)
+                    return try validationError(allocator, "VALIDATION_FAILED", "/createSurface/surfaceId", "surfaceId must be a non-empty string");
+                break :blk v.string;
+            } else surface_id;
+            self.mutex.lockUncancelable(self.io);
+            _ = try self.surfaceLocked(sid);
+            self.mutex.unlock(self.io);
+            return null; // nothing to broadcast — no content yet
         }
 
         if (obj.get("updateComponents")) |uc| {
             if (uc != .object) return try validationError(allocator, "VALIDATION_FAILED", "/updateComponents", "updateComponents must be an object");
-            if (uc.object.get("surfaceId")) |sid| {
-                if (sid != .string or !std.mem.eql(u8, sid.string, surface_id))
-                    return try validationError(allocator, "VALIDATION_FAILED", "/updateComponents/surfaceId", "unknown surfaceId (PoC supports \"main\" only)");
-            }
+            const sid: []const u8 = switch (try a2uiSurfaceId(allocator, uc, "/updateComponents")) {
+                .none => surface_id,
+                .ok => |s| s,
+                .err => |e| return e,
+            };
             const comps = uc.object.get("components") orelse
                 return try validationError(allocator, "VALIDATION_FAILED", "/updateComponents/components", "missing components array");
             if (comps != .array) return try validationError(allocator, "VALIDATION_FAILED", "/updateComponents/components", "components must be an array");
@@ -118,8 +172,9 @@ pub const Session = struct {
             const comps_mut: std.json.Value = comps;
             const copy = try deepCopy(self.allocator, comps_mut);
             self.mutex.lockUncancelable(self.io);
-            if (self.state) |*s| freeCopy(self.allocator, s.*);
-            self.state = copy;
+            const surf = try self.surfaceLocked(sid);
+            if (surf.state) |*s| freeCopy(self.allocator, s.*);
+            surf.state = copy;
             self.version += 1;
             const ver = self.version;
             self.mutex.unlock(self.io);
@@ -129,16 +184,18 @@ pub const Session = struct {
 
         if (obj.get("updateDataModel")) |udm| {
             if (udm != .object) return try validationError(allocator, "VALIDATION_FAILED", "/updateDataModel", "updateDataModel must be an object");
-            if (udm.object.get("surfaceId")) |sid| {
-                if (sid != .string or !std.mem.eql(u8, sid.string, surface_id))
-                    return try validationError(allocator, "VALIDATION_FAILED", "/updateDataModel/surfaceId", "unknown surfaceId (PoC supports \"main\" only)");
-            }
+            const sid: []const u8 = switch (try a2uiSurfaceId(allocator, udm, "/updateDataModel")) {
+                .none => surface_id,
+                .ok => |s| s,
+                .err => |e| return e,
+            };
             const data = udm.object.get("data") orelse
                 return try validationError(allocator, "VALIDATION_FAILED", "/updateDataModel/data", "missing data object");
             if (data != .object) return try validationError(allocator, "VALIDATION_FAILED", "/updateDataModel/data", "data must be an object");
 
             self.mutex.lockUncancelable(self.io);
-            try mergeJson(self.allocator, &self.data_model, data);
+            const surf = try self.surfaceLocked(sid);
+            try mergeJson(self.allocator, &surf.data_model, data);
             self.version += 1;
             const ver = self.version;
             self.mutex.unlock(self.io);
@@ -153,10 +210,11 @@ pub const Session = struct {
             // the renderer applies the same append, so streaming text
             // costs O(delta) per event instead of O(accumulated).
             if (adm != .object) return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel", "appendDataModel must be an object");
-            if (adm.object.get("surfaceId")) |sid| {
-                if (sid != .string or !std.mem.eql(u8, sid.string, surface_id))
-                    return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/surfaceId", "unknown surfaceId (PoC supports \"main\" only)");
-            }
+            const sid: []const u8 = switch (try a2uiSurfaceId(allocator, adm, "/appendDataModel")) {
+                .none => surface_id,
+                .ok => |s| s,
+                .err => |e| return e,
+            };
             const path_v = adm.object.get("path") orelse
                 return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/path", "missing path (JSON pointer to a string)");
             if (path_v != .string or path_v.string.len == 0 or path_v.string[0] != '/')
@@ -167,7 +225,8 @@ pub const Session = struct {
                 return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/delta", "delta must be a string");
 
             self.mutex.lockUncancelable(self.io);
-            try pointerAppendString(self.allocator, &self.data_model, path_v.string, delta_v.string);
+            const surf = try self.surfaceLocked(sid);
+            try pointerAppendString(self.allocator, &surf.data_model, path_v.string, delta_v.string);
             self.version += 1;
             const ver = self.version;
             self.mutex.unlock(self.io);
@@ -175,14 +234,17 @@ pub const Session = struct {
             return null;
         }
 
-        if (obj.get("deleteSurface")) |_| {
+        if (obj.get("deleteSurface")) |ds| {
+            const sid: []const u8 = if (ds == .object) switch (try a2uiSurfaceId(allocator, ds, "/deleteSurface")) {
+                .none => surface_id,
+                .ok => |s| s,
+                .err => |e| return e,
+            } else surface_id;
             self.mutex.lockUncancelable(self.io);
-            if (self.state) |*s| {
-                freeCopy(self.allocator, s.*);
-                self.state = null;
+            if (self.surfaces.getPtr(sid)) |surf| {
+                surf.deinit(self.allocator);
+                surf.* = .{};
             }
-            freeCopy(self.allocator, self.data_model);
-            self.data_model = .null;
             self.version += 1;
             const ver = self.version;
             self.mutex.unlock(self.io);
@@ -195,9 +257,39 @@ pub const Session = struct {
 
     // ── renderer-side snapshots ───────────────────────────────────
 
-    /// Serialize the current surface state + data model for a
-    /// reconnecting renderer: `{"components": [...], "dataModel": {...},
-    /// "version": N}`. Caller owns the returned slice.
+    /// Serialize the full surface registry + data models for a
+    /// reconnecting renderer:
+    /// `{"version": N, "surfaces": {"main": {"components": [...],
+    /// "dataModel": {...}}, ...}}`. Caller owns the returned slice.
+    /// Plan 4.2 — multi-surface; `renderSnapshotJson("main")` below
+    /// keeps the single-surface shape for the existing renderer.
+    pub fn renderSnapshotAllJson(self: *Session, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var out: std.Io.Writer.Allocating = std.Io.Writer.Allocating.init(allocator);
+        errdefer out.deinit();
+        var jw: std.json.Stringify = .{
+            .writer = &out.writer,
+            .options = .{},
+        };
+        try jw.beginObject();
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("surfaces");
+        try jw.beginObject();
+        var it = self.surfaces.iterator();
+        while (it.next()) |e| {
+            try jw.objectField(e.key_ptr.*);
+            try writeSurfaceJson(&jw, e.value_ptr);
+        }
+        try jw.endObject();
+        try jw.endObject();
+        return try out.toOwnedSlice();
+    }
+
+    /// Single-surface snapshot (back-compat for the current renderer):
+    /// `{"version": N, "surfaceId": sid, "components": [...],
+    /// "dataModel": {...}}`.
     pub fn renderSnapshotJson(self: *Session, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -212,17 +304,39 @@ pub const Session = struct {
         try jw.write(self.version);
         try jw.objectField("surfaceId");
         try jw.write(surface_id);
+        if (self.surfaces.getPtr(surface_id)) |surf| {
+            try jw.objectField("components");
+            if (surf.state) |s| {
+                try jw.write(s);
+            } else {
+                try jw.beginArray();
+                try jw.endArray();
+            }
+            try jw.objectField("dataModel");
+            try jw.write(surf.data_model);
+        } else {
+            try jw.objectField("components");
+            try jw.beginArray();
+            try jw.endArray();
+            try jw.objectField("dataModel");
+            try jw.write(@as(std.json.Value, .null));
+        }
+        try jw.endObject();
+        return try out.toOwnedSlice();
+    }
+
+    fn writeSurfaceJson(jw: *std.json.Stringify, surf: *const Surface) !void {
+        try jw.beginObject();
         try jw.objectField("components");
-        if (self.state) |s| {
+        if (surf.state) |s| {
             try jw.write(s);
         } else {
             try jw.beginArray();
             try jw.endArray();
         }
         try jw.objectField("dataModel");
-        try jw.write(self.data_model);
+        try jw.write(surf.data_model);
         try jw.endObject();
-        return try out.toOwnedSlice();
     }
 
     pub fn currentVersion(self: *Session) u64 {
@@ -231,15 +345,58 @@ pub const Session = struct {
         return self.version;
     }
 
-    /// Deep-copy of the current component adjacency list (or null
-    /// when no `updateComponents` has landed yet). Caller frees with
-    /// `freeCopy`. Used by the proxy's host-side projections to
-    /// inspect the surface (e.g. locate the "root" children list).
+    /// Deep-copy of the `"main"` surface's component adjacency list
+    /// (or null when no `updateComponents` has landed yet). Caller
+    /// frees with `freeCopy`. Used by the proxy's host-side
+    /// projections to inspect the surface (e.g. locate the "root"
+    /// children list). Multi-surface callers should use
+    /// `renderSnapshotAllJson`.
     pub fn snapshotComponents(self: *Session, allocator: std.mem.Allocator) !?std.json.Value {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const s = self.state orelse return null;
+        const surf = self.surfaces.getPtr(surface_id) orelse return null;
+        const s = surf.state orelse return null;
         return try deepCopy(allocator, s);
+    }
+
+    // ── plan 4.2: replay ring ─────────────────────────────────────
+
+    /// Store a fully-stamped SSE frame in the replay ring. Caller
+    /// holds no lock; we take it. `frame` is deep-copied.
+    fn replayPush(self: *Session, id: u64, frame: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, frame);
+        self.mutex.lockUncancelable(self.io);
+        const slot: usize = @intCast(id % replay_ring_capacity);
+        if (self.replay_ring[slot]) |old| self.allocator.free(old.frame);
+        self.replay_ring[slot] = .{ .id = id, .frame = copy };
+        self.mutex.unlock(self.io);
+    }
+
+    /// Oldest event id still in the ring (1-based).
+    pub fn oldestVersion(self: *Session) u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.version > replay_ring_capacity)
+            return self.version - replay_ring_capacity;
+        return 1;
+    }
+
+    /// Append every frame with `id > last_event_id` to `out` (in
+    /// order). Returns false when the requested range has fallen out
+    /// of the ring — the caller should send a full snapshot instead.
+    pub fn replaySince(self: *Session, last_event_id: u64, out: *std.Io.Writer.Allocating) !bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const oldest: u64 = if (self.version > replay_ring_capacity) self.version - replay_ring_capacity else 1;
+        if (last_event_id + 1 < oldest and self.version > last_event_id) return false;
+        var id = last_event_id + 1;
+        while (id <= self.version) : (id += 1) {
+            const slot: usize = @intCast(id % replay_ring_capacity);
+            if (self.replay_ring[slot]) |f| {
+                if (f.id == id) try out.writer.writeAll(f.frame);
+            }
+        }
+        return true;
     }
 
     /// Host-side component projection (§4.3 translator seed): inject
@@ -263,10 +420,11 @@ pub const Session = struct {
             return try allocator.dupe(u8, err_msg);
 
         self.mutex.lockUncancelable(self.io);
-        try upsertListLocked(self, parsed.value.array.items);
+        const surf = try self.surfaceLocked(surface_id);
+        try upsertListLocked(self, surf, parsed.value.array.items);
         self.version += 1;
         const ver = self.version;
-        const payload = try std.json.Stringify.valueAlloc(allocator, self.state.?, .{});
+        const payload = try std.json.Stringify.valueAlloc(allocator, surf.state.?, .{});
         self.mutex.unlock(self.io);
         defer allocator.free(payload);
 
@@ -281,8 +439,9 @@ pub const Session = struct {
     /// pruned. Broadcast as a full-list `updateComponents` envelope.
     pub fn removeComponents(self: *Session, allocator: std.mem.Allocator, ids: []const []const u8) !void {
         self.mutex.lockUncancelable(self.io);
-        if (self.state != null and ids.len > 0) {
-            var list = self.state.?.array;
+        const surf = try self.surfaceLocked(surface_id);
+        if (surf.state != null and ids.len > 0) {
+            var list = surf.state.?.array;
             // Drop the entries themselves.
             var i: usize = 0;
             while (i < list.items.len) {
@@ -325,12 +484,12 @@ pub const Session = struct {
                     }
                 }
             }
-            self.state = .{ .array = list };
+            surf.state = .{ .array = list };
         }
         self.version += 1;
         const ver = self.version;
         var payload: ?[]u8 = null;
-        if (self.state) |st|
+        if (surf.state) |st|
             payload = try std.json.Stringify.valueAlloc(allocator, st, .{});
         self.mutex.unlock(self.io);
         defer if (payload) |p| allocator.free(p);
@@ -345,13 +504,13 @@ pub const Session = struct {
         return false;
     }
 
-    /// Merge `items` into the surface adjacency list (upsert by `id`,
+    /// Merge `items` into a surface's adjacency list (upsert by `id`,
     /// preserving existing order; new ids append at the end). Caller
     /// must hold the mutex. `items` values are deep-copied.
-    fn upsertListLocked(self: *Session, items: []const std.json.Value) !void {
-        if (self.state == null)
-            self.state = .{ .array = std.json.Array.init(self.allocator) };
-        const list = &self.state.?.array;
+    fn upsertListLocked(self: *Session, surf: *Surface, items: []const std.json.Value) !void {
+        if (surf.state == null)
+            surf.state = .{ .array = std.json.Array.init(self.allocator) };
+        const list = &surf.state.?.array;
         for (items) |item| {
             const id = item.object.get("id").?.string; // validated
             var replaced = false;
@@ -379,6 +538,10 @@ pub const Session = struct {
         const full = try std.fmt.allocPrint(allocator, "{s}{s}\n\n", .{ head, payload });
         defer allocator.free(full);
 
+        // Plan 4.2 — store in the replay ring before fan-out so a
+        // reconnecting client sees the same frame.
+        try self.replayPush(ver, full);
+
         self.mutex.lockUncancelable(self.io);
         const f = self.broadcast_fn;
         const ud = self.broadcast_userdata;
@@ -391,6 +554,8 @@ pub const Session = struct {
         const full = try std.fmt.allocPrint(allocator, "id: {d}\nevent: a2ui_{s}\ndata: {s}\n\n", .{ ver, kind, env_json });
         defer allocator.free(full);
 
+        try self.replayPush(ver, full);
+
         self.mutex.lockUncancelable(self.io);
         const f = self.broadcast_fn;
         const ud = self.broadcast_userdata;
@@ -398,6 +563,30 @@ pub const Session = struct {
         if (f) |bf| bf(ud.?, full);
     }
 };
+
+/// Extract + validate an envelope's optional `surfaceId`.
+/// - absent → `.none`
+/// - present + valid → `.ok` with the id (borrows from `obj`)
+/// - present + invalid → `.err` with an allocated validation string
+///   (caller frees via the tool path)
+/// Plan 4.2 — any non-empty surfaceId is accepted (surfaces are
+/// created lazily).
+const SurfaceIdResult = union(enum) {
+    none,
+    ok: []const u8,
+    err: []u8,
+};
+
+fn a2uiSurfaceId(allocator: std.mem.Allocator, obj: std.json.Value, base_path: []const u8) !SurfaceIdResult {
+    const v = obj.object.get("surfaceId") orelse return .none;
+    if (v != .string or v.string.len == 0) {
+        const p = try std.fmt.allocPrint(allocator, "{s}/surfaceId", .{base_path});
+        defer allocator.free(p);
+        const e = (try validationError(allocator, "VALIDATION_FAILED", p, "surfaceId must be a non-empty string")).?;
+        return .{ .err = e };
+    }
+    return .{ .ok = v.string };
+}
 
 // ─── validation ─────────────────────────────────────────────────
 
@@ -1153,16 +1342,72 @@ test "applyEnvelope: deleteSurface clears state and data model" {
     try testing.expect(std.mem.indexOf(u8, snap, "\"dataModel\":null") != null);
 }
 
-test "applyEnvelope: wrong surfaceId is rejected" {
+test "applyEnvelope: plan 4.2 — any surfaceId creates a lazy surface; surfaces are independent" {
     var session = Session.init(testing.allocator, undefined);
     defer session.deinit();
     const t = try parse(testing.allocator,
-        \\{"updateComponents":{"surfaceId":"other","components":[]}}
+        \\{"updateComponents":{"surfaceId":"panel","components":[
+        \\  {"id":"root","component":"Column","children":["t"]},
+        \\  {"id":"t","component":"Text","text":"panel text"}
+        \\]}}
     );
     defer freeCopy(testing.allocator, t);
-    const err = (try session.applyEnvelope(testing.allocator, t)).?;
-    defer testing.allocator.free(err);
-    try testing.expect(std.mem.indexOf(u8, err, "unknown surfaceId") != null);
+    try testing.expect((try session.applyEnvelope(testing.allocator, t)) == null);
+
+    // "main" untouched; "panel" has its own state.
+    const snap_main = try session.renderSnapshotJson(testing.allocator);
+    defer testing.allocator.free(snap_main);
+    try testing.expect(std.mem.indexOf(u8, snap_main, "panel text") == null);
+    const snap_all = try session.renderSnapshotAllJson(testing.allocator);
+    defer testing.allocator.free(snap_all);
+    try testing.expect(std.mem.indexOf(u8, snap_all, "\"panel\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap_all, "panel text") != null);
+
+    // Data models are per-surface too.
+    const d = try parse(testing.allocator,
+        \\{"updateDataModel":{"surfaceId":"panel","data":{"x":1}}}
+    );
+    defer freeCopy(testing.allocator, d);
+    try testing.expect((try session.applyEnvelope(testing.allocator, d)) == null);
+    const snap_main2 = try session.renderSnapshotJson(testing.allocator);
+    defer testing.allocator.free(snap_main2);
+    try testing.expect(std.mem.indexOf(u8, snap_main2, "\"x\":1") == null);
+
+    // deleteSurface clears only that surface.
+    const del = try parse(testing.allocator, "{\"deleteSurface\":{\"surfaceId\":\"panel\"}}");
+    defer freeCopy(testing.allocator, del);
+    try testing.expect((try session.applyEnvelope(testing.allocator, del)) == null);
+    const snap_all2 = try session.renderSnapshotAllJson(testing.allocator);
+    defer testing.allocator.free(snap_all2);
+    try testing.expect(std.mem.indexOf(u8, snap_all2, "panel text") == null);
+}
+
+test "applyEnvelope: plan 4.2 — replay ring replays missed envelopes, falls off when too old" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+
+    const t1 = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[{"id":"t","component":"Text","text":"v1"}]}}
+    );
+    defer freeCopy(testing.allocator, t1);
+    try testing.expect((try session.applyEnvelope(testing.allocator, t1)) == null);
+    const d1 = try parse(testing.allocator, "{\"updateDataModel\":{\"data\":{\"a\":1}}}");
+    defer freeCopy(testing.allocator, d1);
+    try testing.expect((try session.applyEnvelope(testing.allocator, d1)) == null);
+
+    // version is 2; replay from 0 yields both frames in order.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expect(try session.replaySince(0, &out));
+    try testing.expect(std.mem.indexOf(u8, out.written(), "a2ui_updateComponents") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "a2ui_updateDataModel") != null);
+    // Up-to-date client replays nothing.
+    var out2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out2.deinit();
+    try testing.expect(try session.replaySince(2, &out2));
+    try testing.expectEqual(@as(usize, 0), out2.written().len);
+    // oldestVersion tracks the ring.
+    try testing.expectEqual(@as(u64, 1), session.oldestVersion());
 }
 
 test "deepCopy + freeCopy round-trip" {

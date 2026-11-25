@@ -2403,23 +2403,35 @@ fn runA2uiSseStream(
 
     var sub = SseSubscriber{ .stream = stream.*, .io = io };
 
-    // Snapshot + register under events_mutex so a broadcast can't
-    // slip between the snapshot and the live registration.
+    // Catch-up + register under events_mutex so a broadcast can't
+    // slip between the catch-up and the live registration. Plan 4.2:
+    // a Last-Event-ID that still falls inside the replay ring replays
+    // the missed envelopes; anything older gets a full snapshot.
     {
         session.events_mutex.lockUncancelable(io);
         defer session.events_mutex.unlock(io);
 
         if (session.a2ui_state.currentVersion() > last_event_id) {
-            const snap = session.a2ui_state.renderSnapshotJson(session.allocator) catch null;
-            if (snap) |s| {
-                defer session.allocator.free(s);
-                var out: std.Io.Writer.Allocating = .init(session.allocator);
-                defer out.deinit();
-                out.writer.print("id: {d}\nevent: a2ui_snapshot\ndata: {s}\n\n", .{ session.a2ui_state.currentVersion(), s }) catch {};
+            var replay: std.Io.Writer.Allocating = .init(session.allocator);
+            defer replay.deinit();
+            const covered = session.a2ui_state.replaySince(last_event_id, &replay) catch false;
+            if (covered and replay.written().len > 0) {
                 var wb: [256]u8 = undefined;
                 var w = stream.writer(io, &wb);
-                w.interface.writeAll(out.written()) catch return;
+                w.interface.writeAll(replay.written()) catch return;
                 w.interface.flush() catch return;
+            } else if (!covered or last_event_id == 0) {
+                const snap = session.a2ui_state.renderSnapshotJson(session.allocator) catch null;
+                if (snap) |s| {
+                    defer session.allocator.free(s);
+                    var out: std.Io.Writer.Allocating = .init(session.allocator);
+                    defer out.deinit();
+                    out.writer.print("id: {d}\nevent: a2ui_snapshot\ndata: {s}\n\n", .{ session.a2ui_state.currentVersion(), s }) catch {};
+                    var wb: [256]u8 = undefined;
+                    var w = stream.writer(io, &wb);
+                    w.interface.writeAll(out.written()) catch return;
+                    w.interface.flush() catch return;
+                }
             }
         }
 
