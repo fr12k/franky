@@ -226,7 +226,18 @@ pub const Session = struct {
 
             self.mutex.lockUncancelable(self.io);
             const surf = try self.surfaceLocked(sid);
-            try pointerAppendString(self.allocator, &surf.data_model, path_v.string, delta_v.string);
+            // Convert internal append errors into an LLM-facing
+            // validation error so the model can self-correct instead
+            // of breaking the tool call (spec: prompt–generate–validate).
+            pointerAppendString(self.allocator, &surf.data_model, path_v.string, delta_v.string) catch |e| {
+                self.mutex.unlock(self.io);
+                return try validationError(allocator, "VALIDATION_FAILED", "/appendDataModel/path", switch (e) {
+                    error.TypeMismatch => "path points at a non-string value",
+                    error.InvalidPath => "path traverses into a non-object value",
+                    error.PathTooDeep => "path exceeds the maximum depth",
+                    else => "failed to append at path",
+                });
+            };
             self.version += 1;
             const ver = self.version;
             self.mutex.unlock(self.io);
