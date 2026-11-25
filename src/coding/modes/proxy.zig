@@ -71,6 +71,7 @@ const extensions_mod = franky.coding.extensions;
 const ext_catalog = franky.coding.extensions_builtin.catalog;
 const review_mod = @import("../review.zig");
 const sse_mod = @import("../sse.zig");
+const a2ui_render_tool = @import("../tools/a2ui_render.zig");
 const compression_mod = franky.coding.compression;
 const config_mod = franky.coding.config.resolver;
 const memory_mod = franky.coding.memory;
@@ -113,9 +114,11 @@ fn patchVersion(html: []const u8) []const u8 {
     return replaceSentinel(
         replaceSentinel(
             replaceSentinel(html, "__FRANKY_VERSION__", franky.version),
-            "__FRANKY_COMMIT__", franky.commit,
+            "__FRANKY_COMMIT__",
+            franky.commit,
         ),
-        "__FRANKY_DATE__", franky.build_date,
+        "__FRANKY_DATE__",
+        franky.build_date,
     );
 }
 
@@ -282,7 +285,6 @@ pub fn run(
     }
 }
 
-
 /// Accept loop — blocks accepting HTTP connections and dispatching
 /// them to handleConnection. Made public so --mode worker can spawn
 /// it in a background thread with zero code duplication.
@@ -320,7 +322,6 @@ pub fn runAcceptLoop(
         session.broadcastEvent(allocator, "event: close\ndata: {}\n\n");
     }
 }
-
 
 // ─── session ─────────────────────────────────────────────────────
 
@@ -1012,14 +1013,21 @@ pub fn initSession(
     {
         const ra_mcp = session.role_arena.allocator();
         session.tools = try config_mod.discoverMcpTools(
-            ra_mcp, io, cfg, session.environ_map, session.tools, &session.mcp_client,
+            ra_mcp,
+            io,
+            cfg,
+            session.environ_map,
+            session.tools,
+            &session.mcp_client,
         );
     }
     // v3.x — auto-mode MCP pre-filter: remove destructive MCP tools.
     if (permission_store.auto_enabled) {
         const ra_pf = session.role_arena.allocator();
         session.tools = try config_mod.filterMcpToolsForAutoMode(
-            ra_pf, session.tools, &permission_store,
+            ra_pf,
+            session.tools,
+            &permission_store,
         );
     }
     // No resume_loaded cleanup — SessionState.init() handled
@@ -1379,7 +1387,6 @@ fn skillsHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!voi
     try ctx.output.appendSlice(ctx.allocator, text);
     try ctx.output.appendSlice(ctx.allocator, "```\n");
 }
-
 
 fn costHandler(ctx: *slash_mod.Ctx, _: []const []const u8) slash_mod.Error!void {
     const px = proxySlashCtx(ctx);
@@ -2497,6 +2504,13 @@ fn respondA2uiAction(
         return;
     }
 
+    // §4.4 — `permission_decision` actions are consumed by the
+    // permission gate, not forwarded to the model.
+    if (std.mem.eql(u8, name_v.string, "permission_decision")) {
+        if (a2uiHandlePermissionDecision(session, stream, io, allocator, action)) return;
+        return; // unreachable today: the handler always responds
+    }
+
     // Build the transcript-facing text: action name + userMessage +
     // resolved context (already resolved renderer-side per spec).
     var msg: std.Io.Writer.Allocating = .init(a);
@@ -2519,6 +2533,143 @@ fn respondA2uiAction(
 
     sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
     runOneTurn(session, allocator, io, text);
+}
+
+/// §4.4 — render a `tool_permission_request` as an A2UI form. The
+/// card is host-injected via `upsertComponents` (no LLM involvement);
+/// its Buttons fire the reserved `permission_decision` action which
+/// `respondA2uiAction` routes to `PermissionPrompter.resolve`. Ids
+/// are prefixed `perm_<call_id>_` so concurrent prompts and model UI
+/// can't collide; `respondA2uiAction` removes the card after a
+/// decision lands.
+fn a2uiProjectPermissionRequest(
+    session: *Session,
+    allocator: std.mem.Allocator,
+    req: anytype,
+) void {
+    const aid = sanitizeA2uiId(allocator, req.call_id) catch return;
+    defer allocator.free(aid);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    const w = &out.writer;
+    w.writeAll("[") catch return;
+    w.print("{{\"id\":\"perm_{s}\",\"component\":\"Card\",\"title\":\"Permission required: {s}\",\"subtitle\":", .{ aid, req.tool_name }) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, req.args_json) catch return;
+    w.print(",\"children\":[\"perm_{s}_remember\",\"perm_{s}_row\"]}}", .{ aid, aid }) catch return;
+    w.print(",{{\"id\":\"perm_{s}_remember\",\"component\":\"CheckBox\",\"label\":\"Remember this decision for future requests\",\"checked\":{{\"@path\":\"/perm/{s}/remember\"}}}}", .{ aid, aid }) catch return;
+    w.print(",{{\"id\":\"perm_{s}_row\",\"component\":\"Row\",\"children\":[\"perm_{s}_allow\",\"perm_{s}_deny\"]}}", .{ aid, aid, aid }) catch return;
+    w.print(",{{\"id\":\"perm_{s}_allow\",\"component\":\"Button\",\"label\":\"Allow\",\"action\":{{\"event\":{{\"name\":\"permission_decision\",\"userMessage\":\"Allow {s}\",\"context\":{{\"call_id\":", .{ aid, req.tool_name }) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, req.call_id) catch return;
+    w.print(",\"decision\":\"allow\",\"remember\":{{\"@path\":\"/perm/{s}/remember\"}}}}}}}}}}", .{aid}) catch return;
+    w.print(",{{\"id\":\"perm_{s}_deny\",\"component\":\"Button\",\"label\":\"Deny\",\"action\":{{\"event\":{{\"name\":\"permission_decision\",\"userMessage\":\"Deny {s}\",\"context\":{{\"call_id\":", .{ aid, req.tool_name }) catch return;
+    a2ui_render_tool.jsonStringifyStr(w, req.call_id) catch return;
+    w.print(",\"decision\":\"deny\",\"remember\":{{\"@path\":\"/perm/{s}/remember\"}}}}}}}}}}", .{aid}) catch return;
+    w.writeAll("]") catch return;
+
+    // A validation failure here is a programming error (the batch is
+    // constructed above), not user input — log and move on rather
+    // than blocking the permission gate.
+    if (session.a2ui_state.upsertComponents(allocator, out.written()) catch null) |err_msg| {
+        defer allocator.free(err_msg);
+        ai.log.log(.warn, "proxy", "a2ui.perm_project", "permission form rejected: {s}", .{err_msg});
+    }
+}
+
+/// Component ids are embedded in data-model paths (`/perm/<id>/…`),
+/// where `/` and `~` are RFC 6901 escapes — replace them (and other
+/// non-alphanumerics) so generated ids stay single path segments.
+fn sanitizeA2uiId(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try allocator.dupe(u8, s);
+    for (out) |*ch| {
+        const ok = (ch.* >= 'a' and ch.* <= 'z') or
+            (ch.* >= 'A' and ch.* <= 'Z') or
+            (ch.* >= '0' and ch.* <= '9') or
+            ch.* == '-' or ch.* == '_';
+        if (!ok) ch.* = '_';
+    }
+    return out;
+}
+
+/// §4.4 — handle a `permission_decision` A2UI action: resolve the
+/// pending prompt, remove the form card from the surface. Returns
+/// true when the action was consumed (caller skips the LLM turn).
+fn a2uiHandlePermissionDecision(
+    session: *Session,
+    stream: *std.Io.net.Stream,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    action: std.json.Value,
+) bool {
+    const ctx = action.object.get("context") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"permission_decision requires a context object\"}");
+        return true;
+    };
+    if (ctx != .object) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context must be an object\"}");
+        return true;
+    }
+    const call_id_v = ctx.object.get("call_id") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.call_id is required\"}");
+        return true;
+    };
+    const decision_v = ctx.object.get("decision") orelse {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.decision is required\"}");
+        return true;
+    };
+    if (call_id_v != .string or decision_v != .string) {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.call_id / context.decision must be strings\"}");
+        return true;
+    }
+    const remember = if (ctx.object.get("remember")) |r| r == .bool and r.bool else false;
+    const allow = std.mem.eql(u8, decision_v.string, "allow");
+    const resolution_str: []const u8 = if (allow)
+        (if (remember) "always_allow" else "allow_once")
+    else if (std.mem.eql(u8, decision_v.string, "deny"))
+        (if (remember) "always_deny" else "deny_once")
+    else {
+        sse_mod.respondJson(stream, io, 400, "{\"ok\":false,\"error\":\"context.decision must be \\\"allow\\\" or \\\"deny\\\"\"}");
+        return true;
+    };
+    const resolution = permissions_mod.Resolution.fromString(resolution_str).?;
+
+    session.resolve_mutex.lockUncancelable(io);
+    defer session.resolve_mutex.unlock(io);
+
+    const prompter = session.current_prompter orelse {
+        sse_mod.respondJson(stream, io, 409, "{\"ok\":false,\"error\":\"no in-flight permission request\"}");
+        return true;
+    };
+    prompter.resolve(call_id_v.string, resolution) catch {
+        sse_mod.respondJson(stream, io, 404, "{\"ok\":false,\"error\":\"stale or unknown call_id\"}");
+        return true;
+    };
+    sse_mod.respondJson(stream, io, 200, "{\"ok\":true}");
+
+    // Best-effort cleanup of the form card. Recompute the id the
+    // same way `a2uiProjectPermissionRequest` did.
+    const aid = sanitizeA2uiId(allocator, call_id_v.string) catch return true;
+    defer allocator.free(aid);
+    const ids = [_][]const u8{
+        std.fmt.allocPrint(allocator, "perm_{s}", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_remember", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_row", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_allow", .{aid}) catch return true,
+        std.fmt.allocPrint(allocator, "perm_{s}_deny", .{aid}) catch return true,
+    };
+    defer for (ids) |x| allocator.free(x);
+    session.a2ui_state.removeComponents(allocator, &ids) catch {};
+    return true;
+}
+
+test "sanitizeA2uiId replaces RFC 6901 / non-alphanumeric characters" {
+    const t = @import("std").testing;
+    const out = try sanitizeA2uiId(t.allocator, "call/a~b c-d_e");
+    defer t.allocator.free(out);
+    try t.expectEqualStrings("call_a_b_c-d_e", out);
 }
 
 // ─── /prompt ─────────────────────────────────────────────────────
@@ -2781,6 +2932,11 @@ fn runOneTurnInternal(
             continue;
         };
         defer allocator.free(frame);
+        // §4.4 — project tool-permission requests into the A2UI
+        // surface as an interactive form (off unless `--a2ui`).
+        if (session.cfg.a2ui_enabled and ev == .tool_permission_request)
+            a2uiProjectPermissionRequest(session, allocator, ev.tool_permission_request);
+
         // Render the HTML frame too when an htmx subscriber is connected.
         // The frame is rendered before ev.deinit frees owned strings.
         if (session.hasHtmlSubscriber()) {
@@ -3039,7 +3195,6 @@ fn writeMessageForUi(
     try buf.append(allocator, '}');
 }
 
-
 // ─── §H.4 + v1.7.0: session-management routes ───────────────────
 
 /// `GET /session` — return the active session's id + the count of
@@ -3137,7 +3292,7 @@ fn respondUsage(
     var cum_output: u64 = 0;
     for (session.transcript.messages.items) |m| {
         if (m.usage) |u| {
-            cum_input = u.input;  // last wins — API reports total context
+            cum_input = u.input; // last wins — API reports total context
             cum_output += u.output;
         }
     }
@@ -5785,6 +5940,137 @@ test "proxy: POST /permission/resolve with a wired prompter succeeds + wakes the
     try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "\"ok\":true") != null);
     try testing.expectEqual(permissions_mod.Resolution.allow_once, worker.result.?);
+}
+
+test "proxy: POST /a2ui/action permission_decision resolves the pending prompt + clears the card" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return;
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    // Seed the surface with a root so the injected card attaches.
+    const seed =
+        \\{"updateComponents":{"components":[
+        \\  {"id":"root","component":"Column","children":["t"]},
+        \\  {"id":"t","component":"Text","text":"hi"}
+        \\]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, seed, .{});
+    defer parsed.deinit();
+    try testing.expect((try ts.session.a2ui_state.applyEnvelope(gpa, parsed.value)) == null);
+
+    // Wire a prompter + suspended worker like the /permission/resolve
+    // test. NOTE: heap-allocate the prompter — it is freed AFTER the
+    // worker thread joins (deinit zeroes the struct, and a resolved
+    // worker may still be signaling its condition variable while the
+    // main thread unwinds; the join order makes that safe).
+    var ch = try agent.loop.AgentChannel.initWithDrop(gpa, 8, at.AgentEvent.deinit, gpa);
+    defer ch.deinit();
+    const prompter = try gpa.create(permissions_mod.PermissionPrompter);
+    prompter.* = permissions_mod.PermissionPrompter.init(gpa, io, &ch);
+    ts.session.current_prompter = prompter;
+    defer ts.session.current_prompter = null;
+    var worker_joined = false;
+    defer if (!worker_joined) {
+        prompter.deinit();
+        gpa.destroy(prompter);
+    };
+
+    const Worker = struct {
+        result: ?permissions_mod.Resolution = null,
+        prompter: *permissions_mod.PermissionPrompter,
+
+        fn run(self: *@This()) void {
+            self.result = self.prompter.requestAndWait("bash", "c1", "{\"command\":\"git status\"}") catch null;
+        }
+    };
+    var worker = Worker{ .prompter = prompter };
+    const wt = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+
+    var ev = ch.next(io).?;
+    try testing.expect(ev == .tool_permission_request);
+    const req_ev = ev.tool_permission_request;
+    // Project the event into the A2UI surface (what the runOneTurn
+    // drain loop does in production).
+    a2uiProjectPermissionRequest(&ts.session, gpa, req_ev);
+    ev.deinit(gpa);
+
+    const snap1 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap1);
+    try testing.expect(std.mem.indexOf(u8, snap1, "\"perm_c1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "permission_decision") != null);
+    try testing.expect(std.mem.indexOf(u8, snap1, "Remember this decision") != null);
+
+    // User clicks "Allow" with the remember checkbox ticked.
+    const body =
+        \\{"version":"1.0","action":{"name":"permission_decision","surfaceId":"main",
+        \\ "sourceComponentId":"perm_c1_allow","timestamp":"2026-11-25T00:00:00Z",
+        \\ "context":{"call_id":"c1","decision":"allow","remember":true}}}
+    ;
+    const req = try std.fmt.allocPrint(
+        gpa,
+        "POST /a2ui/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer gpa.free(req);
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
+    wt.join();
+    // Worker finished — safe to tear the prompter down now (no
+    // pending slots, no one signaling).
+    worker_joined = true;
+    prompter.deinit();
+    gpa.destroy(prompter);
+
+    try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
+    try testing.expectEqual(permissions_mod.Resolution.always_allow, worker.result.?);
+
+    // The permission card was removed; the model UI survived.
+    const snap2 = try ts.session.a2ui_state.renderSnapshotJson(gpa);
+    defer gpa.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"perm_c1\"") == null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"hi\"") != null);
+    // No LLM turn ran — the action was consumed by the gate.
+    try testing.expectEqual(@as(usize, 0), ts.session.transcript.messages.items.len);
+}
+
+test "proxy: POST /a2ui/action permission_decision without a pending prompt returns 409" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return;
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{ "franky", "--a2ui" });
+    defer ts.deinit();
+
+    const body =
+        \\{"version":"1.0","action":{"name":"permission_decision","surfaceId":"main",
+        \\ "context":{"call_id":"nope","decision":"deny","remember":false}}}
+    ;
+    const req = try std.fmt.allocPrint(
+        gpa,
+        "POST /a2ui/action HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    defer gpa.free(req);
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, req, &resp);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 409") != null);
 }
 
 test "proxy: GET /transcript returns the live transcript" {

@@ -248,10 +248,40 @@ system prompt, `/a2ui/action` round-trips into the transcript and produces an
 agent turn, invalid action payloads → 400.
 
 PoC scope cuts (vs. full plan): one fixed surface `"main"` (createSurface
-optional/idempotent), full-replace `updateComponents`, snapshot instead of a
-replay ring, no permission-form integration, no `emit_ui` structured-output
-tool (the model emits via the regular tool-call channel), minimal 5-component
-catalog.
+optional/idempotent), snapshot instead of a replay ring, no `emit_ui`
+structured-output tool (the model emits via the regular tool-call channel).
+
+### 8.1 Round 2 (2026-11) — permission-form integration (§4.4) + translator seed (§4.3)
+
+- **Permission forms (§4.4 closed).** `tool_permission_request` events are
+  projected into the A2UI surface as a host-injected `Card`
+  (`a2uiProjectPermissionRequest` in `proxy.zig`): tool name + raw args as
+  title/subtitle, a "Remember this decision" `CheckBox` (two-way bound to
+  `/perm/<call_id>/remember`), and Allow/Deny `Button`s firing the reserved
+  `permission_decision` action. `POST /a2ui/action` intercepts
+  `permission_decision` and resolves the pending prompt via
+  `PermissionPrompter.resolve` (`allow_once`/`always_allow`/`deny_once`/
+  `always_deny` from decision+remember) — the action never reaches the LLM.
+  After resolving, the card is removed from the surface. Proxy-level tests
+  cover the full round-trip (request → card → decision → resolution +
+  card cleanup) and the no-pending-prompt 409 path.
+- **Host-side projection API (§4.3 seed).** `a2ui.zig` gained
+  `upsertComponents` (validate + merge into the adjacency list by id) and
+  `removeComponents` (drop ids, prune dangling child references), both
+  broadcast as regular `updateComponents` envelopes. This is the mechanism
+  the future `AgentEvent` → A2UI translator will use; the permission
+  projection is its first consumer.
+- **Catalog: +`CheckBox`, +`Card`** (validation + vanilla-JS rendering,
+  two-way boolean binding for `checked`).
+- **Renderer convergence.** `updateComponents` is now upsert-by-id on both
+  server (`upsertComponents`) and renderer (was full-replace), so
+  host-injected UI survives the model's full-tree re-renders; components
+  not reachable from `root` (e.g. permission cards) render after the
+  model tree. Snapshots now carry `surfaceId`.
+
+Remaining scope cuts after round 2: single surface, snapshot instead of a
+replay ring, no `emit_ui` tool, no per-delta streaming text (open question
+§7.2), no AG-UI binding (open question §7.1).
 
 ## 7. Open questions (resolve before execution)
 

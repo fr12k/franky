@@ -41,6 +41,16 @@
     border-radius: 6px; padding: 7px 10px; font-size: 14px;
   }
   .a2-field input:focus { outline: none; border-color: var(--accent); }
+  .a2-check { display: flex; flex-direction: row; gap: 8px; align-items: center; }
+  .a2-check label { font-size: 13px; color: var(--fg); }
+  .a2-check input { accent-color: var(--accent); width: 16px; height: 16px; }
+  .a2-card-box {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .a2-card-box > .a2-card-title { margin: 0; font-size: 14px; font-weight: 600; }
+  .a2-card-box > .a2-card-sub { margin: -8px 0 0; font-size: 12px; color: var(--dim); white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -154,6 +164,48 @@ const renderers = {
     wrap.append(label, input);
     return wrap;
   },
+  CheckBox(def) {
+    const wrap = document.createElement("div");
+    wrap.className = "a2-check";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.id = "a2cb-" + def.id;
+    const label = document.createElement("label");
+    label.htmlFor = input.id;
+    label.textContent = resolveDynamic(def.label);
+    const binding = def.checked && typeof def.checked === "object" ? def.checked["@path"] : null;
+    if (binding) {
+      const cur = pointerGet(state.dataModel, binding);
+      input.checked = cur === true;
+      // Two-way binding, renderer-local per spec.
+      input.addEventListener("change", () => {
+        if (state.dataModel == null || typeof state.dataModel !== "object") state.dataModel = {};
+        pointerSet(state.dataModel, binding, input.checked);
+      });
+    } else {
+      input.checked = def.checked === true;
+    }
+    wrap.append(input, label);
+    return wrap;
+  },
+  Card(def, render) {
+    const el = document.createElement("div");
+    el.className = "a2-card-box";
+    if (def.title != null) {
+      const t = document.createElement("p");
+      t.className = "a2-card-title";
+      t.textContent = resolveDynamic(def.title);
+      el.appendChild(t);
+    }
+    if (def.subtitle != null) {
+      const s = document.createElement("p");
+      s.className = "a2-card-sub";
+      s.textContent = resolveDynamic(def.subtitle);
+      el.appendChild(s);
+    }
+    for (const kid of def.children || []) render(kid, el);
+    return el;
+  },
 };
 
 function render() {
@@ -168,7 +220,7 @@ function render() {
   const byId = new Map(state.components.map(c => [c.id, c]));
   const renderInto = (id, parent) => {
     const def = byId.get(id);
-    if (!def) return;
+    if (!def) return; // dangling reference (id not in this surface)
     const r = renderers[def.component];
     if (!r) {
       const w = document.createElement("div");
@@ -179,7 +231,26 @@ function render() {
     }
     parent.appendChild(r(def, renderInto));
   };
-  renderInto("root", surfaceEl);
+  if (byId.has("root")) {
+    // Model-driven tree rooted at "root"; any unattached components
+    // (e.g. host-injected permission cards) render after it.
+    const attached = new Set();
+    (function mark(id) {
+      if (!id || attached.has(id)) return;
+      attached.add(id);
+      const def = byId.get(id);
+      if (!def) return;
+      for (const k of def.children || []) mark(k);
+      if (def.child) mark(def.child);
+    })("root");
+    renderInto("root", surfaceEl);
+    for (const c of state.components) {
+      if (!attached.has(c.id)) renderInto(c.id, surfaceEl);
+    }
+  } else {
+    // No "root" component (host-injected UI only) — render in list order.
+    for (const c of state.components) renderInto(c.id, surfaceEl);
+  }
 }
 
 // ── actions → agent ───────────────────────────────────────────────
@@ -223,7 +294,22 @@ function deepMerge(dst, src) {
 function applyEnvelope(env) {
   if (env.createSurface) return; // surface is implicit in the PoC
   if (env.updateComponents) {
-    state.components = env.updateComponents.components || [];
+    // Upsert semantics: components with a matching id are replaced in
+    // place, new ids append; ids absent from the batch are kept. This
+    // lets host-side projections (permission cards) and incremental
+    // updates coexist with full-tree model renders (a full render
+    // always includes every id it manages, so it still converges).
+    const batch = env.updateComponents.components || [];
+    const byId = new Map(state.components.map((c, i) => [c.id, i]));
+    for (const c of batch) {
+      const idx = byId.get(c.id);
+      if (idx === undefined) {
+        byId.set(c.id, state.components.length);
+        state.components.push(c);
+      } else {
+        state.components[idx] = c;
+      }
+    }
     render();
     return;
   }

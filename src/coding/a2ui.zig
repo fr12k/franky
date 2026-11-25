@@ -11,7 +11,10 @@
 //!     batch replaces the whole adjacency list — simple and
 //!     convergence-friendly for a PoC) and `updateDataModel`
 //!     (deep-merge into the surface data model).
-//!   - Basic catalog only: Column, Row, Text, Button, TextField.
+//!   - Catalog: Column, Row, Text, Button, TextField, CheckBox, Card.
+//!   - Host-side projection: `upsertComponents` / `removeComponents`
+//!     let the proxy inject UI (e.g. tool-permission forms per plan
+//!     §4.4) without going through the LLM tool path.
 //!   - Dynamic strings: plain string or `{ "@path": "/json/pointer" }`.
 //!     `@call` function bindings are NOT supported (rejected).
 //!   - Two-way binding is renderer-local per spec; state reaches the
@@ -178,6 +181,8 @@ pub const Session = struct {
         try jw.beginObject();
         try jw.objectField("version");
         try jw.write(self.version);
+        try jw.objectField("surfaceId");
+        try jw.write(surface_id);
         try jw.objectField("components");
         if (self.state) |s| {
             try jw.write(s);
@@ -197,6 +202,133 @@ pub const Session = struct {
         return self.version;
     }
 
+    /// Host-side component projection (§4.3 translator seed): inject
+    /// or replace components in the surface adjacency list without
+    /// going through the LLM tool path. Used by the proxy to render
+    /// `tool_permission_request` events as A2UI forms. The batch is
+    /// validated (with per-id upsert semantics) and broadcast as a
+    /// regular `updateComponents` envelope, so renderers just apply
+    /// their normal upsert.
+    pub fn upsertComponents(self: *Session, allocator: std.mem.Allocator, components: []const u8) !?[]u8 {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, components, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array)
+            return try validationError(allocator, "VALIDATION_FAILED", "/components", "components must be an array");
+
+        if (try validateComponents(a, parsed.value.array.items)) |err_msg|
+            return try allocator.dupe(u8, err_msg);
+
+        self.mutex.lockUncancelable(self.io);
+        try upsertListLocked(self, parsed.value.array.items);
+        self.version += 1;
+        const ver = self.version;
+        const payload = try std.json.Stringify.valueAlloc(allocator, self.state.?, .{});
+        self.mutex.unlock(self.io);
+        defer allocator.free(payload);
+
+        const env = try std.fmt.allocPrint(allocator, "{{\"updateComponents\":{{\"surfaceId\":\"{s}\",\"components\":{s}}}}}", .{ surface_id, payload });
+        defer allocator.free(env);
+        try self.broadcastRaw(allocator, "updateComponents", env, ver);
+        return null;
+    }
+
+    /// Host-side removal of components by id (e.g. a resolved
+    /// permission card). Children lists referencing removed ids are
+    /// pruned. Broadcast as a full-list `updateComponents` envelope.
+    pub fn removeComponents(self: *Session, allocator: std.mem.Allocator, ids: []const []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        if (self.state != null and ids.len > 0) {
+            var list = self.state.?.array;
+            // Drop the entries themselves.
+            var i: usize = 0;
+            while (i < list.items.len) {
+                const c = list.items[i];
+                const id_v = if (c == .object) c.object.get("id") else null;
+                const hit = if (id_v != null and id_v.? == .string) containsId(ids, id_v.?.string) else false;
+                if (hit) {
+                    freeCopy(self.allocator, c);
+                    _ = list.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            // Prune dangling child references. NOTE: mutate the
+            // `children` ArrayList through the `getPtr` pointer — a
+            // copied struct would leave the in-tree list with a stale
+            // length and corrupt subsequent serialization.
+            for (list.items) |*c| {
+                if (c.* != .object) continue;
+                if (c.object.getPtr("children")) |ch| {
+                    if (ch.* == .array) {
+                        const kids = &ch.array;
+                        var k: usize = 0;
+                        while (k < kids.items.len) {
+                            const kid = kids.items[k];
+                            const dangling = if (kid == .string) containsId(ids, kid.string) else false;
+                            if (dangling) {
+                                freeCopy(self.allocator, kid);
+                                _ = kids.orderedRemove(k);
+                            } else {
+                                k += 1;
+                            }
+                        }
+                    }
+                }
+                if (c.object.getPtr("child")) |ch| {
+                    if (ch.* == .string and containsId(ids, ch.string)) {
+                        freeCopy(self.allocator, ch.*);
+                        _ = c.object.orderedRemove("child");
+                    }
+                }
+            }
+            self.state = .{ .array = list };
+        }
+        self.version += 1;
+        const ver = self.version;
+        var payload: ?[]u8 = null;
+        if (self.state) |st|
+            payload = try std.json.Stringify.valueAlloc(allocator, st, .{});
+        self.mutex.unlock(self.io);
+        defer if (payload) |p| allocator.free(p);
+
+        const env = try std.fmt.allocPrint(allocator, "{{\"updateComponents\":{{\"surfaceId\":\"{s}\",\"components\":{s}}}}}", .{ surface_id, payload orelse "[]" });
+        defer allocator.free(env);
+        try self.broadcastRaw(allocator, "updateComponents", env, ver);
+    }
+
+    fn containsId(ids: []const []const u8, id: []const u8) bool {
+        for (ids) |x| if (std.mem.eql(u8, x, id)) return true;
+        return false;
+    }
+
+    /// Merge `items` into the surface adjacency list (upsert by `id`,
+    /// preserving existing order; new ids append at the end). Caller
+    /// must hold the mutex. `items` values are deep-copied.
+    fn upsertListLocked(self: *Session, items: []const std.json.Value) !void {
+        if (self.state == null)
+            self.state = .{ .array = std.json.Array.init(self.allocator) };
+        const list = &self.state.?.array;
+        for (items) |item| {
+            const id = item.object.get("id").?.string; // validated
+            var replaced = false;
+            for (list.items) |*existing| {
+                const eid = existing.object.get("id").?.string;
+                if (std.mem.eql(u8, eid, id)) {
+                    freeCopy(self.allocator, existing.*);
+                    existing.* = try deepCopy(self.allocator, item);
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced)
+                try list.append(try deepCopy(self.allocator, item));
+        }
+    }
+
     // ── internals ─────────────────────────────────────────────────
 
     fn broadcast(self: *Session, allocator: std.mem.Allocator, kind: []const u8, env: std.json.Value, ver: u64) !void {
@@ -213,11 +345,23 @@ pub const Session = struct {
         self.mutex.unlock(self.io);
         if (f) |bf| bf(ud.?, full);
     }
+
+    /// Like `broadcast`, but `env` is a pre-serialized JSON envelope.
+    fn broadcastRaw(self: *Session, allocator: std.mem.Allocator, kind: []const u8, env_json: []const u8, ver: u64) !void {
+        const full = try std.fmt.allocPrint(allocator, "id: {d}\nevent: a2ui_{s}\ndata: {s}\n\n", .{ ver, kind, env_json });
+        defer allocator.free(full);
+
+        self.mutex.lockUncancelable(self.io);
+        const f = self.broadcast_fn;
+        const ud = self.broadcast_userdata;
+        self.mutex.unlock(self.io);
+        if (f) |bf| bf(ud.?, full);
+    }
 };
 
 // ─── validation ─────────────────────────────────────────────────
 
-const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField" };
+const known_components = [_][]const u8{ "Column", "Row", "Text", "Button", "TextField", "CheckBox", "Card" };
 
 fn isKnownComponent(name: []const u8) bool {
     for (known_components) |k| if (std.mem.eql(u8, k, name)) return true;
@@ -251,29 +395,29 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
         if (comp_v != .string)
             return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), "component type must be a string");
         if (!isKnownComponent(comp_v.string))
-            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — PoC catalog: Column, Row, Text, Button, TextField", .{comp_v.string}));
+            return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/component", .{path_prefix}), try std.fmt.allocPrint(a, "unknown component \"{s}\" — catalog: Column, Row, Text, Button, TextField, CheckBox, Card", .{comp_v.string}));
     }
 
     // Pass 2: structural references + per-type prop validation.
+    // Child references must be id strings; a reference may point at a
+    // component defined outside this batch (upsert semantics — the
+    // host-side permission projection and incremental updates rely on
+    // it). The renderer ignores dangling ids at render time.
     for (items, 0..) |c, i| {
         const path_prefix = try std.fmt.allocPrint(a, "/components/{d}", .{i});
         const comp = c.object.get("component").?.string;
 
         if (c.object.get("children")) |ch| {
             if (ch != .array)
-                return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/children", .{path_prefix}), "children must be an array of component ids (template ChildLists are not supported in the PoC)");
+                return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/children", .{path_prefix}), "children must be an array of component ids (template ChildLists are not supported)");
             for (ch.array.items, 0..) |kid, k| {
                 if (kid != .string)
                     return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/children/{d}", .{ path_prefix, k }), "child reference must be a component id string");
-                if (!ids.contains(kid.string))
-                    return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/children/{d}", .{ path_prefix, k }), try std.fmt.allocPrint(a, "child \"{s}\" is not a defined component id", .{kid.string}));
             }
         }
         if (c.object.get("child")) |ch| {
             if (ch != .string)
                 return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/child", .{path_prefix}), "child must be a component id string");
-            if (!ids.contains(ch.string))
-                return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/child", .{path_prefix}), try std.fmt.allocPrint(a, "child \"{s}\" is not a defined component id", .{ch.string}));
         }
 
         if (std.mem.eql(u8, comp, "Text")) {
@@ -304,6 +448,25 @@ fn validateComponents(a: std.mem.Allocator, items: []const std.json.Value) !?[]u
                 return try validationError(a, "VALIDATION_FAILED", path_prefix, "TextField component requires \"value\" ({\"@path\": \"/...\"} two-way binding)");
             if (v != .object or v.object.get("@path") == null)
                 return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/value", .{path_prefix}), "TextField.value must be a {\"@path\": \"/...\"} binding (two-way binding requires a data path)");
+        } else if (std.mem.eql(u8, comp, "CheckBox")) {
+            const l = c.object.get("label") orelse
+                return try validationError(a, "VALIDATION_FAILED", path_prefix, "CheckBox component requires \"label\"");
+            if (try validateDynamicString(a, l, try std.fmt.allocPrint(a, "{s}/label", .{path_prefix}))) |e| return e;
+            const v = c.object.get("checked") orelse
+                return try validationError(a, "VALIDATION_FAILED", path_prefix, "CheckBox component requires \"checked\" (boolean or {\"@path\": \"/...\"} two-way binding)");
+            switch (v) {
+                .bool => {},
+                .object => {
+                    if (v.object.get("@path") == null)
+                        return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/checked", .{path_prefix}), "CheckBox.checked object must be a {\"@path\": \"/...\"} binding (@call is not supported)");
+                },
+                else => return try validationError(a, "VALIDATION_FAILED", try std.fmt.allocPrint(a, "{s}/checked", .{path_prefix}), "CheckBox.checked must be a boolean or a {\"@path\": \"/...\"} binding"),
+            }
+        } else if (std.mem.eql(u8, comp, "Card")) {
+            if (c.object.get("title")) |t|
+                if (try validateDynamicString(a, t, try std.fmt.allocPrint(a, "{s}/title", .{path_prefix}))) |e| return e;
+            if (c.object.get("subtitle")) |t|
+                if (try validateDynamicString(a, t, try std.fmt.allocPrint(a, "{s}/subtitle", .{path_prefix}))) |e| return e;
         }
     }
     return null;
@@ -444,15 +607,21 @@ pub const system_prompt_block: []const u8 =
     \\  `{"@path": "/json/pointer"}` (RFC 6901).
     \\- `deleteSurface` — `{"deleteSurface":{"surfaceId":"main"}}` clears the UI.
     \\
-    \\PoC catalog (only these components exist):
+    \\Catalog (only these components exist):
     \\- `Column` / `Row`: `{"id","component":"Column","children":["<id>",...]}`
+    \\- `Card`: `{"id","component":"Card","title":"...","subtitle":"...","children":[...]}`
+    \\  (title/subtitle optional; a titled container for grouping content)
     \\- `Text`: `{"id","component":"Text","text":"..."}` — `text` is a string or `{"@path": "/..."}`
     \\- `Button`: `{"id","component":"Button","label":"...","action":{"event":{"name":"<snake_case>","userMessage":"...","context":{"k":{"@path":"/..."}}}}}`
     \\- `TextField`: `{"id","component":"TextField","label":"...","value":{"@path":"/form/field"}}`
     \\  (two-way bound: user edits update the local data model; nothing is sent until a Button action fires)
+    \\- `CheckBox`: `{"id","component":"CheckBox","label":"...","checked":{"@path":"/form/flag"}}`
+    \\  (two-way bound boolean; `checked` may also be a literal `true`/`false`)
     \\
     \\When the user clicks a Button, its `action.event` comes back to you as a user
     \\message (`[A2UI action] name=... context=...`) — treat it like a normal instruction.
+    \\Exception: Button actions named `permission_decision` are consumed by the
+    \\permission gate (approve/deny tool calls) and never reach you.
     \\
     \\Example — a name form:
     \\```json
@@ -517,16 +686,105 @@ test "applyEnvelope: unknown component is rejected with catalog hint" {
     try testing.expectEqual(@as(u64, 0), session.currentVersion());
 }
 
-test "applyEnvelope: dangling child reference is rejected" {
+test "applyEnvelope: child reference to an id outside the batch is allowed (upsert semantics)" {
     var session = Session.init(testing.allocator, undefined);
     defer session.deinit();
     const t = try parse(testing.allocator,
         \\{"updateComponents":{"components":[{"id":"root","component":"Column","children":["nope"]}]}}
     );
     defer freeCopy(testing.allocator, t);
+    const err = try session.applyEnvelope(testing.allocator, t);
+    try testing.expect(err == null);
+}
+
+test "applyEnvelope: non-string child reference is rejected" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+    const t = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[{"id":"root","component":"Column","children":[42]}]}}
+    );
+    defer freeCopy(testing.allocator, t);
     const err = (try session.applyEnvelope(testing.allocator, t)).?;
     defer testing.allocator.free(err);
-    try testing.expect(std.mem.indexOf(u8, err, "not a defined component id") != null);
+    try testing.expect(std.mem.indexOf(u8, err, "child reference must be a component id string") != null);
+}
+
+test "upsertComponents: injects, replaces, and removeComponents prunes" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+
+    const t = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"root","component":"Column","children":["t"]},
+        \\  {"id":"t","component":"Text","text":"hello"}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, t);
+    _ = try session.applyEnvelope(testing.allocator, t);
+
+    // Attach a card to the existing root + replace the text.
+    const err = try session.upsertComponents(testing.allocator,
+        \\[
+        \\  {"id":"root","component":"Column","children":["t","card"]},
+        \\  {"id":"card","component":"Card","title":"Perm","children":["c_txt"]},
+        \\  {"id":"c_txt","component":"Text","text":"allow?"},
+        \\  {"id":"t","component":"Text","text":"updated"}
+        \\]
+    );
+    try testing.expect(err == null);
+    const snap = try session.renderSnapshotJson(testing.allocator);
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"updated\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"Perm\"") != null);
+    // Original root + text preserved; root now references the card.
+    try testing.expect(std.mem.indexOf(u8, snap, "\"root\"") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "\"surfaceId\":\"main\"") != null);
+
+    // Remove the card: entries gone, dangling references pruned.
+    try session.removeComponents(testing.allocator, &.{ "card", "c_txt" });
+    const snap2 = try session.renderSnapshotJson(testing.allocator);
+    defer testing.allocator.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"card\"") == null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"c_txt\"") == null);
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"updated\"") != null);
+    // root's children list must no longer reference "card".
+    try testing.expect(std.mem.indexOf(u8, snap2, "\"children\":[\"t\"]") != null);
+}
+
+test "upsertComponents: invalid batch is rejected without mutation" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+    const ver = session.currentVersion();
+    const err = (try session.upsertComponents(testing.allocator,
+        \\[{"id":"x","component":"Iframe"}]
+    )).?;
+    defer testing.allocator.free(err);
+    try testing.expect(std.mem.indexOf(u8, err, "unknown component") != null);
+    try testing.expectEqual(ver, session.currentVersion());
+}
+
+test "applyEnvelope: CheckBox and Card validate" {
+    var session = Session.init(testing.allocator, undefined);
+    defer session.deinit();
+    const t = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"root","component":"Column","children":["c","cb"]},
+        \\  {"id":"c","component":"Card","title":"T","subtitle":{"@path":"/s"}},
+        \\  {"id":"cb","component":"CheckBox","label":"L","checked":{"@path":"/f/r"}}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, t);
+    try testing.expect((try session.applyEnvelope(testing.allocator, t)) == null);
+
+    const bad = try parse(testing.allocator,
+        \\{"updateComponents":{"components":[
+        \\  {"id":"cb","component":"CheckBox","label":"L","checked":"yes"}
+        \\]}}
+    );
+    defer freeCopy(testing.allocator, bad);
+    const err = (try session.applyEnvelope(testing.allocator, bad)).?;
+    defer testing.allocator.free(err);
+    try testing.expect(std.mem.indexOf(u8, err, "CheckBox.checked") != null);
 }
 
 test "applyEnvelope: @call binding is rejected" {

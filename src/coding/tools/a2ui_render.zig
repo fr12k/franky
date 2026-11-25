@@ -18,6 +18,13 @@ const ai = ct.ai;
 const common = @import("common.zig");
 const a2ui_mod = @import("../a2ui.zig");
 
+/// Write `s` to `writer` as a JSON string literal (quoted + escaped).
+/// Used by the proxy's host-side A2UI projections to build component
+/// batches safely (plan §4.4 — tool names / args may contain quotes).
+pub fn jsonStringifyStr(writer: *std.Io.Writer, s: []const u8) !void {
+    try std.json.Stringify.value(s, .{}, writer);
+}
+
 pub const parameters_json: []const u8 =
     \\{
     \\  "type": "object",
@@ -39,8 +46,9 @@ pub fn tool(session: *a2ui_mod.Session) at.AgentTool {
         .description = "Render or update rich interactive UI in the user's browser using A2UI v1.0 " ++
             "messages (createSurface / updateComponents / updateDataModel / deleteSurface). " ++
             "Use for forms, cards, dashboards — anything a visual layout communicates better " ++
-            "than prose. The UI tree is full-replace: always send the complete component list " ++
-            "in updateComponents. PoC catalog: Column, Row, Text, Button, TextField.",
+            "than prose. Always send the complete component list for the part of the UI " ++
+            "you manage in updateComponents. Catalog: Column, Row, Text, Button, TextField, " ++
+            "CheckBox, Card.",
         .parameters_json = parameters_json,
         .execution_mode = .sequential,
         .ctx = @ptrCast(session),
@@ -86,13 +94,12 @@ fn execute(
             // a2ui.zig applyEnvelope doc) — free after formatting.
             defer allocator.free(err_json);
             const msg = try std.fmt.allocPrint(allocator, "message {d} failed validation: {s}", .{ i, err_json });
+            defer allocator.free(msg); // toolError formats its own copy
             return common.toolError(allocator, "a2ui_validation", msg);
         }
     }
 
-    const text = try std.fmt.allocPrint(allocator,
-        "Rendered {d} A2UI message(s) to surface \"{s}\" (version {d}). The UI is now visible in the user's browser.",
-        .{ msgs.array.items.len, a2ui_mod.surface_id, session.currentVersion() });
+    const text = try std.fmt.allocPrint(allocator, "Rendered {d} A2UI message(s) to surface \"{s}\" (version {d}). The UI is now visible in the user's browser.", .{ msgs.array.items.len, a2ui_mod.surface_id, session.currentVersion() });
     const content_arr = try allocator.alloc(ai.types.ContentBlock, 1);
     content_arr[0] = .{ .text = .{ .text = text } };
     return .{ .content = content_arr };
@@ -121,7 +128,7 @@ test "a2ui_render: valid envelopes reach the session state" {
         \\  {"updateDataModel":{"surfaceId":"main","data":{"form":{"name":"Frank"}}}}
         \\]}
     ;
-    var result = try t.execute(&t, testing.allocator, io, "call1", args, &cancel, null);
+    var result = try t.execute(&t, testing.allocator, io, "call1", args, &cancel, .{});
     defer result.deinit(testing.allocator);
     try testing.expect(!result.is_error);
     try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "2 A2UI message(s)") != null);
@@ -145,7 +152,7 @@ test "a2ui_render: validation failure returns spec-format tool error" {
     const args =
         \\{"messages":[{"updateComponents":{"components":[{"id":"x","component":"Iframe"}]}}]}
     ;
-    var result = try t.execute(&t, testing.allocator, io, "call2", args, &cancel, null);
+    var result = try t.execute(&t, testing.allocator, io, "call2", args, &cancel, .{});
     defer result.deinit(testing.allocator);
     try testing.expect(result.is_error);
     try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "VALIDATION_FAILED") != null);
@@ -162,7 +169,7 @@ test "a2ui_render: missing messages array is invalid_args" {
     const io = threaded.io();
     var cancel: ai.stream.Cancel = .{};
 
-    var result = try t.execute(&t, testing.allocator, io, "call3", "{}", &cancel, null);
+    var result = try t.execute(&t, testing.allocator, io, "call3", "{}", &cancel, .{});
     defer result.deinit(testing.allocator);
     try testing.expect(result.is_error);
     try testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "missing \"messages\" array") != null);
