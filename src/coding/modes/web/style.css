@@ -2115,7 +2115,8 @@ button#send:hover:not(:disabled) {
 
     /* Right-side drawers */
     aside#design-panel,
-    aside#subagent-panel {
+    aside#subagent-panel,
+    aside#a2ui-panel {
         position: fixed;
         top: 0; bottom: 0; right: 0;
         z-index: 120;

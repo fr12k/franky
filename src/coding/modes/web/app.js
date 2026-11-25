@@ -1097,9 +1097,17 @@ function highlightCodeBlocks(container) {
         maybeHideBackdrop();
     }
     (function a2uiInit() {
-        if (!a2uiPanelBtn || typeof A2UI === 'undefined') return;
+        if (!a2uiPanelBtn) return;
+        if (typeof A2UI === 'undefined') {
+            console.warn('[a2ui] panel present but /a2ui.js failed to load — surface disabled');
+            return;
+        }
         fetch('/a2ui.html', { method: 'HEAD' }).then((r) => {
-            if (!r.ok) return; // proxy started without --a2ui
+            if (!r.ok) {
+                console.debug('[a2ui] probe: /a2ui.html ->', r.status, '(--a2ui off; panel hidden)');
+                return;
+            }
+            console.debug('[a2ui] enabled — wiring surface panel');
             a2uiPanelBtn.hidden = false;
             a2uiPanelBtn.addEventListener('click', a2uiToggle);
             if (a2uiPanelClose) a2uiPanelClose.addEventListener('click', a2uiClose);
@@ -1113,7 +1121,9 @@ function highlightCodeBlocks(container) {
                     }
                 },
             });
-        }).catch(() => { /* --a2ui off; leave the button hidden */ });
+        }).catch((e) => {
+            console.warn('[a2ui] probe failed — surface disabled:', e);
+        });
     })();
 
     function showTurnIndicator() {

@@ -2057,10 +2057,16 @@ fn handleConnection(arg: ConnArg) void {
         return;
     };
     const headers = hdr_buf[0..hdr_len.consumed];
-    const req = sse_mod.parseRequest(headers) orelse {
+    var req = sse_mod.parseRequest(headers) orelse {
         sse_mod.respondStatus(&stream, arg.io, 400, "Bad Request");
         return;
     };
+    // HEAD is GET minus the body (RFC 9110). Normalizing here
+    // keeps read-only endpoints probeable — the A2UI feature-detect in
+    // app.js HEADs /a2ui.html — without touching every route. The SSE
+    // routes below are matched before any static asset, so a HEAD
+    // probe can never hijack a stream.
+    if (std.mem.eql(u8, req.method, "HEAD")) req.method = "GET";
 
     if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/health")) {
         sse_mod.respondJson(&stream, arg.io, 200, "{\"ok\":true}");
@@ -6118,6 +6124,33 @@ test "proxy: GET /style.css serves the web UI stylesheet" {
         .expect_substr = ".message-user",
         .expect_content_type = "text/css",
     });
+}
+
+test "proxy: GET /a2ui.js serves the A2UI panel renderer" {
+    try runStaticAssetCase(.{
+        .request_path = "/a2ui.js",
+        .expect_substr = "window.A2UI",
+        .expect_content_type = "text/javascript",
+    });
+}
+
+test "proxy: HEAD is routed like GET (A2UI feature-detect probe)" {
+    var threaded = test_h.threadedIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+
+    var setup = bindLoopback(io) orelse return;
+    defer setup.server.deinit(io);
+
+    var ts: ProxyTestSession = undefined;
+    try ts.initFor(gpa, io, &.{"franky"});
+    defer ts.deinit();
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try runProxyHttpRequest(gpa, io, &setup, &ts.session, "HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", &resp);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "HTTP/1.1 200") != null);
 }
 
 test "proxy: GET /events writes SSE preamble" {
