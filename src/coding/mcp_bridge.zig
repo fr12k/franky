@@ -71,9 +71,8 @@ pub const McpBridge = struct {
     token_raw: [32]u8,
     permission_store: ?*permissions.Store,
     /// Set by `code_exec` while a script is running; cleared on exit.
-    /// Peer-PID checks accept this pid or any pid in its process group.
+    /// Peer-PID checks accept only this exact spawned code_exec PID.
     active_child_pid: std.atomic.Value(posix.pid_t) = .init(-1),
-    active_child_pgid: std.atomic.Value(posix.pid_t) = .init(-1),
     server: ?std.Io.net.Server = null,
     targets: std.StringHashMap(Target),
     stats: std.StringHashMap(BridgeStat),
@@ -154,20 +153,14 @@ pub const McpBridge = struct {
         });
     }
 
-    /// Mark the given pid + its process group as the authorized code_exec
-    /// subprocess. `pgid` accepts every member of the child's process group
-    /// (python, sandboxed grandchildren) without a per-pid getpgid syscall
-    /// on the accept path. Pass `pid` as `pgid` when the wrapper does not
-    /// establish its own group.
-    pub fn setActiveChild(self: *McpBridge, pid: posix.pid_t, pgid: posix.pid_t) void {
-        self.active_child_pgid.store(pgid, .release);
+    /// Mark the spawned code process as the authorized peer.
+    pub fn setActiveChild(self: *McpBridge, pid: posix.pid_t) void {
         self.active_child_pid.store(pid, .release);
     }
 
     /// Clear the authorized child (called when code_exec exits).
     pub fn clearActiveChild(self: *McpBridge) void {
         self.active_child_pid.store(-1, .release);
-        self.active_child_pgid.store(-1, .release);
     }
 
     /// Bind + listen on the UDS socket and set restrictive permissions.
@@ -187,14 +180,26 @@ pub const McpBridge = struct {
 
     /// Stop the accept loop and remove the socket file.
     pub fn shutdown(self: *McpBridge, io: std.Io) void {
-        if (self.running.swap(false, .acq_rel)) {
-            if (self.server) |*s| s.deinit(io);
-            self.server = null;
-        }
         if (self.serve_thread) |t| {
+            self.running.store(false, .release);
+            // Wake a blocking accept with a local connection while the
+            // listening descriptor is still valid. serve() sees running=false
+            // immediately after this accept and closes the wake stream.
+            if (self.server != null) {
+                const addr = std.Io.net.UnixAddress.init(self.socket_path) catch null;
+                if (addr) |a| {
+                    if (a.connect(io)) |stream| {
+                        var wake = stream;
+                        wake.close(io);
+                    } else |_| {}
+                }
+            }
             t.join();
             self.serve_thread = null;
         }
+        self.running.store(false, .release);
+        if (self.server) |*s| s.deinit(io);
+        self.server = null;
         std.Io.Dir.deleteFileAbsolute(io, self.socket_path) catch {};
     }
 
@@ -234,6 +239,9 @@ pub const McpBridge = struct {
             return;
         }
 
+        // Verify again after reading the bounded frame. This closes the
+        // clear-active-child race where an authorized child exits while a
+        // connection is being accepted/read.
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         var chunk: [16384]u8 = undefined;
@@ -251,6 +259,10 @@ pub const McpBridge = struct {
         }
         const line = std.mem.trim(u8, buf.items, " \t\r\n");
         if (line.len == 0) return;
+        if (!self.verifyPeer(stream.socket.handle)) {
+            try self.writeJsonLine(io, stream, "{\"error\":\"unauthorized peer\"}");
+            return;
+        }
 
         // dispatch converts auth/permission/unknown-tool failures into a
         // JSON error payload itself, so the only errors that escape are
@@ -340,21 +352,16 @@ pub const McpBridge = struct {
         return std.crypto.timing_safe.eql([32]u8, provided, self.token_raw);
     }
 
-    /// Verify the connecting peer belongs to the active code_exec child
-    /// (or its process group). Best-effort across platforms; when the
-    /// platform offers no peer-cred mechanism we fail closed unless no
-    /// child has been registered (unit-test / fallback path).
+    /// Verify the connecting peer is exactly the active code_exec child.
+    /// Fail closed on platforms where peer credentials are unavailable.
     fn verifyPeer(self: *McpBridge, handle: posix.fd_t) bool {
         const active = self.active_child_pid.load(.acquire);
-        const active_pgid = self.active_child_pgid.load(.acquire);
         const peer = peerPid(handle) orelse {
-            // No peer-cred support — allow only when nothing registered.
-            return active < 0;
+            // Fail closed when peer credentials are unavailable. A bearer
+            // token alone must not grant access to the bridge.
+            return false;
         };
-        if (active < 0) return true; // no child registered → permissive (tests)
-        if (peer == active) return true;
-        if (active_pgid >= 0 and peer == active_pgid) return true;
-        return false;
+        return active >= 0 and peer == active;
     }
 
     fn recordStat(self: *McpBridge, ns_name: []const u8, is_error: bool, ms: u64, bytes: u64) void {

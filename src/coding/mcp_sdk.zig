@@ -410,7 +410,9 @@ fn writeAtomic(
     const cwd = std.Io.Dir.cwd();
     const target = try std.fs.path.join(allocator, &.{ dir, name });
     defer allocator.free(target);
-    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ target, std.time.nanoTimestamp() });
+    var random_suffix: [8]u8 = undefined;
+    try io.randomSecure(&random_suffix);
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp-{x}", .{ target, random_suffix });
     defer allocator.free(tmp);
 
     {

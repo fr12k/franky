@@ -124,18 +124,13 @@ fn execute(
     try env.put("TMPDIR", "/tmp");
 
     // Construct argv for the detected sandbox.
-    const argv = try buildArgv(aa, io, sandbox, ctx, script_path);
+    const argv = try buildArgv(aa, sandbox, ctx, script_path);
 
     const timeout: std.Io.Timeout = .{ .duration = .{
         .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
         .clock = .awake,
     } };
 
-    // Spawn directly (rather than std.process.run) so we can register the
-    // child's pid + process group with the bridge for peer-PID auth. The
-    // wrapper (bwrap/unshare/sandbox-exec) gets pgid=0 → becomes a process-
-    // group leader, so every python grandchild shares pid==pgid and passes
-    // the bridge's peer check.
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = ctx.workspace_root },
@@ -143,17 +138,16 @@ fn execute(
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-        .pgid = 0, // new process group, led by this child
+        .pgid = 0,
     }) catch |err| switch (err) {
         error.FileNotFound => return common.toolError(allocator, "code_exec_python_missing", "python3 (or sandbox binary) not found in PATH"),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute python3"),
         else => |e| return common.toolError(allocator, "code_exec_spawn_failed", @errorName(e)),
     };
-    defer child.kill(io);
-
-    // Register the authorized child with the bridge; clear on exit.
-    if (child.id) |pid| ctx.bridge.setActiveChild(pid, pid);
+    const child_pid = child.id orelse return common.toolError(allocator, "code_exec_spawn_failed", "spawned process has no PID");
+    ctx.bridge.setActiveChild(child_pid);
     defer ctx.bridge.clearActiveChild();
+    defer terminateProcessGroup(&child, child_pid, io);
 
     const result = collectOutput(allocator, io, &child, timeout) catch |err| switch (err) {
         error.StreamTooLong => return common.toolError(allocator, "code_exec_output_too_large", "output exceeded 8 MiB cap; redirect to a file or print less"),
@@ -164,6 +158,19 @@ fn execute(
     defer allocator.free(result.stderr);
 
     return try formatResult(allocator, ctx, result);
+}
+
+/// Terminate the complete sandbox process group, then reap the direct child.
+/// The child is created with pgid=0, making its PID the process-group ID.
+fn terminateProcessGroup(child: *std.process.Child, pid: std.posix.pid_t, io: std.Io) void {
+    if (child.id == null) return;
+    const os_tag = @import("builtin").os.tag;
+    if (os_tag == .linux or os_tag == .macos or os_tag == .freebsd or os_tag == .openbsd or os_tag == .netbsd) {
+        // Negative pid targets the process group. SIGKILL is intentional here:
+        // this runs only on abnormal return (timeout, output cap, cancellation).
+        _ = std.c.kill(-pid, .KILL);
+    }
+    child.kill(io);
 }
 
 /// Read piped stdout/stderr to EOF with byte caps, then wait for exit.
@@ -258,7 +265,6 @@ fn probe(io: std.Io, argv: []const []const u8) bool {
 /// Allocated on `aa`.
 fn buildArgv(
     aa: std.mem.Allocator,
-    io: std.Io,
     sandbox: Sandbox,
     ctx: *CodeExecCtx,
     script_path: []const u8,
@@ -278,11 +284,8 @@ fn buildArgv(
             });
             // The scratch script + SDK modules live under `sdk_dir`, which
             // may itself be under /tmp — bind it AFTER the tmpfs so it is not
-            // masked. Bind the bridge socket likewise (it is created on
-            // `listen`, so only when present to avoid a missing-source abort).
-            if (socketExists(io, ctx.bridge.socket_path)) {
-                try out.appendSlice(aa, &.{ "--bind", ctx.bridge.socket_path, ctx.bridge.socket_path });
-            }
+            // masked. The bridge socket is not mounted: a host UDS pathname is
+            // not reliably reachable from the isolated network namespace.
             try out.appendSlice(aa, &.{ "--bind", ctx.sdk_dir, ctx.sdk_dir });
             try out.append(aa, "--");
             try out.appendSlice(aa, &py);
