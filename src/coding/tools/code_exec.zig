@@ -131,23 +131,73 @@ fn execute(
         .clock = .awake,
     } };
 
-    const result = std.process.run(allocator, io, .{
+    // Spawn directly (rather than std.process.run) so we can register the
+    // child's pid + process group with the bridge for peer-PID auth. The
+    // wrapper (bwrap/unshare/sandbox-exec) gets pgid=0 → becomes a process-
+    // group leader, so every python grandchild shares pid==pgid and passes
+    // the bridge's peer check.
+    var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = ctx.workspace_root },
-        .stdout_limit = std.Io.Limit.limited(max_output_bytes),
-        .stderr_limit = std.Io.Limit.limited(max_output_bytes),
-        .timeout = timeout,
         .environ_map = &env,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0, // new process group, led by this child
     }) catch |err| switch (err) {
-        error.StreamTooLong => return common.toolError(allocator, "code_exec_output_too_large", "output exceeded 8 MiB cap; redirect to a file or print less"),
         error.FileNotFound => return common.toolError(allocator, "code_exec_python_missing", "python3 (or sandbox binary) not found in PATH"),
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute python3"),
+        else => |e| return common.toolError(allocator, "code_exec_spawn_failed", @errorName(e)),
+    };
+    defer child.kill(io);
+
+    // Register the authorized child with the bridge; clear on exit.
+    if (child.id) |pid| ctx.bridge.setActiveChild(pid, pid);
+    defer ctx.bridge.clearActiveChild();
+
+    const result = collectOutput(allocator, io, &child, timeout) catch |err| switch (err) {
+        error.StreamTooLong => return common.toolError(allocator, "code_exec_output_too_large", "output exceeded 8 MiB cap; redirect to a file or print less"),
+        error.Timeout => return common.toolError(allocator, "code_exec_timeout", "script exceeded its timeoutMs budget"),
         else => |e| return common.toolError(allocator, "code_exec_spawn_failed", @errorName(e)),
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
     return try formatResult(allocator, ctx, result);
+}
+
+/// Read piped stdout/stderr to EOF with byte caps, then wait for exit.
+/// Mirrors `std.process.run`'s collection but over an already-spawned
+/// `Child` whose pid we've registered with the bridge.
+fn collectOutput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    timeout: std.Io.Timeout,
+) !std.process.RunResult {
+    var mr_buf: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var mr: std.Io.File.MultiReader = undefined;
+    mr.init(allocator, io, mr_buf.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer mr.deinit();
+    const out_r = mr.reader(0);
+    const err_r = mr.reader(1);
+
+    while (mr.fill(64, timeout)) |_| {
+        if (out_r.buffered().len > max_output_bytes) return error.StreamTooLong;
+        if (err_r.buffered().len > max_output_bytes) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        error.Timeout => return error.Timeout,
+        else => |e| return e,
+    }
+    try mr.checkAnyError();
+
+    const term = try child.wait(io);
+    const stdout_slice = try mr.toOwnedSlice(0);
+    errdefer allocator.free(stdout_slice);
+    const stderr_slice = try mr.toOwnedSlice(1);
+    errdefer allocator.free(stderr_slice);
+    return .{ .term = term, .stdout = stdout_slice, .stderr = stderr_slice };
 }
 
 /// Write `code` to `<sdk_dir>/.scratch-<rand>.py` atomically and return

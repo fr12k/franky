@@ -1201,12 +1201,12 @@ pub fn initSession(
 
         session.a2ui_state.setBroadcast(@ptrCast(session), Session.a2uiBroadcastTrampoline);
 
-        const base_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+        const base_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null, false);
         defer allocator.free(base_prompt);
         const trimmed = std.mem.trimEnd(u8, base_prompt, &std.ascii.whitespace);
         session.system_prompt = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ trimmed, a2ui_mod.system_prompt_block });
     } else {
-        session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null);
+        session.system_prompt = try print_mode.buildSystemPromptIo(allocator, io, environ, environ_map, cfg, null, false);
     }
 }
 

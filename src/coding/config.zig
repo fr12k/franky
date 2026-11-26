@@ -38,6 +38,8 @@ const compression_mod = franky.coding.compression;
 const memory_mod = franky.coding.memory;
 const memory_guard_mod = franky.agent.guardrails;
 const mcp_mod = franky.coding.mcp;
+const mcp_sdk_mod = franky.coding.mcp_sdk;
+const mcp_bridge_mod = franky.coding.mcp_bridge;
 
 /// Error set for config resolution.
 pub const ResolveError = error{
@@ -175,6 +177,18 @@ pub const ResolvedConfig = struct {
     /// were configured. Owned by the resolver arena.
     mcp_client: ?*mcp_mod.McpClient = null,
 
+    // ── MCP code mode (--mcp-code-mode) ───────────────────────────
+    /// UDS bridge serving the sandboxed `code_exec` subprocess. Non-null
+    /// only when `--mcp-code-mode` is active AND at least one MCP server
+    /// was discovered. Owned by the resolver arena; the bridge thread is
+    /// started by the mode driver via `ensureBridgeThread`.
+    mcp_bridge: ?*mcp_bridge_mod.McpBridge = null,
+    /// Context backing the `code_exec` tool (same lifetime as the bridge).
+    mcp_code_exec_ctx: ?*tools_mod.code_exec.CodeExecCtx = null,
+    /// True only when code mode successfully generated the SDK and
+    /// installed `code_exec`; used to gate its system-prompt hint.
+    mcp_code_mode_active: bool = false,
+
     // ── Arena ────────────────────────────────────────────────────
     /// Everything that outlives `resolve()` is allocated on this arena.
     arena: std.heap.ArenaAllocator,
@@ -189,6 +203,11 @@ pub const ResolvedConfig = struct {
         if (self.workspace) |ws| a.destroy(ws);
         a.destroy(self.read_ctx);
         a.destroy(self.subagent_ctx);
+        // MCP code-mode bridge: shut down listener + remove socket, then
+        // free the code_exec ctx (both arena-allocated; bridge deinit also
+        // destroys its own struct).
+        if (self.mcp_bridge) |b| b.deinitSelf();
+        if (self.mcp_code_exec_ctx) |c| a.destroy(c);
         // Guardrail state owns its sub-structures.
         self.guardrail_state.deinit();
         a.destroy(self.guardrail_state);
@@ -1625,10 +1644,85 @@ pub fn resolve(
     // aren't in autoMode.allow. This prevents the model from even
     // seeing destructive MCP tools like `delete_ticket`, saving a
     // wasted turn + tokens on an inevitable denial.
-    const final_filtered = if (permission_store.auto_enabled)
+    const auto_filtered = if (permission_store.auto_enabled)
         try filterMcpToolsForAutoMode(a, final_with_mcp, permission_store)
     else
         final_with_mcp;
+
+    // ── Step 13.6: MCP code mode (--mcp-code-mode) ───────────────
+    // Instead of exposing each `mcp__*` schema to the model, generate the
+    // Python SDK, start the UDS bridge, and swap the raw MCP tools for a
+    // single sandboxed `code_exec` tool. Only engages when code mode is on,
+    // the role permits code_exec, and at least one MCP tool was discovered.
+    var mcp_bridge_ptr: ?*mcp_bridge_mod.McpBridge = null;
+    var mcp_code_exec_ctx_ptr: ?*tools_mod.code_exec.CodeExecCtx = null;
+    const final_filtered = blk: {
+        if (!cfg.mcp_code_mode) break :blk auto_filtered;
+        if (!role_gate.set.allows("code_exec")) {
+            ai.log.log(.warn, "mcp-code", "resolve", "--mcp-code-mode requires --role code or full; ignoring", .{});
+            break :blk auto_filtered;
+        }
+        const mcp_only = mcpToolsOnly(a, auto_filtered);
+        if (mcp_only.len == 0) {
+            ai.log.log(.warn, "mcp-code", "resolve", "--mcp-code-mode set but no MCP tools discovered; ignoring", .{});
+            break :blk auto_filtered;
+        }
+        const mcp_ws_root = workspace_root orelse {
+            ai.log.log(.warn, "mcp-code", "resolve", "--mcp-code-mode needs a workspace root (PWD); ignoring", .{});
+            break :blk auto_filtered;
+        };
+
+        // Generate the Python SDK (best-effort; failure disables code mode).
+        const servers = mcp_sdk_mod.generate(a, io, mcp_ws_root, mcp_only) catch |err| {
+            ai.log.log(.err, "mcp-code", "resolve", "SDK generation failed: {s}; disabling code mode", .{@errorName(err)});
+            break :blk auto_filtered;
+        };
+
+        // Build + populate the bridge, register every discovered tool.
+        const bridge = mcp_bridge_mod.McpBridge.init(a, io, if (prompts_enabled) permission_store else null) catch |err| {
+            ai.log.log(.err, "mcp-code", "resolve", "bridge init failed: {s}; disabling code mode", .{@errorName(err)});
+            break :blk auto_filtered;
+        };
+        for (mcp_only) |t| {
+            const ctx: *mcp_mod.McpToolCtx = @ptrCast(@alignCast(t.ctx orelse continue));
+            bridge.registerTool(ctx) catch {};
+        }
+        bridge.listen(io) catch |err| {
+            ai.log.log(.err, "mcp-code", "resolve", "bridge listen failed: {s}; disabling code mode", .{@errorName(err)});
+            bridge.deinitSelf();
+            break :blk auto_filtered;
+        };
+        bridge.startServing() catch |err| {
+            ai.log.log(.err, "mcp-code", "resolve", "bridge thread start failed: {s}; disabling code mode", .{@errorName(err)});
+            bridge.deinitSelf();
+            break :blk auto_filtered;
+        };
+
+        const sdk_dir = std.fs.path.join(a, &.{ mcp_ws_root, mcp_sdk_mod.sdk_rel_dir }) catch {
+            bridge.deinitSelf();
+            break :blk auto_filtered;
+        };
+        const ce_ctx = a.create(tools_mod.code_exec.CodeExecCtx) catch {
+            bridge.deinitSelf();
+            break :blk auto_filtered;
+        };
+        ce_ctx.* = .{
+            .bridge = bridge,
+            .workspace_root = mcp_ws_root,
+            .sdk_dir = sdk_dir,
+            .allow_unsandboxed = false,
+        };
+        mcp_bridge_ptr = bridge;
+        mcp_code_exec_ctx_ptr = ce_ctx;
+
+        // Remove raw mcp__* tools from the model's tool list, add code_exec.
+        const stripped = try stripMcpTools(a, auto_filtered);
+        const out = try a.alloc(at.AgentTool, stripped.len + 1);
+        @memcpy(out[0..stripped.len], stripped);
+        out[stripped.len] = tools_mod.code_exec.toolWithCtx(ce_ctx);
+        ai.log.log(.info, "mcp-code", "resolve", "code mode active: {d} MCP server(s) via SDK + code_exec", .{servers});
+        break :blk out;
+    };
 
     // Update subagent ctx's parent_tools to include MCP tools.
     subagent_ctx.parent_tools = final_filtered;
@@ -1724,6 +1818,9 @@ pub fn resolve(
         .memory_guardrail = memory_guardrail,
         .memory_nudge_enabled = cfg.memory_nudge,
         .mcp_client = mcp_client_ptr,
+        .mcp_bridge = mcp_bridge_ptr,
+        .mcp_code_exec_ctx = mcp_code_exec_ctx_ptr,
+        .mcp_code_mode_active = mcp_bridge_ptr != null,
         .arena = arena,
     };
 }
@@ -1733,6 +1830,40 @@ pub fn resolve(
 fn fauxShim(ctx: ai.registry.StreamCtx) anyerror!void {
     const faux_ptr: *ai.providers.faux.FauxProvider = @ptrCast(@alignCast(ctx.userdata.?));
     try faux_ptr.runSync(ctx.io, ctx.context, ctx.out);
+}
+
+/// True when a tool name carries the `mcp__<server>__<tool>` namespace.
+fn isMcpToolName(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "mcp__");
+}
+
+/// Borrowed-value sub-slice of only the `mcp__*` tools in `tools`,
+/// allocated on `allocator` (the resolver arena in practice).
+fn mcpToolsOnly(allocator: std.mem.Allocator, tools: []const at.AgentTool) []const at.AgentTool {
+    var count: usize = 0;
+    for (tools) |t| if (isMcpToolName(t.name)) {
+        count += 1;
+    };
+    if (count == 0) return &.{};
+    const out = allocator.alloc(at.AgentTool, count) catch return &.{};
+    var i: usize = 0;
+    for (tools) |t| {
+        if (isMcpToolName(t.name)) {
+            out[i] = t;
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// Return a copy of `tools` with every `mcp__*` entry removed.
+fn stripMcpTools(allocator: std.mem.Allocator, tools: []const at.AgentTool) ![]at.AgentTool {
+    var out: std.ArrayList(at.AgentTool) = .empty;
+    errdefer out.deinit(allocator);
+    for (tools) |t| {
+        if (!isMcpToolName(t.name)) try out.append(allocator, t);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Shared MCP tool discovery — called by both `resolve()` (print/proxy modes)

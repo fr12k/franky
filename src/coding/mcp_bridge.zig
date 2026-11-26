@@ -73,6 +73,7 @@ pub const McpBridge = struct {
     /// Set by `code_exec` while a script is running; cleared on exit.
     /// Peer-PID checks accept this pid or any pid in its process group.
     active_child_pid: std.atomic.Value(posix.pid_t) = .init(-1),
+    active_child_pgid: std.atomic.Value(posix.pid_t) = .init(-1),
     server: ?std.Io.net.Server = null,
     targets: std.StringHashMap(Target),
     stats: std.StringHashMap(BridgeStat),
@@ -81,6 +82,7 @@ pub const McpBridge = struct {
     /// Captured at `listen` so `summary`/`recordStat` can lock the
     /// mutex without threading `io` through every call site.
     io: ?std.Io = null,
+    serve_thread: ?std.Thread = null,
 
     /// Build a bridge bound to a fresh `/tmp/franky-mcp-<rand>.sock`.
     /// Mints the session token but does NOT start listening yet —
@@ -126,6 +128,21 @@ pub const McpBridge = struct {
         self.allocator.destroy(self);
     }
 
+    /// Self-contained teardown using the `io` captured at `init`. Lets
+    /// owners that don't hold an `io` at their own deinit (e.g.
+    /// `ResolvedConfig`) release the bridge cleanly.
+    pub fn deinitSelf(self: *McpBridge) void {
+        if (self.io) |io| {
+            self.deinit(io);
+        } else {
+            self.targets.deinit();
+            self.stats.deinit();
+            self.allocator.free(self.socket_path);
+            self.allocator.free(self.token_hex);
+            self.allocator.destroy(self);
+        }
+    }
+
     /// Register an MCP tool so the bridge can dispatch to it. Called once
     /// per discovered `mcp__*` tool during session setup.
     pub fn registerTool(self: *McpBridge, ctx: *const mcp_client.McpToolCtx) !void {
@@ -137,14 +154,20 @@ pub const McpBridge = struct {
         });
     }
 
-    /// Mark the given child pid as the authorized code_exec subprocess.
-    pub fn setActiveChild(self: *McpBridge, pid: posix.pid_t) void {
+    /// Mark the given pid + its process group as the authorized code_exec
+    /// subprocess. `pgid` accepts every member of the child's process group
+    /// (python, sandboxed grandchildren) without a per-pid getpgid syscall
+    /// on the accept path. Pass `pid` as `pgid` when the wrapper does not
+    /// establish its own group.
+    pub fn setActiveChild(self: *McpBridge, pid: posix.pid_t, pgid: posix.pid_t) void {
+        self.active_child_pgid.store(pgid, .release);
         self.active_child_pid.store(pid, .release);
     }
 
     /// Clear the authorized child (called when code_exec exits).
     pub fn clearActiveChild(self: *McpBridge) void {
         self.active_child_pid.store(-1, .release);
+        self.active_child_pgid.store(-1, .release);
     }
 
     /// Bind + listen on the UDS socket and set restrictive permissions.
@@ -153,7 +176,11 @@ pub const McpBridge = struct {
         self.server = try addr.listen(io, .{ .kernel_backlog = 16 });
         // 0600 so only this user can even open the socket.
         if (comptime @import("builtin").os.tag != .windows) {
-            _ = std.c.chmod(self.socket_path, 0o600);
+            var zbuf: [std.Io.net.UnixAddress.max_len + 1]u8 = undefined;
+            @memcpy(zbuf[0..self.socket_path.len], self.socket_path);
+            zbuf[self.socket_path.len] = 0;
+            const path_z: [*:0]const u8 = @ptrCast(&zbuf);
+            _ = std.c.chmod(path_z, 0o600);
         }
         self.running.store(true, .release);
     }
@@ -163,8 +190,24 @@ pub const McpBridge = struct {
         if (self.running.swap(false, .acq_rel)) {
             if (self.server) |*s| s.deinit(io);
             self.server = null;
-            std.Io.Dir.deleteFileAbsolute(io, self.socket_path) catch {};
         }
+        if (self.serve_thread) |t| {
+            t.join();
+            self.serve_thread = null;
+        }
+        std.Io.Dir.deleteFileAbsolute(io, self.socket_path) catch {};
+    }
+
+    /// Start the accept loop on a joinable background thread.
+    pub fn startServing(self: *McpBridge) !void {
+        if (self.serve_thread != null) return;
+        if (self.io == null or self.server == null) return error.NotListening;
+        self.serve_thread = try std.Thread.spawn(.{}, serveEntry, .{self});
+    }
+
+    fn serveEntry(self: *McpBridge) void {
+        const io = self.io orelse return;
+        self.serve(io);
     }
 
     /// Accept + serve connections until `shutdown` is called. Runs on its
@@ -194,9 +237,10 @@ pub const McpBridge = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         var chunk: [16384]u8 = undefined;
+        var r = stream.reader(io, &.{});
         while (true) {
-            var slices = [_][]u8{chunk[0..]};
-            const n = stream.read(io, &slices) catch |err| {
+            var vecs: [1][]u8 = .{chunk[0..]};
+            const n = r.interface.readVec(&vecs) catch |err| {
                 if (err == error.EndOfStream) break;
                 return err;
             };
@@ -208,15 +252,11 @@ pub const McpBridge = struct {
         const line = std.mem.trim(u8, buf.items, " \t\r\n");
         if (line.len == 0) return;
 
+        // dispatch converts auth/permission/unknown-tool failures into a
+        // JSON error payload itself, so the only errors that escape are
+        // allocation/IO — surface those as a generic bridge error frame.
         const resp = self.dispatch(io, line) catch |err| blk: {
-            const msg: []const u8 = switch (err) {
-                BridgeError.Unauthorized => "unauthorized token",
-                BridgeError.UnknownTool => "unknown tool",
-                BridgeError.PermissionDenied => "permission denied",
-                BridgeError.OutOfMemory => return err,
-                else => @errorName(err),
-            };
-            break :blk try self.errorJson(msg);
+            break :blk try self.errorJson(@errorName(err));
         };
         defer self.allocator.free(resp);
         try self.writeJsonLine(io, stream, resp);
@@ -306,13 +346,15 @@ pub const McpBridge = struct {
     /// child has been registered (unit-test / fallback path).
     fn verifyPeer(self: *McpBridge, handle: posix.fd_t) bool {
         const active = self.active_child_pid.load(.acquire);
+        const active_pgid = self.active_child_pgid.load(.acquire);
         const peer = peerPid(handle) orelse {
             // No peer-cred support — allow only when nothing registered.
             return active < 0;
         };
         if (active < 0) return true; // no child registered → permissive (tests)
         if (peer == active) return true;
-        return sameProcessGroup(peer, active);
+        if (active_pgid >= 0 and peer == active_pgid) return true;
+        return false;
     }
 
     fn recordStat(self: *McpBridge, ns_name: []const u8, is_error: bool, ms: u64, bytes: u64) void {
@@ -375,7 +417,7 @@ fn peerPid(handle: posix.fd_t) ?posix.pid_t {
             var cred: ucred = undefined;
             var len: std.os.linux.socklen_t = @sizeOf(ucred);
             const rc = std.os.linux.getsockopt(handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.PEERCRED, @ptrCast(&cred), &len);
-            if (std.os.linux.E.init(rc) != .SUCCESS) return null;
+            if (std.os.linux.errno(rc) != .SUCCESS) return null;
             return cred.pid;
         },
         .macos => {
@@ -387,16 +429,6 @@ fn peerPid(handle: posix.fd_t) ?posix.pid_t {
         },
         else => return null,
     }
-}
-
-/// True when `peer` shares a process group with `active` (children the
-/// script spawns inherit the group). Fails closed to false.
-fn sameProcessGroup(peer: posix.pid_t, active: posix.pid_t) bool {
-    if (@import("builtin").os.tag == .windows) return false;
-    const peer_pgid = std.c.getpgid(peer);
-    const active_pgid = std.c.getpgid(active);
-    if (peer_pgid < 0 or active_pgid < 0) return false;
-    return peer_pgid == active_pgid;
 }
 
 /// Serialize a `ToolResult`'s content blocks to a JSON array of
@@ -429,6 +461,22 @@ fn resultToJson(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, result: a
 // ─── tests ─────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Read one newline-terminated line from `stream` into an owned list.
+fn readOneLine(gpa: std.mem.Allocator, io: std.Io, stream: *std.Io.net.Stream) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var chunk: [1024]u8 = undefined;
+    var r = stream.reader(io, &.{});
+    while (true) {
+        var vecs: [1][]u8 = .{chunk[0..]};
+        const n = r.interface.readVec(&vecs) catch break;
+        if (n == 0) break;
+        try out.appendSlice(gpa, chunk[0..n]);
+        if (std.mem.indexOfScalar(u8, out.items, '\n') != null) break;
+    }
+    return out;
+}
 
 test "token check is timing-safe and length-checked" {
     var threaded = @import("../test_helpers.zig").threadedIo();

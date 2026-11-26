@@ -351,7 +351,7 @@ fn runPrint(
     } else if (cfg.memory_enabled) {
         cfg.memory_enabled = false;
     }
-    const system_prompt = try buildSystemPromptIo(allocator, io, environ, environ_map, cfg, memory_context);
+    const system_prompt = try buildSystemPromptIo(allocator, io, environ, environ_map, cfg, memory_context, resolved.mcp_code_mode_active);
     defer allocator.free(system_prompt);
 
     const model: ai.types.Model = .{
@@ -1560,8 +1560,12 @@ pub fn buildSystemPromptIo(
     environ_map: *const std.process.Environ.Map,
     cfg: *const cli_mod.Config,
     memory_context: ?[]const u8,
+    mcp_code_mode_active: bool,
 ) ![]u8 {
-    if (cfg.system_prompt) |s| return try allocator.dupe(u8, s);
+    if (cfg.system_prompt) |s| {
+        if (!mcp_code_mode_active) return try allocator.dupe(u8, s);
+        return try std.fmt.allocPrint(allocator, "{s}\n\nExternal MCP tools are available as Python modules in `.franky/mcp_sdk/`. Use `ls` or `read` on `.franky/mcp_sdk/` to discover functions, then call `code_exec` to orchestrate them in Python. Direct network access is disabled.", .{s});
+    }
 
     // Try the disk template. On any read failure, fall back silently.
     var base: []u8 = undefined;
@@ -1826,10 +1830,35 @@ pub fn buildSystemPromptIo(
     }
     defer if (recall_owned) allocator.free(with_recall);
 
+    // v3.4 — MCP code mode hint: when `--mcp-code-mode` is active the raw
+    // mcp__* schemas are hidden, so tell the model where the Python SDK
+    // lives and how to orchestrate calls through code_exec.
+    var with_code_mode: []u8 = if (recall_owned) with_recall else if (memory_owned) with_memory else if (compression_owned) with_compression else if (review_owned) with_review else with_skills;
+    var code_mode_owned = false;
+    if (mcp_code_mode_active) {
+        const trimmed = std.mem.trimEnd(u8, with_code_mode, &std.ascii.whitespace);
+        with_code_mode = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n## MCP Code Mode\n\n" ++
+            "External MCP tools are available as Python modules in `.franky/mcp_sdk/`.\n" ++
+            "Use `ls` or `read` on `.franky/mcp_sdk/` to discover the available server\n" ++
+            "modules and their typed functions, then call `code_exec` to import and\n" ++
+            "orchestrate them in Python. Aggregate results in Python and print a compact\n" ++
+            "summary — only stdout returns to you. Direct network access is disabled.\n",
+            .{trimmed},
+        );
+        code_mode_owned = true;
+    }
+    defer if (code_mode_owned) allocator.free(with_code_mode);
+
     if (cfg.append_system_prompt) |extra| {
-        const trimmed = std.mem.trimEnd(u8, if (recall_owned) with_recall else if (memory_owned) with_memory else if (compression_owned) with_compression else if (review_owned) with_review else with_skills, &std.ascii.whitespace);
+        const trimmed = std.mem.trimEnd(u8, with_code_mode, &std.ascii.whitespace);
         const out = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ trimmed, extra });
         return out;
+    }
+    if (code_mode_owned) {
+        code_mode_owned = false;
+        return with_code_mode;
     }
     if (recall_owned) {
         recall_owned = false;
@@ -2592,7 +2621,7 @@ test "buildSystemPromptIo: --system-prompt flag beats disk + default" {
     const env: std.process.Environ = .empty;
     var env_map = std.process.Environ.Map.init(gpa);
     defer env_map.deinit();
-    const out = try buildSystemPromptIo(gpa, null, env, &env_map, &cfg, null);
+    const out = try buildSystemPromptIo(gpa, null, env, &env_map, &cfg, null, false);
     defer gpa.free(out);
     try testing.expectEqualStrings("you are a test", out);
 }
@@ -2640,7 +2669,7 @@ test "buildSystemPromptIo: missing system.md falls back to default + appends sub
     defer env_map.deinit();
     try env_map.put("FRANKY_HOME", dir_path);
     const env: std.process.Environ = .empty;
-    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null);
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null, false);
     defer gpa.free(out);
     // Default prompt body is preserved verbatim at the start.
     try testing.expect(std.mem.startsWith(u8, out, default_system_prompt));
@@ -2694,7 +2723,7 @@ test "buildSystemPromptIo: --skill NAME injects body under Active skills (§6.1)
     const env: std.process.Environ = .empty;
     var env_map = std.process.Environ.Map.init(gpa);
     defer env_map.deinit();
-    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null);
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null, false);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "## Active skills") != null);
@@ -2738,7 +2767,7 @@ test "buildSystemPromptIo: skill stays out when not selected and no auto_apply (
     const env: std.process.Environ = .empty;
     var env_map = std.process.Environ.Map.init(gpa);
     defer env_map.deinit();
-    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null);
+    const out = try buildSystemPromptIo(gpa, io, env, &env_map, &cfg, null, false);
     defer gpa.free(out);
 
     try testing.expect(std.mem.indexOf(u8, out, "Active skills") == null);
