@@ -195,7 +195,7 @@
         },
         "openai": {
             "provider": "openai",
-            "models": ["gpt-5.4-mini-2026-03-17"],
+            "models": ["gpt-6-luna"],
             "api-key-env": "OPENAI_API_KEY",
             "role": "full",
             "ask-tools": "all",

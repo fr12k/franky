@@ -289,7 +289,6 @@ pub const Usage = struct {
             else => null,
         };
     }
-
 };
 
 /// v1.32.0 — Session-level cost-state accumulators for the
@@ -652,6 +651,7 @@ pub const Model = struct {
 
 /// Reasoning/thinking intensity — unified across providers per §B.
 pub const ThinkingLevel = enum {
+    none,
     off,
     minimal,
     low,
@@ -660,6 +660,7 @@ pub const ThinkingLevel = enum {
     xhigh,
 
     pub fn fromString(s: []const u8) ?ThinkingLevel {
+        if (std.mem.eql(u8, s, "none")) return .none;
         if (std.mem.eql(u8, s, "off")) return .off;
         if (std.mem.eql(u8, s, "minimal")) return .minimal;
         if (std.mem.eql(u8, s, "low")) return .low;
@@ -676,6 +677,7 @@ pub const ThinkingLevel = enum {
     /// §B — Anthropic budget_tokens.
     pub fn anthropicBudget(self: ThinkingLevel) ?u32 {
         return switch (self) {
+            .none => null,
             .off => null,
             .minimal => 1024,
             .low => 4096,
@@ -689,6 +691,7 @@ pub const ThinkingLevel = enum {
     pub fn openaiResponsesEffort(self: ThinkingLevel) ?[]const u8 {
         return switch (self) {
             .off => null,
+            .none => "none",
             .minimal => "minimal",
             .low => "low",
             .medium => "medium",
@@ -707,6 +710,7 @@ pub const ThinkingLevel = enum {
     pub fn googleBudget(self: ThinkingLevel) ?u32 {
         return switch (self) {
             .off => null,
+            .none => null,
             .minimal => 512,
             .low => 2048,
             .medium => 8192,
@@ -1074,4 +1078,3 @@ test "CostState.jsonParseFromValue ignores unknown keys (cost-state wrapper fiel
     try std.testing.expectEqual(@as(i64, 1700000000000), cs.start_time_ms);
     try std.testing.expect(cs.started);
 }
-
