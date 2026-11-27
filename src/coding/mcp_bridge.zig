@@ -70,10 +70,8 @@ pub const McpBridge = struct {
     token_hex: []u8,
     token_raw: [32]u8,
     permission_store: ?*permissions.Store,
-    /// Coordinates shutdown with both connection acceptance and handling.
+    /// Serializes shutdown with the full connection handler lifetime.
     connection_mutex: std.Io.Mutex = .init,
-    /// Serializes access to bridge-owned state used by dispatch/summary.
-    state_mutex: std.Io.Mutex = .init,
     server: ?std.Io.net.Server = null,
     targets: std.StringHashMap(Target),
     stats: std.StringHashMap(BridgeStat),
@@ -173,8 +171,6 @@ pub const McpBridge = struct {
     pub fn shutdown(self: *McpBridge, io: std.Io) void {
         if (self.serve_thread) |t| {
             self.connection_mutex.lockUncancelable(io);
-            self.state_mutex.lockUncancelable(io);
-            defer self.state_mutex.unlock(io);
             defer self.connection_mutex.unlock(io);
             self.running.store(false, .release);
             // Wake a blocking accept with a local connection while the
@@ -243,6 +239,8 @@ pub const McpBridge = struct {
         // Verify again after reading the bounded frame. This closes the
         // clear-active-child race where an authorized child exits while a
         // connection is being accepted/read.
+        self.connection_mutex.lockUncancelable(io);
+        defer self.connection_mutex.unlock(io);
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         var chunk: [16384]u8 = undefined;
@@ -365,6 +363,8 @@ pub const McpBridge = struct {
     /// Aggregate summary for the `code_exec` footer.
     pub fn summary(self: *McpBridge) Summary {
         if (self.io) |io| {
+            self.connection_mutex.lockUncancelable(io);
+            defer self.connection_mutex.unlock(io);
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             return self.summaryLocked();
