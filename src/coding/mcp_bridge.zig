@@ -233,11 +233,6 @@ pub const McpBridge = struct {
 
     /// Handle a single connection: read one JSON line, dispatch, reply.
     fn handleConnection(self: *McpBridge, io: std.Io, stream: *std.Io.net.Stream) !void {
-        // Verify again after reading the bounded frame. This closes the
-        // clear-active-child race where an authorized child exits while a
-        // connection is being accepted/read.
-        self.connection_mutex.lockUncancelable(io);
-        defer self.connection_mutex.unlock(io);
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         var chunk: [16384]u8 = undefined;
@@ -249,7 +244,9 @@ pub const McpBridge = struct {
                 return err;
             };
             if (n == 0) break;
+            self.connection_mutex.lockUncancelable(io);
             try buf.appendSlice(self.allocator, chunk[0..n]);
+            self.connection_mutex.unlock(io);
             if (std.mem.indexOfScalar(u8, buf.items, '\n') != null) break;
             if (buf.items.len > 1 << 20) return error.Io; // 1 MiB request cap
         }
@@ -360,8 +357,6 @@ pub const McpBridge = struct {
     /// Aggregate summary for the `code_exec` footer.
     pub fn summary(self: *McpBridge) Summary {
         if (self.io) |io| {
-            self.connection_mutex.lockUncancelable(io);
-            defer self.connection_mutex.unlock(io);
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             return self.summaryLocked();
