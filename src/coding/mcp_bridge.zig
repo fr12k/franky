@@ -140,19 +140,8 @@ pub const McpBridge = struct {
     /// owners that don't hold an `io` at their own deinit (e.g.
     /// `ResolvedConfig`) release the bridge cleanly.
     pub fn deinitSelf(self: *McpBridge) void {
-        if (self.io) |io| {
-            self.deinit(io);
-        } else {
-            var targets_it = self.targets.iterator();
-            while (targets_it.next()) |entry| self.io_allocator.free(entry.key_ptr.*);
-            var stats_it = self.stats.iterator();
-            while (stats_it.next()) |entry| self.io_allocator.free(entry.key_ptr.*);
-            self.targets.deinit();
-            self.stats.deinit();
-            self.allocator.free(self.socket_path);
-            self.allocator.free(self.token_hex);
-            self.allocator.destroy(self);
-        }
+        const io = self.io orelse return;
+        self.deinit(io);
     }
 
     /// Register an MCP tool so the bridge can dispatch to it. Called once
