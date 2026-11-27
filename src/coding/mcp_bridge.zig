@@ -66,6 +66,9 @@ const Target = struct {
 
 pub const McpBridge = struct {
     allocator: std.mem.Allocator,
+    /// Stable allocator used by the accept thread for request/response frames;
+    /// unlike the config arena, it outlives the bridge's background thread.
+    io_allocator: std.mem.Allocator,
     socket_path: []u8,
     token_hex: []u8,
     token_raw: [32]u8,
@@ -89,6 +92,7 @@ pub const McpBridge = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         permission_store: ?*permissions.Store,
+        io_allocator: std.mem.Allocator,
     ) !*McpBridge {
         const self = try allocator.create(McpBridge);
 
@@ -106,6 +110,7 @@ pub const McpBridge = struct {
 
         self.* = .{
             .allocator = allocator,
+            .io_allocator = io_allocator,
             .socket_path = socket_path,
             .token_hex = token_hex,
             .token_raw = raw,
@@ -222,10 +227,6 @@ pub const McpBridge = struct {
                 stream.close(io);
                 return;
             }
-            if (!self.running.load(.acquire)) {
-                stream.close(io);
-                return;
-            }
             self.handleConnection(io, &stream) catch {};
             stream.close(io);
         }
@@ -234,7 +235,7 @@ pub const McpBridge = struct {
     /// Handle a single connection: read one JSON line, dispatch, reply.
     fn handleConnection(self: *McpBridge, io: std.Io, stream: *std.Io.net.Stream) !void {
         var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
+        defer buf.deinit(self.io_allocator);
         var chunk: [16384]u8 = undefined;
         var r = stream.reader(io, &.{});
         while (true) {
@@ -244,9 +245,7 @@ pub const McpBridge = struct {
                 return err;
             };
             if (n == 0) break;
-            self.connection_mutex.lockUncancelable(io);
-            try buf.appendSlice(self.allocator, chunk[0..n]);
-            self.connection_mutex.unlock(io);
+            try buf.appendSlice(self.io_allocator, chunk[0..n]);
             if (std.mem.indexOfScalar(u8, buf.items, '\n') != null) break;
             if (buf.items.len > 1 << 20) return error.Io; // 1 MiB request cap
         }
@@ -446,7 +445,7 @@ test "token check is timing-safe and length-checked" {
     const io = threaded.io();
     const gpa = @import("../global_allocator.zig").gpa;
 
-    const bridge = try McpBridge.init(gpa, io, null);
+    const bridge = try McpBridge.init(gpa, io, null, gpa);
     defer bridge.deinit(io);
 
     // Build the correct hex from raw.
@@ -463,7 +462,7 @@ test "stats aggregate across calls" {
     const io = threaded.io();
     const gpa = @import("../global_allocator.zig").gpa;
 
-    const bridge = try McpBridge.init(gpa, io, null);
+    const bridge = try McpBridge.init(gpa, io, null, gpa);
     defer bridge.deinit(io);
 
     bridge.recordStat("mcp__a__t1", false, 5, 100);

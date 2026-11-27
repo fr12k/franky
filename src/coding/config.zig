@@ -1679,7 +1679,7 @@ pub fn resolve(
         };
 
         // Build + populate the bridge, register every discovered tool.
-        const bridge = mcp_bridge_mod.McpBridge.init(a, io, if (prompts_enabled) permission_store else null) catch |err| {
+        const bridge = mcp_bridge_mod.McpBridge.init(a, io, if (prompts_enabled) permission_store else null, allocator) catch |err| {
             ai.log.log(.err, "mcp-code", "resolve", "bridge init failed: {s}; disabling code mode", .{@errorName(err)});
             break :blk auto_filtered;
         };

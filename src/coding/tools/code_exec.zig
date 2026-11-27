@@ -449,7 +449,7 @@ test "code_exec: runs python and captures stdout" {
     const gpa = testing.allocator;
     var cancel: ai.stream.Cancel = .{};
 
-    const bridge = try bridge_mod.McpBridge.init(gpa, io, null);
+    const bridge = try bridge_mod.McpBridge.init(gpa, io, null, gpa);
     defer bridge.deinit(io);
     try bridge.listen(io);
     try bridge.startServing();
@@ -475,7 +475,7 @@ test "code_exec: non-zero exit is_error and surfaces stderr" {
     const gpa = testing.allocator;
     var cancel: ai.stream.Cancel = .{};
 
-    const bridge = try bridge_mod.McpBridge.init(gpa, io, null);
+    const bridge = try bridge_mod.McpBridge.init(gpa, io, null, gpa);
     defer bridge.deinit(io);
     try bridge.listen(io);
     try bridge.startServing();
@@ -501,7 +501,7 @@ test "code_exec: rejects empty code" {
     const gpa = testing.allocator;
     var cancel: ai.stream.Cancel = .{};
 
-    const bridge = try bridge_mod.McpBridge.init(gpa, io, null);
+    const bridge = try bridge_mod.McpBridge.init(gpa, io, null, gpa);
     defer bridge.deinit(io);
     const ctx = makeCtx(gpa, io, bridge);
     defer destroyCtx(gpa, ctx);
@@ -521,7 +521,7 @@ test "code_exec: bridge token + socket are injected into the env" {
     const gpa = testing.allocator;
     var cancel: ai.stream.Cancel = .{};
 
-    const bridge = try bridge_mod.McpBridge.init(gpa, io, null);
+    const bridge = try bridge_mod.McpBridge.init(gpa, io, null, gpa);
     defer bridge.deinit(io);
     try bridge.listen(io);
     try bridge.startServing();
