@@ -306,9 +306,15 @@ fn buildArgv(
                 "--proc", "/proc",
                 "--tmpfs", "/tmp",
             });
+            // The bridge socket is created by the host process before bwrap
+            // starts. Bind its parent directory into the sandbox so Python can
+            // connect to that exact per-session socket path.
+            const socket_dir = std.fs.path.dirname(ctx.bridge.socket_path) orelse "/tmp";
+            try out.appendSlice(aa, &.{ "--bind", socket_dir, socket_dir });
             // The scratch script + SDK modules live under `sdk_dir`, which
             // may itself be under /tmp — bind it AFTER the tmpfs so it is not
-            // masked. The bridge uses its Unix socket path from this namespace.
+            // masked. Re-apply the workspace mount after binding the host /tmp.
+            try out.appendSlice(aa, &.{ "--bind", ctx.workspace_root, ctx.workspace_root });
             try out.appendSlice(aa, &.{ "--bind", ctx.sdk_dir, ctx.sdk_dir });
             try out.append(aa, "--");
             try out.appendSlice(aa, &py);
