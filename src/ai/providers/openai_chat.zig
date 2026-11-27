@@ -110,10 +110,11 @@ pub fn buildRequestJson(
     // §session-id — provider-agnostic session identifier for tracing
     // and sticky routing (OpenRouter Broadcast, proxy sticky sessions,
     // etc.). Providers that don't recognise the field silently ignore it.
-    if (options.session_id) |sid| {
-        try buf.appendSlice(allocator, ",\"session_id\":");
-        try utils.appendJsonStr(&buf, allocator, sid);
-    }
+    // request_invalid: Unknown parameter: 'session_id' was respond from openai
+    // if (options.session_id) |sid| {
+    //     try buf.appendSlice(allocator, ",\"session_id\":");
+    //     try utils.appendJsonStr(&buf, allocator, sid);
+    // }
 
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
@@ -653,7 +654,7 @@ pub fn streamFn(ctx: registry_mod.StreamCtx) anyerror!void {
     // HTTP-Referer / X-OpenRouter-Title / X-OpenRouter-Categories onto
     // every gateway request. Heap-allocated because the count is caller-
     // driven; the slice is tiny and freed before the fn returns.
-    const extra = ctx.options.headers orelse &.{ };
+    const extra = ctx.options.headers orelse &.{};
     const base_count: usize = (if (auth_header != null) @as(usize, 1) else 0) + 2;
     const http_headers = try ctx.allocator.alloc(std.http.Header, base_count + extra.len);
     defer ctx.allocator.free(http_headers);
