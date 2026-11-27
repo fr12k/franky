@@ -70,9 +70,12 @@ pub const McpBridge = struct {
     token_hex: []u8,
     token_raw: [32]u8,
     permission_store: ?*permissions.Store,
-    /// Set by `code_exec` while a script is running; cleared on exit.
-    /// Peer-PID checks accept only this exact spawned code_exec PID.
+    /// PID of the spawned sandbox wrapper (bwrap/unshare) or Python process.
+    /// Cleared after child teardown.
     active_child_pid: std.atomic.Value(posix.pid_t) = .init(-1),
+    /// PID of the Python process that actually connects to the bridge.
+    /// It differs from active_child_pid when Python runs behind bwrap/unshare.
+    active_peer_pid: std.atomic.Value(posix.pid_t) = .init(-1),
     server: ?std.Io.net.Server = null,
     targets: std.StringHashMap(Target),
     stats: std.StringHashMap(BridgeStat),
@@ -159,7 +162,12 @@ pub const McpBridge = struct {
     }
 
     /// Clear the authorized child (called when code_exec exits).
+    pub fn setActivePeer(self: *McpBridge, pid: posix.pid_t) void {
+        self.active_peer_pid.store(pid, .release);
+    }
+
     pub fn clearActiveChild(self: *McpBridge) void {
+        self.active_peer_pid.store(-1, .release);
         self.active_child_pid.store(-1, .release);
     }
 
@@ -364,13 +372,20 @@ pub const McpBridge = struct {
     /// Verify the connecting peer is exactly the active code_exec child.
     /// Fail closed on platforms where peer credentials are unavailable.
     fn verifyPeer(self: *McpBridge, handle: posix.fd_t) bool {
-        const active = self.active_child_pid.load(.acquire);
         const peer = peerPid(handle) orelse {
             // Fail closed when peer credentials are unavailable. A bearer
             // token alone must not grant access to the bridge.
             return false;
         };
-        return active >= 0 and peer == active;
+        const active_peer = self.active_peer_pid.load(.acquire);
+        if (active_peer >= 0 and peer == active_peer) return true;
+
+        // `std.process.spawn` starts the wrapper in a fresh process group;
+        // bwrap/unshare then exec Python in-place, preserving that PID.
+        // Accepting only this exact PID (never the whole group) keeps the
+        // credential boundary narrow while supporting sandbox wrappers.
+        const active_child = self.active_child_pid.load(.acquire);
+        return active_child >= 0 and peer == active_child;
     }
 
     fn recordStat(self: *McpBridge, ns_name: []const u8, is_error: bool, ms: u64, bytes: u64) void {
