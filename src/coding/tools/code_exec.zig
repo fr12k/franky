@@ -98,6 +98,15 @@ fn execute(
         else => default_timeout_ms,
     } else default_timeout_ms;
 
+    // Check Python explicitly so a missing runtime gets a useful diagnostic.
+    if (!probe(io, &.{ "python3", "--version" }) and !probe(io, &.{ "python", "--version" })) {
+        return common.toolError(
+            allocator,
+            "code_exec_python_missing",
+            "Python is required to run code_exec but neither 'python3' nor 'python' was found in PATH. Install Python 3 in this environment and retry.",
+        );
+    }
+
     // Write the script to a temp file inside the SDK dir (so the sandbox's
     // workspace bind-mount covers it). Atomic via temp+rename.
     const script_path = try writeScript(allocator, io, ctx.sdk_dir, code);
@@ -481,6 +490,8 @@ test "code_exec: rejects empty code" {
     defer res.deinit(gpa);
     try testing.expect(res.is_error);
 }
+
+
 
 test "code_exec: bridge token + socket are injected into the env" {
     var threaded = test_h.threadedIo();
