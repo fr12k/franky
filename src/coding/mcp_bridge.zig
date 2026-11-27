@@ -70,9 +70,6 @@ pub const McpBridge = struct {
     token_hex: []u8,
     token_raw: [32]u8,
     permission_store: ?*permissions.Store,
-    /// PID of the spawned sandbox wrapper or Python process; cleared after
-    /// child teardown. The server accepts requests from only this PID.
-    active_child_pid: std.atomic.Value(posix.pid_t) = .init(-1),
     /// Serializes one accepted connection and its response with shutdown.
     /// The bridge handles at most one client connection at a time.
     connection_mutex: std.Io.Mutex = .init,
@@ -154,16 +151,6 @@ pub const McpBridge = struct {
             .server = ctx.server_name,
             .ctx = ctx,
         });
-    }
-
-    /// Mark the spawned code process as the authorized peer.
-    pub fn setActiveChild(self: *McpBridge, pid: posix.pid_t) void {
-        self.active_child_pid.store(pid, .release);
-    }
-
-    /// Clear the authorized child (called when code_exec exits).
-    pub fn clearActiveChild(self: *McpBridge) void {
-        self.active_child_pid.store(-1, .release);
     }
 
     /// Bind + listen on the UDS socket and set restrictive permissions.
@@ -250,12 +237,6 @@ pub const McpBridge = struct {
 
     /// Handle a single connection: read one JSON line, dispatch, reply.
     fn handleConnection(self: *McpBridge, io: std.Io, stream: *std.Io.net.Stream) !void {
-        // Peer-PID check (before reading any payload).
-        if (!self.verifyPeer(stream.socket.handle)) {
-            try self.writeJsonLine(io, stream, "{\"error\":\"unauthorized peer\"}");
-            return;
-        }
-
         // Verify again after reading the bounded frame. This closes the
         // clear-active-child race where an authorized child exits while a
         // connection is being accepted/read.
@@ -276,11 +257,6 @@ pub const McpBridge = struct {
         }
         const line = std.mem.trim(u8, buf.items, " \t\r\n");
         if (line.len == 0) return;
-        if (!self.verifyPeer(stream.socket.handle)) {
-            try self.writeJsonLine(io, stream, "{\"error\":\"unauthorized peer\"}");
-            return;
-        }
-
         // dispatch converts auth/permission/unknown-tool failures into a
         // JSON error payload itself, so the only errors that escape are
         // allocation/IO — surface those as a generic bridge error frame.
@@ -303,7 +279,9 @@ pub const McpBridge = struct {
         if (parsed != .object) return try self.errorJson("request not an object");
         const obj = parsed.object;
 
-        // 1. Bearer token.
+        // 1. Per-session bearer token. This is the bridge authentication
+        // mechanism; don't bind authorization to wrapper PIDs, which vary
+        // across bwrap/unshare/sandbox-exec implementations.
         const tok = if (obj.get("token")) |t| (if (t == .string) t.string else "") else "";
         if (!self.checkToken(tok)) return try self.errorJson("unauthorized token");
 
@@ -369,18 +347,6 @@ pub const McpBridge = struct {
         return std.crypto.timing_safe.eql([32]u8, provided, self.token_raw);
     }
 
-    /// Verify the connecting peer is exactly the active code_exec child.
-    /// Fail closed on platforms where peer credentials are unavailable.
-    fn verifyPeer(self: *McpBridge, handle: posix.fd_t) bool {
-        const peer = peerPid(handle) orelse {
-            // Fail closed when peer credentials are unavailable. A bearer
-            // token alone must not grant access to the bridge.
-            return false;
-        };
-        const active_child = self.active_child_pid.load(.acquire);
-        return active_child >= 0 and peer == active_child;
-    }
-
     fn recordStat(self: *McpBridge, ns_name: []const u8, is_error: bool, ms: u64, bytes: u64) void {
         const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
@@ -430,29 +396,6 @@ pub const McpBridge = struct {
 fn elapsed(start_ms: i64) u64 {
     const now = ai.stream.nowMillis();
     return if (now > start_ms) @intCast(now - start_ms) else 0;
-}
-
-/// Platform peer-pid lookup. Returns null when unsupported.
-fn peerPid(handle: posix.fd_t) ?posix.pid_t {
-    const os_tag = @import("builtin").os.tag;
-    switch (os_tag) {
-        .linux => {
-            const ucred = extern struct { pid: i32, uid: u32, gid: u32 };
-            var cred: ucred = undefined;
-            var len: std.os.linux.socklen_t = @sizeOf(ucred);
-            const rc = std.os.linux.getsockopt(handle, std.os.linux.SOL.SOCKET, std.os.linux.SO.PEERCRED, @ptrCast(&cred), &len);
-            if (std.os.linux.errno(rc) != .SUCCESS) return null;
-            return cred.pid;
-        },
-        .macos => {
-            var pid: posix.pid_t = 0;
-            var len: std.c.socklen_t = @sizeOf(posix.pid_t);
-            const LOCAL_PEERPID: u32 = 0x002;
-            if (std.c.getsockopt(handle, 0, LOCAL_PEERPID, &pid, &len) != 0) return null;
-            return pid;
-        },
-        else => return null,
-    }
 }
 
 /// Serialize a `ToolResult`'s content blocks to a JSON array of

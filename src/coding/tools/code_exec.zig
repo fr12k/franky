@@ -162,10 +162,6 @@ fn execute(
         else => |e| return common.toolError(allocator, "code_exec_spawn_failed", @errorName(e)),
     };
     const child_pid = child.id orelse return common.toolError(allocator, "code_exec_spawn_failed", "spawned process has no PID");
-    ctx.bridge.setActiveChild(child_pid);
-    // Defer LIFO: terminate/reap Python before clearing its PID so bridge
-    // shutdown can wait until no child can still issue a UDS request.
-    defer ctx.bridge.clearActiveChild();
     defer terminateProcessGroup(&child, child_pid, io);
 
     const result = collectOutput(allocator, io, &child, timeout) catch |err| switch (err) {
