@@ -70,12 +70,12 @@ pub const McpBridge = struct {
     token_hex: []u8,
     token_raw: [32]u8,
     permission_store: ?*permissions.Store,
-    /// PID of the spawned sandbox wrapper (bwrap/unshare) or Python process.
-    /// Cleared after child teardown.
+    /// PID of the spawned sandbox wrapper or Python process; cleared after
+    /// child teardown. The server accepts requests from only this PID.
     active_child_pid: std.atomic.Value(posix.pid_t) = .init(-1),
-    /// PID of the Python process that actually connects to the bridge.
-    /// It differs from active_child_pid when Python runs behind bwrap/unshare.
-    active_peer_pid: std.atomic.Value(posix.pid_t) = .init(-1),
+    /// Serializes one accepted connection and its response with shutdown.
+    /// The bridge handles at most one client connection at a time.
+    connection_mutex: std.Io.Mutex = .init,
     server: ?std.Io.net.Server = null,
     targets: std.StringHashMap(Target),
     stats: std.StringHashMap(BridgeStat),
@@ -162,12 +162,7 @@ pub const McpBridge = struct {
     }
 
     /// Clear the authorized child (called when code_exec exits).
-    pub fn setActivePeer(self: *McpBridge, pid: posix.pid_t) void {
-        self.active_peer_pid.store(pid, .release);
-    }
-
     pub fn clearActiveChild(self: *McpBridge) void {
-        self.active_peer_pid.store(-1, .release);
         self.active_child_pid.store(-1, .release);
     }
 
@@ -188,11 +183,9 @@ pub const McpBridge = struct {
 
     /// Stop the accept loop and remove the socket file.
     pub fn shutdown(self: *McpBridge, io: std.Io) void {
-        // If a code_exec child is still connected, let it finish before the
-        // listener is torn down. The owner must not free bridge state while
-        // the accept thread can still be dispatching a request.
-        while (self.active_child_pid.load(.acquire) >= 0) std.Thread.yield() catch {};
         if (self.serve_thread) |t| {
+            self.connection_mutex.lockUncancelable(io);
+            defer self.connection_mutex.unlock(io);
             self.running.store(false, .release);
             // Wake a blocking accept with a local connection while the
             // listening descriptor is still valid. serve() checks `running`
@@ -243,8 +236,15 @@ pub const McpBridge = struct {
                 stream.close(io);
                 return;
             }
+            self.connection_mutex.lockUncancelable(io);
+            if (!self.running.load(.acquire)) {
+                self.connection_mutex.unlock(io);
+                stream.close(io);
+                return;
+            }
             self.handleConnection(io, &stream) catch {};
             stream.close(io);
+            self.connection_mutex.unlock(io);
         }
     }
 
@@ -377,13 +377,6 @@ pub const McpBridge = struct {
             // token alone must not grant access to the bridge.
             return false;
         };
-        const active_peer = self.active_peer_pid.load(.acquire);
-        if (active_peer >= 0 and peer == active_peer) return true;
-
-        // `std.process.spawn` starts the wrapper in a fresh process group;
-        // bwrap/unshare then exec Python in-place, preserving that PID.
-        // Accepting only this exact PID (never the whole group) keeps the
-        // credential boundary narrow while supporting sandbox wrappers.
         const active_child = self.active_child_pid.load(.acquire);
         return active_child >= 0 and peer == active_child;
     }

@@ -163,9 +163,6 @@ fn execute(
     };
     const child_pid = child.id orelse return common.toolError(allocator, "code_exec_spawn_failed", "spawned process has no PID");
     ctx.bridge.setActiveChild(child_pid);
-    // bwrap/unshare exec Python in place: the wrapper process retains the
-    // same PID, so SO_PEERCRED reports child_pid for every sandbox mode.
-    ctx.bridge.setActivePeer(child_pid);
     // Defer LIFO: terminate/reap Python before clearing its PID so bridge
     // shutdown can wait until no child can still issue a UDS request.
     defer ctx.bridge.clearActiveChild();
