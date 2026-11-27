@@ -66,8 +66,8 @@ const Target = struct {
 
 pub const McpBridge = struct {
     allocator: std.mem.Allocator,
-    /// Stable allocator used by the accept thread for request/response frames;
-    /// unlike the config arena, it outlives the bridge's background thread.
+    /// Stable allocator used for all bridge operations executed by the
+    /// accept thread. It outlives the session arena owned by the resolver.
     io_allocator: std.mem.Allocator,
     socket_path: []u8,
     token_hex: []u8,
@@ -257,14 +257,14 @@ pub const McpBridge = struct {
         const resp = self.dispatch(io, line) catch |err| blk: {
             break :blk try self.errorJson(@errorName(err));
         };
-        defer self.allocator.free(resp);
+        defer self.io_allocator.free(resp);
         try self.writeJsonLine(io, stream, resp);
     }
 
     /// Parse + authorize + route one request frame. Returns an owned JSON
     /// response line (without trailing newline).
     fn dispatch(self: *McpBridge, io: std.Io, line: []const u8) ![]u8 {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.io_allocator);
         defer arena.deinit();
         const aa = arena.allocator();
 
@@ -312,25 +312,25 @@ pub const McpBridge = struct {
 
         // Serialize the ToolResult content blocks to a JSON array.
         var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
+        defer payload.deinit(self.io_allocator);
         try resultToJson(&payload, self.allocator, result);
         self.recordStat(ns_name, result.is_error, elapsed(start), payload.items.len);
 
         var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(self.allocator);
-        try out.appendSlice(self.allocator, "{\"result\":");
-        try out.appendSlice(self.allocator, payload.items);
-        try out.appendSlice(self.allocator, "}");
-        return out.toOwnedSlice(self.allocator);
+        errdefer out.deinit(self.io_allocator);
+        try out.appendSlice(self.io_allocator, "{\"result\":");
+        try out.appendSlice(self.io_allocator, payload.items);
+        try out.appendSlice(self.io_allocator, "}");
+        return out.toOwnedSlice(self.io_allocator);
     }
 
     fn errorJson(self: *McpBridge, msg: []const u8) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(self.allocator);
-        try buf.appendSlice(self.allocator, "{\"error\":");
-        try jh.appendJsonStr(&buf, self.allocator, msg);
-        try buf.appendSlice(self.allocator, "}");
-        return buf.toOwnedSlice(self.allocator);
+        errdefer buf.deinit(self.io_allocator);
+        try buf.appendSlice(self.io_allocator, "{\"error\":");
+        try jh.appendJsonStr(&buf, self.io_allocator, msg);
+        try buf.appendSlice(self.io_allocator, "}");
+        return buf.toOwnedSlice(self.io_allocator);
     }
 
     fn checkToken(self: *McpBridge, tok_hex: []const u8) bool {
@@ -377,9 +377,9 @@ pub const McpBridge = struct {
 
     fn writeJsonLine(self: *McpBridge, io: std.Io, stream: *std.Io.net.Stream, line: []const u8) !void {
         var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        try buf.appendSlice(self.allocator, line);
-        try buf.append(self.allocator, '\n');
+        defer buf.deinit(self.io_allocator);
+        try buf.appendSlice(self.io_allocator, line);
+        try buf.append(self.io_allocator, '\n');
         var wbuf: [8192]u8 = undefined;
         var w = stream.writer(io, &wbuf);
         try w.interface.writeAll(buf.items);
