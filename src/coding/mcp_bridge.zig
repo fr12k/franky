@@ -222,15 +222,12 @@ pub const McpBridge = struct {
                 stream.close(io);
                 return;
             }
-            self.connection_mutex.lockUncancelable(io);
             if (!self.running.load(.acquire)) {
-                self.connection_mutex.unlock(io);
                 stream.close(io);
                 return;
             }
             self.handleConnection(io, &stream) catch {};
             stream.close(io);
-            self.connection_mutex.unlock(io);
         }
     }
 
