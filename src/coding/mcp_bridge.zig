@@ -305,15 +305,16 @@ pub const McpBridge = struct {
         const start = ai.stream.nowMillis();
 
         var cancel: ai.stream.Cancel = .{};
-        const result = mcp_client.callTool(target.ctx, self.allocator, io, args, &cancel) catch |err| {
+        var result = mcp_client.callTool(target.ctx, self.io_allocator, io, args, &cancel) catch |err| {
             self.recordStat(ns_name, true, elapsed(start), 0);
             return try self.errorJson(@errorName(err));
         };
+        defer result.deinit(self.io_allocator);
 
         // Serialize the ToolResult content blocks to a JSON array.
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.io_allocator);
-        try resultToJson(&payload, self.allocator, result);
+        try resultToJson(&payload, self.io_allocator, result);
         self.recordStat(ns_name, result.is_error, elapsed(start), payload.items.len);
 
         var out: std.ArrayList(u8) = .empty;
