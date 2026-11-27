@@ -98,15 +98,6 @@ fn execute(
         else => default_timeout_ms,
     } else default_timeout_ms;
 
-    // Check Python explicitly so a missing runtime gets a useful diagnostic.
-    if (!probe(io, &.{ "python3", "--version" }) and !probe(io, &.{ "python", "--version" })) {
-        return common.toolError(
-            allocator,
-            "code_exec_python_missing",
-            "Python is required to run code_exec but neither 'python3' nor 'python' was found in PATH. Install Python 3 in this environment and retry.",
-        );
-    }
-
     // Write the script to a temp file inside the SDK dir (so the sandbox's
     // workspace bind-mount covers it). Atomic via temp+rename.
     const script_path = try writeScript(allocator, io, ctx.sdk_dir, code);
@@ -149,7 +140,14 @@ fn execute(
         .stderr = .pipe,
         .pgid = 0,
     }) catch |err| switch (err) {
-        error.FileNotFound => return common.toolError(allocator, "code_exec_python_missing", "python3 (or sandbox binary) not found in PATH"),
+        error.FileNotFound => {
+            logMissingPython();
+            return common.toolError(
+                allocator,
+                "code_exec_python_missing",
+                "Python 3 is required to run code_exec but was not found in PATH. Install Python 3 (python3) in this environment and retry.",
+            );
+        },
         error.AccessDenied, error.PermissionDenied => return common.toolError(allocator, "access_denied", "cannot execute python3"),
         else => |e| return common.toolError(allocator, "code_exec_spawn_failed", @errorName(e)),
     };
@@ -268,6 +266,11 @@ fn probe(io: std.Io, argv: []const []const u8) bool {
         .exited => |code| code == 0,
         else => false,
     };
+}
+
+/// Log why a Python launch failed before returning a user-facing tool error.
+fn logMissingPython() void {
+    log.log(.err, "code_exec", "python_missing", "Python 3 ('python3') was not found in PATH; install Python 3 in this environment", .{});
 }
 
 /// Build the full argv (sandbox wrapper + python) for `sandbox`.
