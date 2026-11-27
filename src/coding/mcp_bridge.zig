@@ -183,16 +183,14 @@ pub const McpBridge = struct {
         if (self.serve_thread) |t| {
             self.running.store(false, .release);
             // Wake a blocking accept with a local connection while the
-            // listening descriptor is still valid. serve() sees running=false
-            // immediately after this accept and closes the wake stream.
+            // listening descriptor is still valid. serve() checks `running`
+            // immediately after accept and skips handling the wake connection.
             if (self.server != null) {
                 const addr = std.Io.net.UnixAddress.init(self.socket_path) catch null;
-                if (addr) |a| {
-                    if (a.connect(io)) |stream| {
-                        var wake = stream;
-                        wake.close(io);
-                    } else |_| {}
-                }
+                if (addr) |a| if (a.connect(io)) |stream| {
+                    var wake = stream;
+                    wake.close(io);
+                } else |_| {};
             }
             t.join();
             self.serve_thread = null;
@@ -226,6 +224,13 @@ pub const McpBridge = struct {
                 log.log(.warn, "mcp-bridge", "accept", "accept failed: {s}", .{@errorName(err)});
                 continue;
             };
+            // Do not process the shutdown wake-up connection: it has no
+            // authorized child peer, and writing its denial response would
+            // allocate through the bridge arena while the owner is tearing down.
+            if (!self.running.load(.acquire)) {
+                stream.close(io);
+                return;
+            }
             self.handleConnection(io, &stream) catch {};
             stream.close(io);
         }
