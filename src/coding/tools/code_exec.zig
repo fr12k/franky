@@ -114,15 +114,15 @@ fn execute(
         );
     }
 
-    // Build a minimal, credential-free environment.
+    // Keep MCP bridge credentials scoped to the child environment; do not
+    // inherit the franky process's ambient environment.
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/local/bin:/usr/bin:/bin");
     try env.put("PYTHONPATH", ctx.sdk_dir);
-    try env.put("FRANKY_MCP_SOCKET", ctx.bridge.socket_path);
     try env.put("FRANKY_MCP_TOKEN", ctx.bridge.token_hex);
+    try env.put("FRANKY_MCP_SOCKET", ctx.bridge.socket_path);
     try env.put("TMPDIR", "/tmp");
-
     // Construct argv for the detected sandbox.
     const argv = try buildArgv(aa, sandbox, ctx, script_path);
 
@@ -284,8 +284,7 @@ fn buildArgv(
             });
             // The scratch script + SDK modules live under `sdk_dir`, which
             // may itself be under /tmp — bind it AFTER the tmpfs so it is not
-            // masked. The bridge socket is not mounted: a host UDS pathname is
-            // not reliably reachable from the isolated network namespace.
+            // masked. The bridge uses its Unix socket path from this namespace.
             try out.appendSlice(aa, &.{ "--bind", ctx.sdk_dir, ctx.sdk_dir });
             try out.append(aa, "--");
             try out.appendSlice(aa, &py);
