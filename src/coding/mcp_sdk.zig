@@ -97,6 +97,12 @@ pub fn generate(
     defer allocator.free(init_src);
     try writeAtomic(allocator, io, sdk_dir, "__init__.py", init_src);
 
+    // README.md — show the package import convention and avoid the common
+    // top-level/relative-import mistakes in code_exec scratch scripts.
+    const readme = try renderReadme(allocator, servers.items);
+    defer allocator.free(readme);
+    try writeAtomic(allocator, io, sdk_dir, "README.md", readme);
+
     // <server>.py — one typed module per server.
     for (servers.items) |server| {
         const specs = by_server.get(server).?;
@@ -162,6 +168,31 @@ pub const runtime_py: []const u8 =
     \\    return resp.get("result")
     \\
 ;
+
+fn renderReadme(allocator: std.mem.Allocator, servers: []const []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator,
+        "# Generated franky MCP SDK\n\n" ++
+        "Import generated server modules as members of the `mcp_sdk` package from `code_exec`:\n\n" ++
+        "```python\nfrom mcp_sdk import ",
+    );
+    for (servers, 0..) |server, i| {
+        if (i > 0) try buf.appendSlice(allocator, ", ");
+        try buf.appendSlice(allocator, server);
+    }
+    try buf.appendSlice(allocator,
+        "\n\n# Read the module for available function names and argument signatures.\n" ++
+        "result = mcp_server.some_tool(...)\n" ++
+        "print(result)\n```\n\n" ++
+        "Replace `mcp_server.some_tool(...)` with an actual generated wrapper.\n" ++
+        "Do not use `import server_name` or relative imports in the scratch script.\n" ++
+        "Tool results follow the server schema: print/inspect a result before assuming\n" ++
+        "it is a dictionary or has particular keys. Combine the workflow in one\n" ++
+        "`code_exec` call when possible.\n",
+    );
+    return buf.toOwnedSlice(allocator);
+}
 
 fn renderInitPy(allocator: std.mem.Allocator, servers: []const []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -498,4 +529,15 @@ test "renderServerPy emits valid Python for a mixed schema" {
     try testing.expect(std.mem.indexOf(u8, src, "\"\"\"Fetch one item by id.\"\"\"") != null);
     try testing.expect(std.mem.indexOf(u8, src, "_runtime.call_mcp(\"mock\", \"fetch_item\", args)") != null);
     try testing.expect(std.mem.indexOf(u8, src, "if v is not None") != null);
+}
+
+test "renderReadme shows package imports and cautious result handling" {
+    const gpa = testing.allocator;
+    const servers = [_][]const u8{ "briefcase", "calendar" };
+    const readme = try renderReadme(gpa, &servers);
+    defer gpa.free(readme);
+
+    try testing.expect(std.mem.indexOf(u8, readme, "from mcp_sdk import briefcase, calendar") != null);
+    try testing.expect(std.mem.indexOf(u8, readme, "Do not use `import server_name`") != null);
+    try testing.expect(std.mem.indexOf(u8, readme, "print/inspect a result before assuming") != null);
 }

@@ -1840,11 +1840,15 @@ pub fn buildSystemPromptIo(
         with_code_mode = try std.fmt.allocPrint(
             allocator,
             "{s}\n\n## MCP Code Mode\n\n" ++
-            "External MCP tools are available as Python modules in `.franky/mcp_sdk/`.\n" ++
-            "Use `ls` or `read` on `.franky/mcp_sdk/` to discover the available server\n" ++
-            "modules and their typed functions, then call `code_exec` to import and\n" ++
-            "orchestrate them in Python. Aggregate results in Python and print a compact\n" ++
-            "summary — only stdout returns to you. Direct network access is disabled.\n",
+            "External MCP tools are available as generated Python modules in `.franky/mcp_sdk/`.\n" ++
+            "Inspect `.franky/mcp_sdk/__init__.py` and the server module with `read` first.\n" ++
+            "Import them as a package, for example: `from mcp_sdk import briefcase` (replace\n" ++
+            "`briefcase` with a name exported by `__init__.py`). Do not use top-level imports\n" ++
+            "like `import briefcase` or relative imports in the scratch script.\n" ++
+            "Call `code_exec` once with the complete Python workflow; do not spend separate\n" ++
+            "tool turns just discovering imports or result shapes. Print/inspect the returned\n" ++
+            "value before assuming its type or keys, then aggregate and print a compact summary.\n" ++
+            "Only stdout returns to you. Direct network access is disabled.\n",
             .{trimmed},
         );
         code_mode_owned = true;
