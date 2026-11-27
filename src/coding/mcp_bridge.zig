@@ -70,9 +70,10 @@ pub const McpBridge = struct {
     token_hex: []u8,
     token_raw: [32]u8,
     permission_store: ?*permissions.Store,
-    /// Serializes one accepted connection and its response with shutdown.
-    /// The bridge handles at most one client connection at a time.
+    /// Coordinates shutdown with both connection acceptance and handling.
     connection_mutex: std.Io.Mutex = .init,
+    /// Serializes access to bridge-owned state used by dispatch/summary.
+    state_mutex: std.Io.Mutex = .init,
     server: ?std.Io.net.Server = null,
     targets: std.StringHashMap(Target),
     stats: std.StringHashMap(BridgeStat),
@@ -172,6 +173,8 @@ pub const McpBridge = struct {
     pub fn shutdown(self: *McpBridge, io: std.Io) void {
         if (self.serve_thread) |t| {
             self.connection_mutex.lockUncancelable(io);
+            self.state_mutex.lockUncancelable(io);
+            defer self.state_mutex.unlock(io);
             defer self.connection_mutex.unlock(io);
             self.running.store(false, .release);
             // Wake a blocking accept with a local connection while the
