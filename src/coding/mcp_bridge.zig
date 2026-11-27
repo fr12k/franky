@@ -66,9 +66,9 @@ const Target = struct {
 
 pub const McpBridge = struct {
     /// Stable allocator for bridge-owned state that survives across calls.
+    /// Both allocators must outlive the bridge's accept thread.
     allocator: std.mem.Allocator,
-    /// Stable allocator used exclusively by the accept thread, independent
-    /// of the session arena owned by the resolver.
+    /// Stable allocator used by all accept-thread work; must outlive the session.
     io_allocator: std.mem.Allocator,
     socket_path: []u8,
     token_hex: []u8,

@@ -1679,7 +1679,10 @@ pub fn resolve(
         };
 
         // Build + populate the bridge, register every discovered tool.
-        const bridge = mcp_bridge_mod.McpBridge.init(a, io, if (prompts_enabled) permission_store else null, allocator) catch |err| {
+        // The bridge owns allocations made by its background thread, so its
+        // parent allocator (and all backing allocations) must outlive the
+        // ResolvedConfig arena. Allocate bridge state from the caller allocator.
+        const bridge = mcp_bridge_mod.McpBridge.init(allocator, io, if (prompts_enabled) permission_store else null, allocator) catch |err| {
             ai.log.log(.err, "mcp-code", "resolve", "bridge init failed: {s}; disabling code mode", .{@errorName(err)});
             break :blk auto_filtered;
         };
