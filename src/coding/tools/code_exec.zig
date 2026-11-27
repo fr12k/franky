@@ -98,10 +98,15 @@ fn execute(
         else => default_timeout_ms,
     } else default_timeout_ms;
 
-    // Write the script to a temp file inside the SDK dir (so the sandbox's
-    // workspace bind-mount covers it). Atomic via temp+rename.
-    const script_path = try writeScript(allocator, io, ctx.sdk_dir, code);
-    defer allocator.free(script_path);
+    // Ensure the bridge listener is alive before creating any child resources.
+    // This also catches stale socket paths before starting Python.
+    if (!socketExists(io, ctx.bridge.socket_path)) {
+        return common.toolError(
+            allocator,
+            "mcp_bridge_unavailable",
+            "The MCP bridge Unix socket is missing. The bridge may have failed to start or shut down; check startup logs and restart the session.",
+        );
+    }
 
     // Resolve the sandbox primitive once per call (cheap probe).
     const sandbox = try detectSandbox(io);
@@ -113,6 +118,11 @@ fn execute(
             "no network-isolation primitive available (install bubblewrap on Alpine, or run on macOS); refusing to run unsandboxed. Re-run with the allow_unsandboxed_code_exec opt-in if you accept the risk",
         );
     }
+
+    // Write the script to a temp file inside the SDK dir (so the sandbox's
+    // workspace bind-mount covers it). Atomic via temp+rename.
+    const script_path = try writeScript(allocator, io, ctx.sdk_dir, code);
+    defer allocator.free(script_path);
 
     // Keep MCP bridge credentials scoped to the child environment; do not
     // inherit the franky process's ambient environment.
@@ -153,6 +163,8 @@ fn execute(
     };
     const child_pid = child.id orelse return common.toolError(allocator, "code_exec_spawn_failed", "spawned process has no PID");
     ctx.bridge.setActiveChild(child_pid);
+    // Defer LIFO: terminate/reap Python before clearing its PID so bridge
+    // shutdown can wait until no child can still issue a UDS request.
     defer ctx.bridge.clearActiveChild();
     defer terminateProcessGroup(&child, child_pid, io);
 
@@ -437,6 +449,8 @@ test "code_exec: runs python and captures stdout" {
 
     const bridge = try bridge_mod.McpBridge.init(gpa, io, null);
     defer bridge.deinit(io);
+    try bridge.listen(io);
+    try bridge.startServing();
     const ctx = makeCtx(gpa, io, bridge);
     defer destroyCtx(gpa, ctx);
 
@@ -461,6 +475,8 @@ test "code_exec: non-zero exit is_error and surfaces stderr" {
 
     const bridge = try bridge_mod.McpBridge.init(gpa, io, null);
     defer bridge.deinit(io);
+    try bridge.listen(io);
+    try bridge.startServing();
     const ctx = makeCtx(gpa, io, bridge);
     defer destroyCtx(gpa, ctx);
 
@@ -505,6 +521,8 @@ test "code_exec: bridge token + socket are injected into the env" {
 
     const bridge = try bridge_mod.McpBridge.init(gpa, io, null);
     defer bridge.deinit(io);
+    try bridge.listen(io);
+    try bridge.startServing();
     const ctx = makeCtx(gpa, io, bridge);
     defer destroyCtx(gpa, ctx);
 

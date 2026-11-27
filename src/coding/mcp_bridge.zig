@@ -180,6 +180,10 @@ pub const McpBridge = struct {
 
     /// Stop the accept loop and remove the socket file.
     pub fn shutdown(self: *McpBridge, io: std.Io) void {
+        // If a code_exec child is still connected, let it finish before the
+        // listener is torn down. The owner must not free bridge state while
+        // the accept thread can still be dispatching a request.
+        while (self.active_child_pid.load(.acquire) >= 0) std.Thread.yield() catch {};
         if (self.serve_thread) |t| {
             self.running.store(false, .release);
             // Wake a blocking accept with a local connection while the
