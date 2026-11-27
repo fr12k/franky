@@ -5,7 +5,8 @@
 //! TLS support may be disabled via `std.options.http_disable_tls`.
 //!
 //! VENDORED COPY of std/http/Client.zig from Zig 0.17.0-dev.87+9b177a7d2 with
-//! Zig PR #23365 applied: when CONNECT-tunnelling to an https origin through
+//! Zig PR #23365 applied.
+//! When CONNECT-tunnelling to an https origin through
 //! a forward proxy, perform a TLS handshake on the established tunnel before
 //! sending the request body. Without this patch, requests to HTTPS hosts via
 //! HTTP_PROXY/HTTPS_PROXY are sent as plaintext through the CONNECT tunnel,
@@ -1303,6 +1304,7 @@ pub const Request = struct {
             // Populated when `http.Reader.bodyReader` is called.
             .interface = undefined,
             .max_head_len = r.client.read_buffer_size,
+            .side = .response,
         };
         r.redirect_behavior.subtractOne();
     }
@@ -1979,6 +1981,7 @@ pub fn request(
             // Populated when `http.Reader.bodyReader` is called.
             .interface = undefined,
             .max_head_len = client.read_buffer_size,
+            .side = .response,
         },
         .keep_alive = options.keep_alive,
         .method = method,

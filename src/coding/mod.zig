@@ -20,6 +20,7 @@ pub const tools = struct {
     pub const memory_delete = @import("tools/memory_delete.zig");
     pub const memory_list = @import("tools/memory_list.zig");
     pub const a2ui_render = @import("tools/a2ui_render.zig");
+    pub const code_exec = @import("tools/code_exec.zig");
 };
 
 pub const a2ui = @import("a2ui.zig");
@@ -32,6 +33,8 @@ pub const modes = struct {
 
 pub const session = @import("session/mod.zig");
 pub const mcp = @import("mcp/mod.zig");
+pub const mcp_sdk = @import("mcp_sdk.zig");
+pub const mcp_bridge = @import("mcp_bridge.zig");
 
 // ═══════════════════════════════════════════════════
 // Backward-compatible aliases for moved modules.
@@ -107,6 +110,7 @@ test {
     _ = tools.workspace;
     _ = tools.common;
     _ = tools.truncate;
+    _ = tools.code_exec;
     _ = modes.print;
     _ = modes.rpc;
     _ = modes.proxy;
@@ -142,6 +146,8 @@ test {
     _ = gitignore;
     _ = rpc;
     _ = mcp;
+    _ = mcp_sdk;
+    _ = mcp_bridge;
     _ = slash;
     _ = update;
     _ = skills;

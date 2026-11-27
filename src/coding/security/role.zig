@@ -87,6 +87,7 @@ const tool_table = [_]ToolEntry{
     .{ .name = "write", .min_role = .plan },
     .{ .name = "edit", .min_role = .plan },
     .{ .name = "bash", .min_role = .code },
+    .{ .name = "code_exec", .min_role = .code },
 };
 
 /// Per-tool allow flags. Tool names match the registry entries

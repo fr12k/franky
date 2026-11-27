@@ -2,7 +2,7 @@
     .name = .franky,
     .version = "0.29.0",
     .fingerprint = 0x827ef3f35d829231,
-    .minimum_zig_version = "0.17.0-dev.1622",
+    .minimum_zig_version = "0.17.1",
     .paths = .{
         "build.zig",
         "build.zig.zon",
@@ -12,8 +12,8 @@
     },
     .dependencies = .{
         .zompress = .{
-            .url = "https://github.com/fr12k/zompress/archive/refs/tags/v0.1.1.tar.gz",
-            .hash = "zompress-0.0.1-hHj4JvKLAQD99DOqFg8rU0NfnwqGflzoPr0m_2A0ZmVG",
+            .url = "https://github.com/fr12k/zompress/archive/refs/tags/v0.1.2.tar.gz",
+            .hash = "zompress-0.0.1-hHj4JqyMAQBM_j4NZEiY3GdJ3ZLPYgYokIudfLOL0KLS",
         },
         .agent_memory = .{
             // Vendored SQLite amalgamation 3.53.4 (fr12k/franky-memory).

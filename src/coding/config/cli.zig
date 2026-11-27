@@ -275,6 +275,15 @@ pub const Config = struct {
     /// Env vars in header values are substituted (`${VAR}`).
     mcp_configs: ?[]const u8 = null,
 
+    /// `--mcp-code-mode` — instead of injecting every `mcp__*` tool
+    /// schema into the LLM prompt, generate typed Python SDK stubs
+    /// under `.franky/mcp_sdk/` and expose a single sandboxed
+    /// `code_exec` tool that orchestrates MCP calls through a local
+    /// Unix-domain-socket bridge. Keeps large tool payloads out of
+    /// the context window. Requires `--role code` or `--role full`.
+    /// Env fallback: `FRANKY_MCP_CODE_MODE` (any non-empty value).
+    mcp_code_mode: bool = false,
+
     /// `--autocontinue` — when the model stops (after tool calls or a
     /// text-only turn) without calling `finish_task`, inject a user
     /// message asking it to continue and call finish_task. Caps at 2
@@ -495,6 +504,10 @@ fn applyBoolFlag(cfg: *Config, name: []const u8) bool {
     }
     if (std.mem.eql(u8, name, "--remember-permissions")) {
         cfg.remember_permissions = true;
+        return true;
+    }
+    if (std.mem.eql(u8, name, "--mcp-code-mode")) {
+        cfg.mcp_code_mode = true;
         return true;
     }
     // v3.x — auto mode flags.
@@ -859,6 +872,11 @@ pub const usage_text: []const u8 =
     \\                               all servers are discovered at startup and added
     \\                               to the tool set as `mcp__server__tool`. Env vars
     \\                               in header values are substituted: ${VAR}.
+    \\  --mcp-code-mode              Expose MCP tools via Python SDK stubs in
+    \\                               .franky/mcp_sdk/ + a sandboxed code_exec tool
+    \\                               instead of raw mcp__* schemas. Keeps large
+    \\                               payloads out of the context window. Requires
+    \\                               --role code or full. Env: FRANKY_MCP_CODE_MODE.
     \\  --memory                     Enable persistent memory tools (default on)
     \\  --no-memory                  Disable persistent memory tools
     \\  --memory-nudge               Nudge agent to save memory before finish_task (default on)
