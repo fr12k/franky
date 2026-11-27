@@ -65,9 +65,10 @@ const Target = struct {
 };
 
 pub const McpBridge = struct {
+    /// Stable allocator for bridge-owned state that survives across calls.
     allocator: std.mem.Allocator,
-    /// Stable allocator used for all bridge operations executed by the
-    /// accept thread. It outlives the session arena owned by the resolver.
+    /// Stable allocator used exclusively by the accept thread, independent
+    /// of the session arena owned by the resolver.
     io_allocator: std.mem.Allocator,
     socket_path: []u8,
     token_hex: []u8,
@@ -115,8 +116,8 @@ pub const McpBridge = struct {
             .token_hex = token_hex,
             .token_raw = raw,
             .permission_store = permission_store,
-            .targets = std.StringHashMap(Target).init(allocator),
-            .stats = std.StringHashMap(BridgeStat).init(allocator),
+            .targets = std.StringHashMap(Target).init(io_allocator),
+            .stats = std.StringHashMap(BridgeStat).init(io_allocator),
             .io = io,
         };
         return self;
@@ -149,7 +150,9 @@ pub const McpBridge = struct {
     /// Register an MCP tool so the bridge can dispatch to it. Called once
     /// per discovered `mcp__*` tool during session setup.
     pub fn registerTool(self: *McpBridge, ctx: *const mcp_client.McpToolCtx) !void {
-        const ns_name = try std.fmt.allocPrint(self.allocator, "mcp__{s}__{s}", .{ ctx.server_name, ctx.tool_name });
+        const ns_name = try std.fmt.allocPrint(self.io_allocator, "mcp__{s}__{s}", .{ ctx.server_name, ctx.tool_name });
+        errdefer self.io_allocator.free(ns_name);
+        if (self.targets.contains(ns_name)) return error.DuplicateTool;
         try self.targets.put(ns_name, .{
             .ns_name = ns_name,
             .server = ctx.server_name,
@@ -264,11 +267,7 @@ pub const McpBridge = struct {
     /// Parse + authorize + route one request frame. Returns an owned JSON
     /// response line (without trailing newline).
     fn dispatch(self: *McpBridge, io: std.Io, line: []const u8) ![]u8 {
-        var arena = std.heap.ArenaAllocator.init(self.io_allocator);
-        defer arena.deinit();
-        const aa = arena.allocator();
-
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, aa, line, .{}) catch
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.io_allocator, line, .{}) catch
             return try self.errorJson("invalid json");
         if (parsed != .object) return try self.errorJson("request not an object");
         const obj = parsed.object;
@@ -282,10 +281,12 @@ pub const McpBridge = struct {
         const server = if (obj.get("server")) |s| (if (s == .string) s.string else "") else "";
         const tool = if (obj.get("tool")) |s| (if (s == .string) s.string else "") else "";
         var args_buf: std.ArrayList(u8) = .empty;
-        if (obj.get("args")) |a| jh.renderJson(&args_buf, aa, a) catch {};
+        if (obj.get("args")) |a| jh.renderJson(&args_buf, self.io_allocator, a) catch {};
+        defer args_buf.deinit(self.io_allocator);
         const args: []const u8 = if (args_buf.items.len > 0) args_buf.items else "{}";
 
-        const ns_name = try std.fmt.allocPrint(aa, "mcp__{s}__{s}", .{ server, tool });
+        const ns_name = try std.fmt.allocPrint(self.io_allocator, "mcp__{s}__{s}", .{ server, tool });
+        defer self.io_allocator.free(ns_name);
 
         // 2. Permission gate — same path as a direct tool call.
         if (self.permission_store) |store| {
@@ -346,8 +347,16 @@ pub const McpBridge = struct {
         const io = self.io orelse return;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const gop = self.stats.getOrPut(ns_name) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const ns_name_stable = self.io_allocator.dupe(u8, ns_name) catch return;
+        const gop = self.stats.getOrPut(ns_name_stable) catch {
+            self.io_allocator.free(ns_name_stable);
+            return;
+        };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        } else {
+            self.io_allocator.free(ns_name_stable);
+        }
         gop.value_ptr.calls += 1;
         if (is_error) gop.value_ptr.errors += 1;
         gop.value_ptr.total_ms += ms;
