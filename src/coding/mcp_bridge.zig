@@ -125,6 +125,10 @@ pub const McpBridge = struct {
 
     pub fn deinit(self: *McpBridge, io: std.Io) void {
         self.shutdown(io);
+        var targets_it = self.targets.iterator();
+        while (targets_it.next()) |entry| self.io_allocator.free(entry.key_ptr.*);
+        var stats_it = self.stats.iterator();
+        while (stats_it.next()) |entry| self.io_allocator.free(entry.key_ptr.*);
         self.targets.deinit();
         self.stats.deinit();
         self.allocator.free(self.socket_path);
@@ -139,6 +143,10 @@ pub const McpBridge = struct {
         if (self.io) |io| {
             self.deinit(io);
         } else {
+            var targets_it = self.targets.iterator();
+            while (targets_it.next()) |entry| self.io_allocator.free(entry.key_ptr.*);
+            var stats_it = self.stats.iterator();
+            while (stats_it.next()) |entry| self.io_allocator.free(entry.key_ptr.*);
             self.targets.deinit();
             self.stats.deinit();
             self.allocator.free(self.socket_path);
