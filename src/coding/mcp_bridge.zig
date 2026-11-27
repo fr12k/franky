@@ -264,10 +264,11 @@ pub const McpBridge = struct {
     /// Parse + authorize + route one request frame. Returns an owned JSON
     /// response line (without trailing newline).
     fn dispatch(self: *McpBridge, io: std.Io, line: []const u8) ![]u8 {
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.io_allocator, line, .{}) catch
+        var parsed = std.json.parseFromSlice(std.json.Value, self.io_allocator, line, .{}) catch
             return try self.errorJson("invalid json");
-        if (parsed != .object) return try self.errorJson("request not an object");
-        const obj = parsed.object;
+        defer parsed.deinit();
+        if (parsed.value != .object) return try self.errorJson("request not an object");
+        const obj = parsed.value.object;
 
         // 1. Per-session bearer token. This is the bridge authentication
         // mechanism; don't bind authorization to wrapper PIDs, which vary
