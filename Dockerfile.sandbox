@@ -11,9 +11,9 @@ RUN sudo apt-get update && \
     sudo apt-get clean && \
     sudo rm -rf /var/lib/apt/lists/*
 
-RUN wget https://ziglang.org/builds/zig-aarch64-linux-0.17.0-dev.1267+300116b02.tar.xz && \
-    tar -xf zig-aarch64-linux-0.17.0-dev.1267+300116b02.tar.xz -C /usr/local/bin --strip-components=1 && \
-    rm zig-aarch64-linux-0.17.0-dev.1267+300116b02.tar.xz
+RUN wget https://ziglang.org/download/0.17.1/zig-aarch64-linux-0.17.1.tar.xz && \
+    tar -xf zig-aarch64-linux-0.17.1.tar.xz -C /usr/local/bin --strip-components=1 && \
+    rm zig-aarch64-linux-0.17.1.tar.xz
 # this enable memory allocatioin tracking for tests with heaptrack that is donme in the profile build step of franky
 # Not needed anymore solved by src/global_allocator.zig 
 # RUN sudo sed -i 's|^pub const allocator = allocator_instance.allocator();$|pub const allocator = std.heap.c_allocator;|' /usr/local/bin/lib/std/testing.zig
